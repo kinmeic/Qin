@@ -133,6 +133,7 @@ qin new <PROMPT>             新建会话并立即执行任务
 qin sessions                 列出会话
 qin use <SESSION_ID>         切换当前会话
 qin show [SESSION_ID]        显示会话概要或消息
+qin delete <SESSION_ID>      永久删除会话；删除当前会话时创建并切换到全新会话
 qin compact [SESSION_ID]     手动压缩历史上下文
 qin memory list              列出长期记忆
 qin memory add <TEXT>        显式添加一条长期记忆

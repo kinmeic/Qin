@@ -7,6 +7,7 @@ mod prompt_file;
 mod state;
 mod tools;
 
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -136,20 +137,36 @@ async fn run() -> Result<()> {
         }
         Command::Use { session_id } => {
             let (_, _, mut store) = open(&explicit_config, &events)?;
-            store.use_session(&session_id)?;
-            events.success(&format!("Active session: {session_id}"))?;
+            let id = store.use_session(&session_id)?;
+            events.success(&format!("Active session: {id}"))?;
         }
         Command::Show { session_id } => {
             let (_, _, store) = open(&explicit_config, &events)?;
-            let id = session_id
+            let id_or_prefix = session_id
                 .or(store.current_session()?)
                 .context("There is no active session")?;
+            let id = store.resolve_session_id(&id_or_prefix)?;
             for message in store.load_messages(&id)? {
                 println!(
                     "[{}] {}",
                     terminal(&message.role),
                     terminal(&message.content.unwrap_or_else(|| "[tool_calls]".into()))
                 );
+            }
+        }
+        Command::Delete { session_id } => {
+            let (_, _, mut store) = open(&explicit_config, &events)?;
+            let id = store.resolve_session_id(&session_id)?;
+            if dry_run {
+                events.success(&format!("Dry run: session would be deleted: {id}"))?;
+            } else {
+                confirm_session_delete(&events, &id, assume_yes)?;
+                let cwd = std::env::current_dir()?;
+                let (_, new_current) = store.delete_session(&id, &cwd)?;
+                let suffix = new_current.map_or_else(String::new, |active| {
+                    format!("; created and switched to a new session: {active}")
+                });
+                events.success(&format!("Deleted session: {id}{suffix}"))?;
             }
         }
         Command::Memory { command } => handle_memory(command, &explicit_config, &events).await?,
@@ -378,4 +395,24 @@ fn short_id(id: &str) -> &str {
 
 fn terminal(value: &str) -> String {
     event::sanitize_terminal(value)
+}
+
+fn confirm_session_delete(events: &EventSink, id: &str, assume_yes: bool) -> Result<()> {
+    if assume_yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!("Session deletion requires an interactive confirmation or --yes");
+    }
+    let message = format!("Permanently delete session {id} and all of its history? [y/N] ");
+    events.approval(&message)?;
+    eprint!("{}", terminal(&message));
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        bail!("Session deletion was declined by the user")
+    }
 }

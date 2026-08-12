@@ -73,6 +73,9 @@ pub enum Command {
     /// Show the active or specified session
     Show { session_id: Option<String> },
 
+    /// Permanently delete a session and all of its stored history
+    Delete { session_id: String },
+
     /// Manage long-term memory
     Memory {
         #[command(subcommand)]
@@ -163,6 +166,7 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
         "sessions",
         "use",
         "show",
+        "delete",
         "memory",
         "knowledge",
         "sync",

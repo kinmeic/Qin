@@ -4,6 +4,7 @@ All notable changes to `qin` are documented here.
 
 ## 0.2.0
 
+- Added `qin delete <SESSION_ID>` with confirmation, short-ID support, cascading history cleanup, and automatic creation of a new session when deleting the active one.
 - Added durable context-compaction boundaries while preserving full session history.
 - Hardened file, configuration, database, lock, shell, terminal, and HTTP trust boundaries.
 - Added bounded model, search, command, tool-audit, and embedding response handling.

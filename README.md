@@ -107,7 +107,10 @@ Manage saved sessions with:
 qin sessions
 qin show
 qin use <SESSION_ID>
+qin delete <SESSION_ID>
 ```
+
+Session IDs may be given in full or by the unique short prefix displayed by `qin sessions`. Deletion permanently removes the session history and tool audit records, asks for confirmation, and accepts `--yes` for non-interactive use. If the active session is deleted, `qin` creates and switches to a brand-new empty session.
 
 ### Read a prompt from a file
 

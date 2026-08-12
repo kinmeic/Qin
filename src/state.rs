@@ -298,15 +298,13 @@ impl StateStore {
         Ok(id)
     }
 
-    pub fn use_session(&mut self, id: &str) -> Result<()> {
-        if !self.session_exists(id)? {
-            bail!("Session does not exist: {id}");
-        }
+    pub fn use_session(&mut self, id_or_prefix: &str) -> Result<String> {
+        let id = self.resolve_session_id(id_or_prefix)?;
         self.connection.execute(
             "INSERT INTO app_state(key,value) VALUES ('current_session',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [id],
+            [&id],
         )?;
-        Ok(())
+        Ok(id)
     }
 
     fn session_exists(&self, id: &str) -> Result<bool> {
@@ -315,6 +313,53 @@ impl StateStore {
             [id],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn resolve_session_id(&self, id_or_prefix: &str) -> Result<String> {
+        let value = id_or_prefix.trim();
+        if value.is_empty() {
+            bail!("The session identifier cannot be empty");
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM sessions WHERE id=?1 OR substr(id,1,length(?1))=?1 ORDER BY id LIMIT 2",
+        )?;
+        let matches = statement
+            .query_map([value], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match matches.as_slice() {
+            [] => bail!("Session does not exist: {value}"),
+            [id] => Ok(id.clone()),
+            _ => bail!("Session identifier is ambiguous: {value}"),
+        }
+    }
+
+    pub fn delete_session(
+        &mut self,
+        id_or_prefix: &str,
+        cwd: &Path,
+    ) -> Result<(String, Option<String>)> {
+        let id = self.resolve_session_id(id_or_prefix)?;
+        let was_current = self.current_session()?.as_deref() == Some(id.as_str());
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM tool_executions WHERE session_id=?1", [&id])?;
+        transaction.execute("DELETE FROM sessions WHERE id=?1", [&id])?;
+        let mut new_current = None;
+        if was_current {
+            let replacement = Uuid::new_v4().to_string();
+            let cwd = cwd.to_string_lossy();
+            transaction.execute(
+                "INSERT INTO sessions(id,title,initial_cwd,last_cwd) VALUES (?1,'New session',?2,?2)",
+                params![replacement, cwd],
+            )?;
+            transaction.execute(
+                "INSERT INTO app_state(key,value) VALUES ('current_session',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [&replacement],
+            )?;
+            new_current = Some(replacement);
+        }
+        transaction.commit()?;
+        self.secure_database_files()?;
+        Ok((id, new_current))
     }
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionInfo>> {
@@ -829,6 +874,47 @@ mod tests {
             Some(id.as_str())
         );
         assert_eq!(store.load_messages(&id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deletes_sessions_by_displayed_prefix_and_creates_a_new_active_session() {
+        let (_dir, mut store) = store();
+        let first = store.new_session(Path::new("/tmp"), Some("first")).unwrap();
+        let second = store
+            .new_session(Path::new("/tmp"), Some("second"))
+            .unwrap();
+        store
+            .append_messages(
+                &second,
+                &[StoredMessage {
+                    role: "user".into(),
+                    content: Some("remove me".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                Path::new("/tmp"),
+            )
+            .unwrap();
+
+        let (deleted, replacement) = store
+            .delete_session(&second[..8], Path::new("/replacement"))
+            .unwrap();
+        assert_eq!(deleted, second);
+        let replacement = replacement.unwrap();
+        assert_ne!(replacement, first);
+        assert_eq!(
+            store.current_session().unwrap().as_deref(),
+            Some(replacement.as_str())
+        );
+        assert!(store.load_messages(&second).unwrap().is_empty());
+        let (deleted, new_current) = store
+            .delete_session(&first[..8], Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(deleted, first);
+        assert_eq!(new_current, None);
+        assert_eq!(store.current_session().unwrap(), Some(replacement));
+        assert_eq!(store.list_sessions(10).unwrap().len(), 1);
+        assert!(store.delete_session("missing", Path::new("/tmp")).is_err());
     }
 
     #[test]
