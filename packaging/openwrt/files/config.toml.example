@@ -1,0 +1,36 @@
+version = 1
+default_model = "primary"
+
+[models.primary]
+base_url = "https://api.openai.com/v1"
+api_style = "chat_completions"
+model = "gpt-4o-mini"
+api_key_env = "QIN_API_KEY"
+context_window = 128000
+max_output_tokens = 8192
+stream = true
+
+[embeddings]
+base_url = "https://api.openai.com/v1"
+model = "text-embedding-3-small"
+api_key_env = "QIN_API_KEY"
+dimensions = 1536
+batch_size = 16
+vector_encoding = "f16"
+
+[storage]
+data_dir = "/root/.local/share/qin"
+database = "qin.db"
+journal_mode = "persist"
+write_profile = "low_write"
+
+[knowledge]
+enabled = true
+auto_extract = true
+auto_extract_every_turns = 8
+
+[permissions]
+approval = "on_risk"
+allow_shell = true
+elevation = "auto"
+trash_instead_of_delete = true

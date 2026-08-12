@@ -1,0 +1,1 @@
+Place an OpenWrt target-specific `qin` binary in this directory before invoking the OpenWrt package build. The binary is intentionally not committed because OpenWrt targets vary by architecture, libc, and ABI. The low-write example configuration is included.

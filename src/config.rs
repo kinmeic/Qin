@@ -65,6 +65,26 @@ impl ConfigPathResolver {
     pub fn scope(&self) -> ConfigScope {
         self.scope
     }
+
+    pub fn database_path(&self, config: &Config) -> Result<PathBuf> {
+        if !config.storage.data_dir.trim().is_empty() {
+            return Ok(
+                absolute(PathBuf::from(&config.storage.data_dir))?.join(&config.storage.database)
+            );
+        }
+        if self.scope == ConfigScope::Explicit {
+            return Ok(self
+                .config_path
+                .parent()
+                .context("配置路径没有父目录")?
+                .join(&config.storage.database));
+        }
+        if self.scope == ConfigScope::System {
+            return Ok(PathBuf::from("/var/lib/qin").join(&config.storage.database));
+        }
+        let dirs = ProjectDirs::from("", "", "qin").context("无法确定数据目录")?;
+        Ok(dirs.data_dir().join(&config.storage.database))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +94,14 @@ pub struct Config {
     pub default_model: String,
     pub models: BTreeMap<String, ModelConfig>,
     pub input: InputConfig,
+    pub agent: AgentConfig,
+    pub context: ContextConfig,
+    pub storage: StorageConfig,
+    pub embeddings: EmbeddingConfig,
+    pub knowledge: KnowledgeConfig,
+    pub permissions: PermissionsConfig,
+    pub search: SearchConfig,
+    pub ui: UiConfig,
 }
 
 impl Default for Config {
@@ -83,6 +111,14 @@ impl Default for Config {
             default_model: "primary".to_string(),
             models: BTreeMap::new(),
             input: InputConfig::default(),
+            agent: AgentConfig::default(),
+            context: ContextConfig::default(),
+            storage: StorageConfig::default(),
+            embeddings: EmbeddingConfig::default(),
+            knowledge: KnowledgeConfig::default(),
+            permissions: PermissionsConfig::default(),
+            search: SearchConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -97,6 +133,8 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
     pub context_window: u64,
     pub max_output_tokens: u64,
+    pub stream: bool,
+    pub supports_native_search: bool,
 }
 
 impl Default for ModelConfig {
@@ -109,6 +147,8 @@ impl Default for ModelConfig {
             api_key: None,
             context_window: 128_000,
             max_output_tokens: 8_192,
+            stream: true,
+            supports_native_search: false,
         }
     }
 }
@@ -151,6 +191,230 @@ impl Default for InputConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub max_iterations: u32,
+    pub max_tool_calls: u32,
+    pub wall_time_seconds: u64,
+    pub summary_model: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: 24,
+            max_tool_calls: 80,
+            wall_time_seconds: 900,
+            summary_model: "summary".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    pub compact_trigger_ratio: f64,
+    pub compact_target_ratio: f64,
+    pub reserve_output_tokens: u64,
+    pub reserve_safety_tokens: u64,
+    pub protect_recent_tokens: u64,
+    pub tool_result_max_tokens: usize,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            compact_trigger_ratio: 0.72,
+            compact_target_ratio: 0.45,
+            reserve_output_tokens: 8_192,
+            reserve_safety_tokens: 2_048,
+            protect_recent_tokens: 16_000,
+            tool_result_max_tokens: 6_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    pub data_dir: String,
+    pub database: String,
+    pub journal_mode: String,
+    pub write_profile: String,
+    pub busy_timeout_ms: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: String::new(),
+            database: "qin.db".to_string(),
+            journal_mode: "auto".to_string(),
+            write_profile: "auto".to_string(),
+            busy_timeout_ms: 5_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: Option<String>,
+    pub api_key: Option<String>,
+    pub dimensions: usize,
+    pub batch_size: usize,
+    pub vector_encoding: String,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            api_key_env: Some("QIN_API_KEY".to_string()),
+            api_key: None,
+            dimensions: 1536,
+            batch_size: 32,
+            vector_encoding: "f32".to_string(),
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    pub fn resolve_api_key(&self) -> Result<String> {
+        resolve_secret(
+            self.api_key_env.as_deref(),
+            self.api_key.as_deref(),
+            "Embedding",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct KnowledgeConfig {
+    pub enabled: bool,
+    pub recall_limit: usize,
+    pub max_context_tokens: usize,
+    pub chunk_tokens: usize,
+    pub chunk_overlap_tokens: usize,
+    pub auto_extract: bool,
+    pub auto_extract_every_turns: u32,
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            recall_limit: 8,
+            max_context_tokens: 2_500,
+            chunk_tokens: 600,
+            chunk_overlap_tokens: 80,
+            auto_extract: true,
+            auto_extract_every_turns: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PermissionsConfig {
+    pub approval: String,
+    pub workspace_write: bool,
+    pub allow_shell: bool,
+    pub elevation: String,
+    pub trash_instead_of_delete: bool,
+    pub command_timeout_seconds: u64,
+    pub max_output_bytes: usize,
+}
+
+impl Default for PermissionsConfig {
+    fn default() -> Self {
+        Self {
+            approval: "on_risk".to_string(),
+            workspace_write: true,
+            allow_shell: true,
+            elevation: "auto".to_string(),
+            trash_instead_of_delete: true,
+            command_timeout_seconds: 120,
+            max_output_bytes: 1_048_576,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SearchProviderConfig {
+    pub enabled: bool,
+    pub api_key_env: Option<String>,
+    pub api_key: Option<String>,
+}
+
+impl SearchProviderConfig {
+    pub fn secret(&self, label: &str) -> Result<String> {
+        resolve_secret(self.api_key_env.as_deref(), self.api_key.as_deref(), label)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub order: Vec<String>,
+    pub max_results: usize,
+    pub timeout_seconds: u64,
+    pub exa: SearchProviderConfig,
+    pub brave: SearchProviderConfig,
+    pub native: SearchProviderConfig,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            order: vec!["exa".into(), "brave".into(), "native".into()],
+            max_results: 8,
+            timeout_seconds: 15,
+            exa: SearchProviderConfig::default(),
+            brave: SearchProviderConfig::default(),
+            native: SearchProviderConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub show_tool_events: bool,
+    pub show_commands: bool,
+    pub stream_command_output: bool,
+    pub command_heartbeat_seconds: u64,
+    pub command_output_max_bytes: usize,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            show_tool_events: true,
+            show_commands: true,
+            stream_command_output: true,
+            command_heartbeat_seconds: 5,
+            command_output_max_bytes: 262_144,
+        }
+    }
+}
+
+fn resolve_secret(env_name: Option<&str>, inline: Option<&str>, label: &str) -> Result<String> {
+    if let Some(name) = env_name {
+        return std::env::var(name).with_context(|| format!("{label} 环境变量 {name} 尚未设置"));
+    }
+    inline
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("{label} 没有配置密钥"))
+}
+
 impl Config {
     pub fn primary_model(&self) -> Result<&ModelConfig> {
         self.models
@@ -178,8 +442,25 @@ impl Config {
         if self.input.fromfile_max_bytes == 0 {
             bail!("input.fromfile_max_bytes 必须大于 0");
         }
+        if !(0.1..1.0).contains(&self.context.compact_trigger_ratio)
+            || !(0.1..self.context.compact_trigger_ratio)
+                .contains(&self.context.compact_target_ratio)
+        {
+            bail!("context 压缩比例必须满足 0.1 <= target < trigger < 1.0");
+        }
+        if self.knowledge.enabled {
+            if self.embeddings.model.trim().is_empty() || self.embeddings.dimensions == 0 {
+                bail!("启用知识库时必须配置 embeddings.model 和 dimensions");
+            }
+            if !matches!(self.embeddings.vector_encoding.as_str(), "f32" | "f16") {
+                bail!("embeddings.vector_encoding 只支持 f32 或 f16");
+            }
+        }
         if check_secret {
             model.resolve_api_key()?;
+            if self.knowledge.enabled {
+                self.embeddings.resolve_api_key()?;
+            }
         }
         Ok(())
     }
@@ -202,8 +483,11 @@ pub struct InitOutcome {
 pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Result<InitOutcome> {
     let path = resolver.config_path();
     let parent = path.parent().context("配置路径没有父目录")?;
+    let parent_existed = parent.exists();
     fs::create_dir_all(parent).with_context(|| format!("无法创建配置目录 {}", parent.display()))?;
-    set_dir_permissions(parent, resolver.scope())?;
+    if !parent_existed || resolver.scope() != ConfigScope::Explicit {
+        set_dir_permissions(parent, resolver.scope())?;
+    }
 
     if path.exists() && !options.force {
         let outcome = InitOutcome {
@@ -266,7 +550,20 @@ pub fn load(resolver: &ConfigPathResolver) -> Result<Config> {
     }
     let content =
         fs::read_to_string(path).with_context(|| format!("无法读取配置文件 {}", path.display()))?;
-    toml::from_str(&content).with_context(|| format!("配置文件格式错误：{}", path.display()))
+    let mut config: Config = toml::from_str(&content)
+        .with_context(|| format!("配置文件格式错误：{}", path.display()))?;
+    if is_openwrt() {
+        if config.storage.write_profile == "auto" {
+            config.storage.write_profile = "low_write".into();
+        }
+        if config.embeddings.vector_encoding == "f32" {
+            config.embeddings.vector_encoding = "f16".into();
+        }
+        if config.knowledge.auto_extract_every_turns == 1 {
+            config.knowledge.auto_extract_every_turns = 8;
+        }
+    }
+    Ok(config)
 }
 
 fn absolute(path: PathBuf) -> Result<PathBuf> {
@@ -295,10 +592,10 @@ fn is_root() -> bool {
 #[cfg(unix)]
 fn set_dir_permissions(path: &Path, scope: ConfigScope) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = if scope == ConfigScope::User {
-        0o700
-    } else {
-        0o755
+    let mode = match scope {
+        ConfigScope::User => 0o700,
+        ConfigScope::System => 0o755,
+        ConfigScope::Explicit => return Ok(()),
     };
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())

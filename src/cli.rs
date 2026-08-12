@@ -23,6 +23,14 @@ pub struct Cli {
     #[arg(long, short = 'q', global = true)]
     pub quiet: bool,
 
+    /// 批准普通写入和命令；极高风险操作仍会确认
+    #[arg(long, global = true)]
+    pub yes: bool,
+
+    /// 只规划和读取，不执行写操作或命令
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -50,6 +58,39 @@ pub enum Command {
         path: PathBuf,
     },
 
+    /// 创建并切换到新会话，可附带首个提示词
+    New {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
+
+    /// 列出最近会话
+    Sessions,
+
+    /// 切换当前会话
+    Use { session_id: String },
+
+    /// 显示当前或指定会话
+    Show { session_id: Option<String> },
+
+    /// 长期记忆管理
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+
+    /// 文档知识库管理
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
+    },
+
+    /// 将数据库 WAL/缓冲同步到持久存储
+    Sync,
+
+    /// 检查配置、数据库和平台能力
+    Doctor,
+
     /// 查看或检查配置
     Config {
         #[command(subcommand)]
@@ -71,6 +112,39 @@ pub enum ConfigCommand {
     Check,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    List,
+    Add {
+        text: String,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
+    Delete {
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KnowledgeCommand {
+    List,
+    Add {
+        path: PathBuf,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
+    Remove {
+        id: String,
+    },
+    Reindex,
+}
+
 impl Cli {
     pub fn parse_normalized() -> Self {
         Self::parse_from(normalize_args(std::env::args_os().collect()))
@@ -82,7 +156,21 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
         return args;
     }
 
-    let known = ["init", "fromfile", "config", "run", "help"];
+    let known = [
+        "init",
+        "fromfile",
+        "new",
+        "sessions",
+        "use",
+        "show",
+        "memory",
+        "knowledge",
+        "sync",
+        "doctor",
+        "config",
+        "run",
+        "help",
+    ];
     let mut index = 1;
     while index < args.len() {
         let value = args[index].to_string_lossy();
@@ -94,6 +182,8 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
             || value == "--json"
             || value == "--quiet"
             || value == "-q"
+            || value == "--yes"
+            || value == "--dry-run"
         {
             index += 1;
             continue;

@@ -15,7 +15,7 @@ max_output_tokens = 8192
 supports_tools = true
 supports_parallel_tools = false
 supports_native_search = false
-stream = false
+stream = true
 
 [models.summary]
 base_url = "https://api.openai.com/v1"
@@ -120,4 +120,3 @@ command_heartbeat_seconds = 5
 command_output_max_bytes = 262144
 color = "auto"
 final_answer_to_stdout = true
-
