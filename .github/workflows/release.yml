@@ -218,7 +218,11 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
           test "v${version}" = "$GITHUB_REF_NAME"
           cd release-assets
-          sha256sum qin-* > SHA256SUMS
+          find . -maxdepth 1 -type f \( -name 'qin-*' -o -name 'qin_*' \) -print0 \
+            | sort --zero-terminated \
+            | xargs --null sha256sum \
+            | sed 's#  \./#  #' > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 10
           ls -lh
       - name: Create release notes
         run: |
