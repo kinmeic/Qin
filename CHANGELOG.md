@@ -4,7 +4,7 @@ All notable changes to `qin` are documented here.
 
 ## 0.2.0
 
-- Added automated, checksummed GitHub release builds for Linux, macOS, and OpenWrt, including OpenWrt `.ipk` packages for `aarch64_cortex-a53` and `x86_64`.
+- Added automated, checksummed GitHub release builds for Linux, macOS, and OpenWrt, including legacy `.ipk` and OpenWrt 25.12.5 SDK-built apk v3 packages for `aarch64_cortex-a53` and `x86_64`.
 - Added `qin delete <SESSION_ID>` with confirmation, short-ID support, cascading history cleanup, and automatic creation of a new session when deleting the active one.
 - Added durable context-compaction boundaries while preserving full session history.
 - Hardened file, configuration, database, lock, shell, terminal, and HTTP trust boundaries.

@@ -53,7 +53,17 @@ OpenWrt devices vary by CPU architecture, libc, and ABI. Cross-compile for the e
 
 ### Prebuilt releases
 
-Tagged releases publish checksummed archives for Linux (`x86_64`, `arm64`), macOS (`x86_64`, Apple Silicon `arm64`), and OpenWrt (`x86_64`, `aarch64_cortex-a53`). OpenWrt releases also include installable `.ipk` packages:
+Tagged releases publish checksummed archives for Linux (`x86_64`, `arm64`), macOS (`x86_64`, Apple Silicon `arm64`), and OpenWrt (`x86_64`, `aarch64_cortex-a53`). OpenWrt releases include native OpenWrt 25.12.5 `apk` v3 packages and legacy `.ipk` packages.
+
+OpenWrt 25.12.5:
+
+```sh
+apk add --allow-untrusted ./qin-VERSION-r1_openwrt-25.12.5_aarch64_cortex-a53.apk
+# or, on x86_64:
+apk add --allow-untrusted ./qin-VERSION-r1_openwrt-25.12.5_x86_64.apk
+```
+
+OpenWrt 24.10 or earlier:
 
 ```sh
 opkg install qin_VERSION-1_aarch64_cortex-a53.ipk
@@ -61,7 +71,7 @@ opkg install qin_VERSION-1_aarch64_cortex-a53.ipk
 opkg install qin_VERSION-1_x86_64.ipk
 ```
 
-After installing, copy or rename `/etc/qin/config.toml.example` to `/etc/qin/config.toml`, edit it, and run `qin config check`.
+The `apk` files are produced by the official OpenWrt 25.12.5 SDKs for `mvebu/cortexa53` and `x86/64`; the embedded package architectures are `aarch64_cortex-a53` and `x86_64`. After installing, copy or rename `/etc/qin/config.toml.example` to `/etc/qin/config.toml`, edit it, and run `qin config check`.
 
 ## Configuration
 
@@ -88,6 +98,7 @@ model = "gpt-4.1-mini"
 api_key_env = "QIN_API_KEY"
 context_window = 128000
 max_output_tokens = 4096
+supports_native_search = false
 
 [context]
 compact_trigger_ratio = 0.72
@@ -96,7 +107,40 @@ compact_target_ratio = 0.45
 
 Keep API keys in environment variables whenever possible instead of storing secrets directly in the configuration file.
 
+Search backends are attempted in the configured order. Disabled providers are skipped, so the following example tries Exa first and Brave second:
+
+```toml
+[search]
+order = ["exa", "brave", "native"]
+max_results = 8
+timeout_seconds = 15
+
+[search.exa]
+enabled = true
+api_key_env = "EXA_API_KEY"
+
+[search.brave]
+enabled = true
+api_key_env = "BRAVE_API_KEY"
+
+[search.native]
+enabled = false
+model = "primary"
+```
+
+Model-native search is the final fallback. Enable it only when the selected OpenAI-compatible provider supports the Responses API web-search tool, and also set `supports_native_search = true` on that model. Exa and Brave keys should be exported as `EXA_API_KEY` and `BRAVE_API_KEY` respectively.
+
 ## Usage
+
+### Help and version
+
+```bash
+qin --help
+qin <COMMAND> --help
+qin --version
+```
+
+`qin --help` lists every supported top-level command and global option. Subcommand help shows command-specific arguments.
 
 ### Run a task
 

@@ -4,6 +4,8 @@ PKG_NAME:=qin
 PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
+PKG_MAINTAINER:=Qin contributors
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -19,14 +21,18 @@ define Package/qin/description
 endef
 
 # The release pipeline must place the target-specific static binary here.
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+endef
+
 define Build/Compile
 endef
 
 define Package/qin/install
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) ./files/qin $(1)/usr/bin/qin
+	$(INSTALL_BIN) $(CURDIR)/files/qin $(1)/usr/bin/qin
 	$(INSTALL_DIR) $(1)/etc/qin
-	$(INSTALL_CONF) ./files/config.toml.example $(1)/etc/qin/config.toml.example
+	$(INSTALL_CONF) $(CURDIR)/files/config.toml.example $(1)/etc/qin/config.toml.example
 endef
 
 $(eval $(call BuildPackage,qin))
