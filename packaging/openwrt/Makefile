@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=qin
-PKG_VERSION:=0.1.0
+PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 
@@ -30,4 +30,3 @@ define Package/qin/install
 endef
 
 $(eval $(call BuildPackage,qin))
-

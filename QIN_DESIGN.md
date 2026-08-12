@@ -1,5 +1,7 @@
 # qin：基于 Rust 的一次性命令行 Agent 方案说明
 
+> 本文记录完整的目标架构和后续演进方向，并不代表所有候选能力均已实现。当前可用行为以 `README.md`、生成的配置文件和 `AUDIT.md` 为准；尤其是跨调用 tmpfs spool 仍是未来方案，当前 OpenWrt 优化采用单次调用批量事务、PERSIST journal、f16 向量和延迟自动记忆提取。
+
 ## 1. 项目目标
 
 `qin` 是一个运行于 Linux、macOS 和 OpenWrt 命令行环境的本地 Agent。用户通过自然语言描述任务，`qin` 调用已配置的 OpenAI 兼容模型，由模型规划并调用本地工具完成任务，然后退出并返回原命令行。
@@ -139,7 +141,7 @@ qin memory delete <ID>       删除长期记忆
 qin knowledge add <PATH>     导入文件或目录到知识库
 qin knowledge search <QUERY> 搜索知识库
 qin knowledge reindex        重建知识索引
-qin sync                     将低写入缓冲同步到持久数据库
+qin sync                     刷新待写审计、WAL checkpoint 与 SQLite 页面缓存
 qin config path              显示实际使用的配置和数据库路径
 qin config check             校验配置、密钥引用和模型能力
 qin doctor                   检查网络、数据库、Shell、搜索和提权能力
@@ -366,7 +368,7 @@ OpenWrt 建议：
 - 如果希望与 LuCI/UCI 集成，单独实现 `UciConfigSource`，将 UCI 转成内部统一配置结构。
 - 会话需要持久保存时，将 `storage.data_dir` 指向容量和耐久性合适的 overlay/外置存储。
 - 闪存设备启用 `low_write` profile：单次调用内存聚合、单事务批量提交、延迟自动记忆写入、禁用查询计数写回，并优先使用可复用 rollback journal；有可靠磁盘的 Linux/macOS 默认使用 WAL。
-- 最近会话事件先写入 `/tmp` 的 tmpfs spool，默认在本次 `qin` 正常结束时批量落盘。只有显式开启跨调用缓冲后，才延迟到条数/时间阈值或 `qin sync`；该模式可能在断电时丢失尚未同步的普通事件，初始化时必须明确告知用户。
+- 跨调用 `/tmp` tmpfs spool 是后续可选优化；当前实现仅在单次调用内聚合消息和审计，并在结束时使用一笔事务落盘，避免引入断电丢失多轮会话的默认行为。
 
 如果必须让配置和数据库同目录，可以显式设置 `QIN_HOME` 或 `storage.data_dir` 进入“便携模式”，但不作为系统默认。
 
@@ -724,7 +726,7 @@ knowledge_index_state(item_id, indexed_hash, indexed_at)
 低写入不是简单地“少调用几次 SQLite”，而是减少事务、索引重复更新、元数据更新和同一内容重复向量化：
 
 1. 一次 `qin` 调用期间，消息、工具事件、usage、自动提取记忆先进入内存 `UnitOfWork`，在安全边界一次事务提交。
-2. `low_write` 模式把本次调用的非关键事件序列化到 `/tmp` tmpfs spool，并在正常结束时一次写入持久 SQLite；崩溃恢复时也可以识别该 spool，而不是进行大量逐事件事务。
+2. 当前 `low_write` 模式在进程内聚合非关键事件，并在正常结束时一次写入持久 SQLite；可恢复的 `/tmp` tmpfs spool 保留为后续扩展。
 3. 用户显式执行 `qin memory add` 或 Agent 的 `save_memory` 获得确认后立即持久化；自动提取的候选记忆允许延迟。
 4. 只在内容哈希变化时重新切块和生成 embedding；完全相同的文档导入是零写入。
 5. Embedding API 使用批量请求，所有 chunk 和向量使用一笔事务写入。
@@ -737,7 +739,7 @@ knowledge_index_state(item_id, indexed_hash, indexed_at)
 
 - `durable`：每次调用结束持久化，数据最安全，写入较多。
 - `low_write`：每次正常结束仍落盘，只合并单次调用内写入；显式记忆优先保证持久化，OpenWrt 默认。
-- `low_write + cross_invocation_buffer`：跨多次调用在 tmpfs 聚合，到条数/时间阈值或 `qin sync` 才落盘；写入最少，但必须由用户显式开启并接受断电丢失近期普通事件的风险。
+- `low_write + cross_invocation_buffer`（规划中，当前配置会拒绝启用）：跨多次调用在 tmpfs 聚合，到条数/时间阈值或 `qin sync` 才落盘；写入最少，但必须由用户显式开启并接受断电丢失近期普通事件的风险。
 
 用户首次启用 `cross_invocation_buffer` 时必须确认；`qin status` 应显示未同步事件数，`qin sync` 原子落盘并清空 tmp spool。
 
@@ -1058,9 +1060,9 @@ OpenWrt 包应安装：
 - `qin fromfile <PATH>` 安全读取受大小限制的 UTF-8 文本，并作为普通用户提示词进入当前会话。
 - 数据库使用 SQLite；Linux/macOS WAL，OpenWrt `auto` 根据数据目录选择。
 - 知识库、长期记忆、Embedding 和向量搜索属于首版核心能力，不是可选插件。
-- Linux/macOS 默认 sqlite-vec，OpenWrt 默认 flat cosine + f16 canonical vector。
+- 当前所有平台使用流式 flat cosine；OpenWrt 额外默认使用 f16 canonical vector，sqlite-vec 保留为后续桌面可选后端。
 - 只对新增或内容哈希变化的 chunk 生成 embedding，并批量事务写入。
-- OpenWrt 默认 low_write：单次调用内存/tmpfs 聚合，正常结束时一笔事务持久化全部交互；跨调用缓冲必须显式开启，并提供 `qin sync`。
+- OpenWrt 默认 low_write：单次调用内存聚合，正常结束时一笔事务持久化全部交互；跨调用 tmpfs 缓冲保留为后续可选能力。
 - 普通调用延续全局当前会话，`qin new` 切换新会话。
 - `qin` 一次调用即退出，不实现常驻 daemon。
 - 模型协议先实现 Chat Completions，内部接口为 Responses API 留扩展点。

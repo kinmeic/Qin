@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -81,7 +81,7 @@ impl ConfigPathResolver {
                 .join(&config.storage.database));
         }
         if self.scope == ConfigScope::System {
-            return Ok(PathBuf::from("/var/lib/qin").join(&config.storage.database));
+            return Ok(system_data_directory(is_openwrt()).join(&config.storage.database));
         }
         let dirs =
             ProjectDirs::from("", "", "qin").context("Unable to determine the data directory")?;
@@ -89,8 +89,16 @@ impl ConfigPathResolver {
     }
 }
 
+fn system_data_directory(openwrt: bool) -> PathBuf {
+    if openwrt {
+        PathBuf::from("/etc/qin")
+    } else {
+        PathBuf::from("/var/lib/qin")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
     pub default_model: String,
@@ -126,7 +134,7 @@ impl Default for Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
     pub base_url: String,
     pub api_style: String,
@@ -136,6 +144,8 @@ pub struct ModelConfig {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub stream: bool,
+    pub supports_tools: bool,
+    pub supports_parallel_tools: bool,
     pub supports_native_search: bool,
 }
 
@@ -150,6 +160,8 @@ impl Default for ModelConfig {
             context_window: 128_000,
             max_output_tokens: 8_192,
             stream: true,
+            supports_tools: true,
+            supports_parallel_tools: false,
             supports_native_search: false,
         }
     }
@@ -177,7 +189,7 @@ impl ModelConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct InputConfig {
     pub fromfile_max_bytes: u64,
     pub allow_utf8_bom: bool,
@@ -195,12 +207,14 @@ impl Default for InputConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
     pub max_iterations: u32,
     pub max_tool_calls: u32,
     pub wall_time_seconds: u64,
+    pub model: String,
     pub summary_model: String,
+    pub live_reasoning: bool,
 }
 
 impl Default for AgentConfig {
@@ -209,13 +223,15 @@ impl Default for AgentConfig {
             max_iterations: 24,
             max_tool_calls: 80,
             wall_time_seconds: 900,
+            model: String::new(),
             summary_model: "summary".to_string(),
+            live_reasoning: false,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ContextConfig {
     pub compact_trigger_ratio: f64,
     pub compact_target_ratio: f64,
@@ -239,13 +255,15 @@ impl Default for ContextConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub data_dir: String,
     pub database: String,
     pub journal_mode: String,
     pub write_profile: String,
     pub busy_timeout_ms: u64,
+    pub retention_days: u64,
+    pub low_write: LowWriteConfig,
 }
 
 impl Default for StorageConfig {
@@ -256,12 +274,38 @@ impl Default for StorageConfig {
             journal_mode: "auto".to_string(),
             write_profile: "auto".to_string(),
             busy_timeout_ms: 5_000,
+            retention_days: 0,
+            low_write: LowWriteConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LowWriteConfig {
+    pub tmp_spool_dir: String,
+    pub flush_every_turns: u32,
+    pub flush_interval_seconds: u64,
+    pub flush_on_clean_shutdown: bool,
+    pub cross_invocation_buffer: bool,
+    pub explicit_memory_durable: bool,
+}
+
+impl Default for LowWriteConfig {
+    fn default() -> Self {
+        Self {
+            tmp_spool_dir: "/tmp/qin-spool".into(),
+            flush_every_turns: 8,
+            flush_interval_seconds: 1_800,
+            flush_on_clean_shutdown: true,
+            cross_invocation_buffer: false,
+            explicit_memory_durable: true,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
     pub base_url: String,
     pub model: String,
@@ -277,7 +321,7 @@ impl Default for EmbeddingConfig {
         Self {
             base_url: "https://api.openai.com/v1".to_string(),
             model: "text-embedding-3-small".to_string(),
-            api_key_env: Some("QIN_API_KEY".to_string()),
+            api_key_env: None,
             api_key: None,
             dimensions: 1536,
             batch_size: 32,
@@ -297,15 +341,21 @@ impl EmbeddingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KnowledgeConfig {
     pub enabled: bool,
     pub recall_limit: usize,
     pub max_context_tokens: usize,
     pub chunk_tokens: usize,
     pub chunk_overlap_tokens: usize,
+    pub retrieval: String,
+    pub vector_weight: f32,
+    pub keyword_weight: f32,
+    pub importance_weight: f32,
+    pub index_backend: String,
     pub auto_extract: bool,
     pub auto_extract_every_turns: u32,
+    pub max_auto_memories_per_run: usize,
 }
 
 impl Default for KnowledgeConfig {
@@ -316,14 +366,20 @@ impl Default for KnowledgeConfig {
             max_context_tokens: 2_500,
             chunk_tokens: 600,
             chunk_overlap_tokens: 80,
+            retrieval: "hybrid".into(),
+            vector_weight: 0.70,
+            keyword_weight: 0.20,
+            importance_weight: 0.10,
+            index_backend: "auto".into(),
             auto_extract: true,
             auto_extract_every_turns: 1,
+            max_auto_memories_per_run: 3,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PermissionsConfig {
     pub approval: String,
     pub workspace_write: bool,
@@ -349,11 +405,12 @@ impl Default for PermissionsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SearchProviderConfig {
     pub enabled: bool,
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
+    pub model: Option<String>,
 }
 
 impl SearchProviderConfig {
@@ -363,7 +420,7 @@ impl SearchProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SearchConfig {
     pub order: Vec<String>,
     pub max_results: usize,
@@ -387,13 +444,15 @@ impl Default for SearchConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     pub show_tool_events: bool,
     pub show_commands: bool,
     pub stream_command_output: bool,
     pub command_heartbeat_seconds: u64,
     pub command_output_max_bytes: usize,
+    pub color: String,
+    pub final_answer_to_stdout: bool,
 }
 
 impl Default for UiConfig {
@@ -404,6 +463,8 @@ impl Default for UiConfig {
             stream_command_output: true,
             command_heartbeat_seconds: 5,
             command_output_max_bytes: 262_144,
+            color: "auto".into(),
+            final_answer_to_stdout: true,
         }
     }
 }
@@ -421,12 +482,14 @@ fn resolve_secret(env_name: Option<&str>, inline: Option<&str>, label: &str) -> 
 
 impl Config {
     pub fn primary_model(&self) -> Result<&ModelConfig> {
-        self.models.get(&self.default_model).with_context(|| {
-            format!(
-                "default_model={} does not exist in [models]",
-                self.default_model
-            )
-        })
+        let name = if self.agent.model.is_empty() {
+            &self.default_model
+        } else {
+            &self.agent.model
+        };
+        self.models
+            .get(name)
+            .with_context(|| format!("active model={} does not exist in [models]", name))
     }
 
     pub fn validate(&self, check_secret: bool) -> Result<()> {
@@ -436,24 +499,52 @@ impl Config {
                 self.version
             );
         }
-        let model = self.primary_model()?;
-        if model.base_url.trim().is_empty() || !model.base_url.starts_with("http") {
-            bail!(
-                "models.{}.base_url must be an HTTP(S) URL",
+        self.models.get(&self.default_model).with_context(|| {
+            format!(
+                "default_model={} does not exist in [models]",
                 self.default_model
+            )
+        })?;
+        let model = self.primary_model()?;
+        for (name, candidate) in &self.models {
+            validate_http_url(&candidate.base_url, &format!("models.{name}.base_url"))?;
+            if candidate.api_style != "chat_completions" {
+                bail!("models.{name}.api_style must be chat_completions");
+            }
+            if candidate.model.trim().is_empty() {
+                bail!("models.{name}.model cannot be empty");
+            }
+            if candidate.supports_parallel_tools {
+                bail!("models.{name}.supports_parallel_tools=true is not supported");
+            }
+            validate_secret_source(
+                candidate.api_key_env.as_deref(),
+                candidate.api_key.as_deref(),
+                &format!("models.{name}"),
+            )?;
+            if !(1_024..=2_000_000).contains(&candidate.context_window)
+                || candidate.max_output_tokens == 0
+                || candidate.max_output_tokens > 262_144
+                || candidate.max_output_tokens >= candidate.context_window
+            {
+                bail!("models.{name} has invalid context or output token limits");
+            }
+        }
+        let reserved = self
+            .context
+            .reserve_output_tokens
+            .checked_add(self.context.reserve_safety_tokens)
+            .context("Context token reserves overflowed")?;
+        if reserved >= model.context_window {
+            bail!("Context token reserves must be smaller than the model context_window");
+        }
+        if self.context.reserve_output_tokens < model.max_output_tokens {
+            bail!(
+                "context.reserve_output_tokens must be at least the active model's max_output_tokens"
             );
         }
-        if model.api_style != "chat_completions" {
-            bail!("Only api_style=chat_completions is currently supported");
-        }
-        if model.model.trim().is_empty() {
-            bail!("models.{}.model cannot be empty", self.default_model);
-        }
-        if model.max_output_tokens == 0 || model.max_output_tokens >= model.context_window {
-            bail!("max_output_tokens must be greater than 0 and less than context_window");
-        }
-        if self.input.fromfile_max_bytes == 0 {
-            bail!("input.fromfile_max_bytes must be greater than 0");
+        if self.input.fromfile_max_bytes == 0 || self.input.fromfile_max_bytes > 64 * 1024 * 1024 {
+            bail!("input.fromfile_max_bytes must be between 1 byte and 64 MiB");
         }
         if !(0.1..1.0).contains(&self.context.compact_trigger_ratio)
             || !(0.1..self.context.compact_trigger_ratio)
@@ -461,7 +552,151 @@ impl Config {
         {
             bail!("Context compression ratios must satisfy 0.1 <= target < trigger < 1.0");
         }
+        if !(1..=1_024).contains(&self.agent.max_iterations)
+            || !(1..=4_096).contains(&self.agent.max_tool_calls)
+            || !(1..=86_400).contains(&self.agent.wall_time_seconds)
+        {
+            bail!(
+                "Agent iteration, tool-call, or wall-time limits are outside the supported range"
+            );
+        }
+        if self.agent.live_reasoning {
+            bail!("agent.live_reasoning is not supported by chat_completions models");
+        }
+        if self.context.tool_result_max_tokens == 0
+            || self.context.tool_result_max_tokens > 1_000_000
+            || self.context.protect_recent_tokens >= model.context_window.saturating_sub(reserved)
+        {
+            bail!(
+                "Context tool and recent-history limits are invalid for the model context window"
+            );
+        }
+        if self.storage.database.trim().is_empty()
+            || Path::new(&self.storage.database).components().count() != 1
+        {
+            bail!("storage.database must be a file name, not a path");
+        }
+        if !matches!(
+            self.storage.journal_mode.to_ascii_lowercase().as_str(),
+            "auto" | "wal" | "persist" | "delete"
+        ) {
+            bail!("storage.journal_mode must be auto, wal, persist, or delete");
+        }
+        if !matches!(
+            self.storage.write_profile.to_ascii_lowercase().as_str(),
+            "auto" | "durable" | "low_write"
+        ) {
+            bail!("storage.write_profile must be auto, durable, or low_write");
+        }
+        if self.storage.busy_timeout_ms > 300_000 {
+            bail!("storage.busy_timeout_ms cannot exceed 300000");
+        }
+        if self.storage.retention_days != 0 {
+            bail!("storage.retention_days is reserved for a future release and must remain 0");
+        }
+        if self.storage.low_write != LowWriteConfig::default() {
+            bail!("Custom [storage.low_write] thresholds are reserved for a future release");
+        }
+        if !matches!(
+            self.permissions.approval.as_str(),
+            "always" | "on_risk" | "never"
+        ) {
+            bail!("permissions.approval must be always, on_risk, or never");
+        }
+        if !matches!(
+            self.permissions.elevation.as_str(),
+            "auto" | "sudo" | "doas" | "disabled"
+        ) {
+            bail!("permissions.elevation must be auto, sudo, doas, or disabled");
+        }
+        if self.permissions.command_timeout_seconds == 0
+            || self.permissions.command_timeout_seconds > 3_600
+            || self.permissions.max_output_bytes == 0
+            || self.permissions.max_output_bytes > 64 * 1024 * 1024
+        {
+            bail!("Command timeout or output-size limits are outside the supported range");
+        }
+        if self.ui.command_output_max_bytes == 0
+            || self.ui.command_output_max_bytes > self.permissions.max_output_bytes
+            || self.ui.command_heartbeat_seconds == 0
+            || self.ui.command_heartbeat_seconds > 3_600
+        {
+            bail!(
+                "ui.command_output_max_bytes must be nonzero and cannot exceed permissions.max_output_bytes"
+            );
+        }
+        if self.search.max_results == 0 || self.search.max_results > 100 {
+            bail!("search.max_results must be between 1 and 100");
+        }
+        if self.search.timeout_seconds == 0 || self.search.timeout_seconds > 300 {
+            bail!("search.timeout_seconds must be between 1 and 300");
+        }
+        if self
+            .search
+            .order
+            .iter()
+            .any(|provider| !matches!(provider.as_str(), "exa" | "brave" | "native"))
+        {
+            bail!("search.order contains an unsupported provider");
+        }
+        let unique_search_providers: HashSet<_> = self.search.order.iter().collect();
+        if unique_search_providers.len() != self.search.order.len() {
+            bail!("search.order cannot contain duplicate providers");
+        }
+        if (self.search.exa.enabled || self.search.brave.enabled || self.search.native.enabled)
+            && self.search.order.is_empty()
+        {
+            bail!("search.order cannot be empty while a search provider is enabled");
+        }
+        for (name, provider) in [("exa", &self.search.exa), ("brave", &self.search.brave)] {
+            validate_secret_source(
+                provider.api_key_env.as_deref(),
+                provider.api_key.as_deref(),
+                &format!("search.{name}"),
+            )?;
+            if provider.enabled && !self.search.order.iter().any(|item| item == name) {
+                bail!("search.{name} is enabled but missing from search.order");
+            }
+        }
+        if self.search.native.enabled && !self.search.order.iter().any(|item| item == "native") {
+            bail!("search.native is enabled but missing from search.order");
+        }
+        if self.search.native.api_key_env.is_some()
+            || self
+                .search
+                .native
+                .api_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            bail!("search.native uses the selected model's API key and cannot define its own");
+        }
+        if let Some(name) = self.search.native.model.as_deref() {
+            if !self.models.contains_key(name) {
+                bail!("search.native.model={name} does not exist in [models]");
+            }
+        }
+        if self.search.native.enabled {
+            let native_model = self
+                .search
+                .native
+                .model
+                .as_deref()
+                .and_then(|name| self.models.get(name))
+                .unwrap_or(model);
+            if !native_model.supports_native_search {
+                bail!(
+                    "search.native is enabled but its selected model does not support native search"
+                );
+            }
+        }
         if self.knowledge.enabled {
+            validate_http_url(&self.embeddings.base_url, "embeddings.base_url")?;
+            validate_secret_source(
+                self.embeddings.api_key_env.as_deref(),
+                self.embeddings.api_key.as_deref(),
+                "embeddings",
+            )?;
             if self.embeddings.model.trim().is_empty() || self.embeddings.dimensions == 0 {
                 bail!(
                     "embeddings.model and dimensions are required when the knowledge base is enabled"
@@ -470,15 +705,97 @@ impl Config {
             if !matches!(self.embeddings.vector_encoding.as_str(), "f32" | "f16") {
                 bail!("embeddings.vector_encoding supports only f32 or f16");
             }
+            if self.embeddings.dimensions > 65_536
+                || !(1..=2_048).contains(&self.embeddings.batch_size)
+            {
+                bail!("Embedding dimensions or batch size are outside the supported range");
+            }
+            if self.knowledge.chunk_tokens < 64
+                || self.knowledge.chunk_tokens > 1_000_000
+                || self.knowledge.chunk_overlap_tokens >= self.knowledge.chunk_tokens
+                || self.knowledge.recall_limit > 100
+                || self.knowledge.max_context_tokens == 0
+                || self.knowledge.max_context_tokens > 1_000_000
+                || self.knowledge.auto_extract_every_turns == 0
+            {
+                bail!("Knowledge chunking or recall limits are invalid");
+            }
+            if self.knowledge.retrieval != "hybrid"
+                || !matches!(self.knowledge.index_backend.as_str(), "auto" | "flat")
+            {
+                bail!("Only hybrid retrieval with the auto or flat index backend is supported");
+            }
+            let weight_sum = self.knowledge.vector_weight
+                + self.knowledge.keyword_weight
+                + self.knowledge.importance_weight;
+            if !weight_sum.is_finite()
+                || (weight_sum - 1.0).abs() > 0.001
+                || self.knowledge.vector_weight < 0.0
+                || self.knowledge.keyword_weight < 0.0
+                || self.knowledge.importance_weight < 0.0
+            {
+                bail!("Knowledge retrieval weights must be nonnegative and sum to 1.0");
+            }
+            if self.knowledge.max_auto_memories_per_run > 20 {
+                bail!("knowledge.max_auto_memories_per_run cannot exceed 20");
+            }
+        }
+        if self.ui.color != "auto" {
+            bail!("ui.color is reserved for a future release and must remain auto");
+        }
+        if !self.ui.final_answer_to_stdout {
+            bail!("ui.final_answer_to_stdout=false is not supported");
         }
         if check_secret {
-            model.resolve_api_key()?;
+            for candidate in self.models.values() {
+                candidate.resolve_api_key()?;
+            }
             if self.knowledge.enabled {
                 self.embeddings.resolve_api_key()?;
+            }
+            if self.search.exa.enabled {
+                self.search.exa.secret("Exa")?;
+            }
+            if self.search.brave.enabled {
+                self.search.brave.secret("Brave")?;
             }
         }
         Ok(())
     }
+}
+
+fn validate_http_url(value: &str, label: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).with_context(|| format!("{label} is not a valid URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("{label} must be an HTTP(S) URL with a host");
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("{label} cannot contain credentials, a query string, or a fragment");
+    }
+    Ok(())
+}
+
+fn validate_secret_source(env_name: Option<&str>, inline: Option<&str>, label: &str) -> Result<()> {
+    if env_name.is_some() && inline.is_some_and(|value| !value.trim().is_empty()) {
+        bail!("{label} cannot configure both api_key_env and api_key");
+    }
+    if let Some(name) = env_name {
+        let mut chars = name.chars();
+        if name.trim() != name
+            || !chars
+                .next()
+                .is_some_and(|value| value == '_' || value.is_ascii_alphabetic())
+            || !chars.all(|value| value == '_' || value.is_ascii_alphanumeric())
+            || matches!(name, "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME")
+        {
+            bail!("{label}.api_key_env is not a safe environment-variable name");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -511,7 +828,26 @@ pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Resul
         set_dir_permissions(parent, resolver.scope())?;
     }
 
-    if path.exists() && !options.force {
+    let existing = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                bail!(
+                    "Refusing to initialize over a non-regular configuration path: {}",
+                    path.display()
+                );
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("Unable to inspect {}", path.display()));
+        }
+    };
+    if existing {
+        set_file_permissions(path)?;
+    }
+
+    if existing && !options.force {
         let outcome = InitOutcome {
             created: false,
             config_path: path.to_path_buf(),
@@ -525,8 +861,8 @@ pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Resul
     }
 
     let mut backup_path = None;
-    if path.exists() {
-        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    if existing {
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
         let backup = path.with_extension(format!("toml.bak.{stamp}"));
         fs::rename(path, &backup).with_context(|| {
             format!(
@@ -537,7 +873,8 @@ pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Resul
         backup_path = Some(backup);
     }
 
-    if let Err(error) = persist_template(path, parent) {
+    let template = platform_template(is_openwrt());
+    if let Err(error) = persist_template(path, parent, &template) {
         if let Some(backup) = backup_path.as_ref() {
             let _ = fs::rename(backup, path);
         }
@@ -556,11 +893,24 @@ pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Resul
     Ok(outcome)
 }
 
-fn persist_template(path: &Path, parent: &Path) -> Result<()> {
+fn platform_template(openwrt: bool) -> String {
+    if openwrt {
+        CONFIG_TEMPLATE
+            .replace("vector_encoding = \"f32\"", "vector_encoding = \"f16\"")
+            .replace(
+                "auto_extract_every_turns = 1",
+                "auto_extract_every_turns = 8",
+            )
+    } else {
+        CONFIG_TEMPLATE.to_string()
+    }
+}
+
+fn persist_template(path: &Path, parent: &Path, template: &str) -> Result<()> {
     let mut temp = NamedTempFile::new_in(parent)
         .with_context(|| format!("Unable to create a temporary file in {}", parent.display()))?;
     set_file_permissions(temp.path())?;
-    temp.write_all(CONFIG_TEMPLATE.as_bytes())?;
+    temp.write_all(template.as_bytes())?;
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path)
         .map_err(|error| error.error)
@@ -582,20 +932,44 @@ pub fn load(resolver: &ConfigPathResolver) -> Result<Config> {
             path.display()
         );
     }
-    let content = fs::read_to_string(path)
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Unable to inspect configuration file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("The configuration path must be a regular file and cannot be a symbolic link");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "Configuration file {} is readable or writable by other users; run chmod 600 {}",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut bytes = Vec::new();
+    options
+        .open(path)
+        .with_context(|| format!("Unable to read configuration file {}", path.display()))?
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("Unable to read configuration file {}", path.display()))?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        bail!("Configuration file exceeds the 4 MiB size limit");
+    }
+    let content = String::from_utf8(bytes).context("Configuration file is not valid UTF-8")?;
     let mut config: Config = toml::from_str(&content)
         .with_context(|| format!("Invalid configuration file format: {}", path.display()))?;
-    if is_openwrt() {
-        if config.storage.write_profile == "auto" {
-            config.storage.write_profile = "low_write".into();
-        }
-        if config.embeddings.vector_encoding == "f32" {
-            config.embeddings.vector_encoding = "f16".into();
-        }
-        if config.knowledge.auto_extract_every_turns == 1 {
-            config.knowledge.auto_extract_every_turns = 8;
-        }
+    if is_openwrt() && config.storage.write_profile == "auto" {
+        config.storage.write_profile = "low_write".into();
     }
     Ok(config)
 }
@@ -687,6 +1061,12 @@ mod tests {
     }
 
     #[test]
+    fn openwrt_system_data_uses_persistent_overlay() {
+        assert_eq!(system_data_directory(true), PathBuf::from("/etc/qin"));
+        assert_eq!(system_data_directory(false), PathBuf::from("/var/lib/qin"));
+    }
+
+    #[test]
     fn init_is_idempotent_and_parseable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -726,5 +1106,113 @@ mod tests {
         .unwrap();
         assert!(outcome.backup_path.unwrap().exists());
         load(&resolver).unwrap().validate(false).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_fields_and_malformed_urls() {
+        let unknown = toml::from_str::<Config>(
+            r#"
+            version = 1
+            default_model = "primary"
+            unexpected = true
+
+            [models.primary]
+            model = "test"
+            api_key = "key"
+            "#,
+        );
+        assert!(unknown.is_err());
+
+        let mut config = Config::default();
+        let model = ModelConfig {
+            model: "test".into(),
+            api_key: Some("key".into()),
+            api_key_env: None,
+            base_url: "httpx://example.com".into(),
+            ..ModelConfig::default()
+        };
+        config.models.insert("primary".into(), model);
+        config.knowledge.enabled = false;
+        assert!(config.validate(false).is_err());
+    }
+
+    #[test]
+    fn accepts_fields_generated_by_the_v1_template() {
+        let config: Config = toml::from_str(
+            r#"
+            version = 1
+            default_model = "primary"
+
+            [models.primary]
+            model = "test"
+            api_key = "test-key"
+            supports_parallel_tools = false
+
+            [agent]
+            model = "primary"
+            summary_model = "primary"
+            live_reasoning = false
+
+            [storage]
+            retention_days = 0
+
+            [storage.low_write]
+            tmp_spool_dir = "/tmp/qin-spool"
+            flush_every_turns = 8
+            flush_interval_seconds = 1800
+            flush_on_clean_shutdown = true
+            cross_invocation_buffer = false
+            explicit_memory_durable = true
+
+            [knowledge]
+            enabled = false
+            retrieval = "hybrid"
+            vector_weight = 0.70
+            keyword_weight = 0.20
+            importance_weight = 0.10
+            index_backend = "auto"
+            max_auto_memories_per_run = 3
+
+            [search.native]
+            model = "primary"
+
+            [ui]
+            color = "auto"
+            final_answer_to_stdout = true
+            "#,
+        )
+        .unwrap();
+        config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn openwrt_template_uses_flash_friendly_defaults() {
+        let template = platform_template(true);
+        assert!(template.contains("vector_encoding = \"f16\""));
+        assert!(template.contains("auto_extract_every_turns = 8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rejects_configuration_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.toml");
+        let link = dir.path().join("config.toml");
+        fs::write(&target, "do-not-change").unwrap();
+        symlink(&target, &link).unwrap();
+        let resolver = ConfigPathResolver::new(Some(link), false).unwrap();
+        assert!(
+            initialize(
+                &resolver,
+                &InitOptions {
+                    force: true,
+                    edit: false,
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(target).unwrap(), "do-not-change");
     }
 }

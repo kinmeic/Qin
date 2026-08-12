@@ -58,7 +58,8 @@ Configuration and persistent state use platform-appropriate directories by defau
 - Linux user configuration: `${XDG_CONFIG_HOME:-~/.config}/qin/config.toml`
 - Linux user data: `${XDG_DATA_HOME:-~/.local/share}/qin/`
 - Linux/OpenWrt system configuration: `/etc/qin/config.toml`
-- Linux/OpenWrt system data: `/var/lib/qin/`
+- Linux system data: `/var/lib/qin/`
+- OpenWrt system data: `/etc/qin/qin.db` by default, so it survives systems where `/var` is tmpfs; set `storage.data_dir` to durable external storage when available
 - macOS user configuration and data: platform application-support directories for `qin`
 
 Run `qin config path` and `qin doctor` to see the exact active paths. Use `qin init --system` when you intentionally want a system-wide configuration. An explicitly selected configuration stores its database beside that configuration unless `storage.data_dir` overrides the location.
@@ -77,8 +78,8 @@ context_window = 128000
 max_output_tokens = 4096
 
 [context]
-compression_trigger_ratio = 0.75
-compression_target_ratio = 0.50
+compact_trigger_ratio = 0.72
+compact_target_ratio = 0.45
 ```
 
 Keep API keys in environment variables whenever possible instead of storing secrets directly in the configuration file.
@@ -139,7 +140,7 @@ qin doctor
 qin sync
 ```
 
-`qin sync` flushes buffered database state and the OpenWrt persistence journal to durable storage.
+`qin sync` commits pending audit records, checkpoints WAL databases, and asks SQLite to flush cached pages.
 
 ## How a task runs
 
@@ -153,10 +154,12 @@ The model can request local tools for directory listing, file inspection, readin
 
 These controls are guardrails, not a complete operating-system sandbox. Review displayed commands, use normal user privileges by default, protect your configuration and database, and keep backups of important data.
 
+See [SECURITY.md](SECURITY.md) for vulnerability reporting and deployment guidance. The latest correctness, security, and performance review is summarized in [AUDIT.md](AUDIT.md).
+
 ## Development
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```

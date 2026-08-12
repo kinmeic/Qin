@@ -85,7 +85,7 @@ pub enum Command {
         command: KnowledgeCommand,
     },
 
-    /// Flush the database WAL and buffered state to durable storage
+    /// Commit pending audits, checkpoint WAL, and flush SQLite cached pages
     Sync,
 
     /// Check configuration, database, and platform capabilities
@@ -178,6 +178,13 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
             index += 2;
             continue;
         }
+        if value == "--" {
+            args.remove(index);
+            if index < args.len() {
+                args.insert(index, OsString::from("run"));
+            }
+            return args;
+        }
         if value.starts_with("--config=")
             || value == "--json"
             || value == "--quiet"
@@ -229,6 +236,14 @@ mod tests {
         assert_eq!(
             normalize_args(strings(&["qin", "--config", "x.toml", "hello"])),
             strings(&["qin", "--config", "x.toml", "run", "hello"])
+        );
+    }
+
+    #[test]
+    fn supports_hyphen_prefixed_prompts_after_separator() {
+        assert_eq!(
+            normalize_args(strings(&["qin", "--", "- inspect this directory"])),
+            strings(&["qin", "run", "- inspect this directory"])
         );
     }
 }

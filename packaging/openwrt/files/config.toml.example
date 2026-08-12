@@ -19,7 +19,7 @@ batch_size = 16
 vector_encoding = "f16"
 
 [storage]
-data_dir = "/root/.local/share/qin"
+data_dir = "/etc/qin"
 database = "qin.db"
 journal_mode = "persist"
 write_profile = "low_write"

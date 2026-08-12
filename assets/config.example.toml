@@ -13,7 +13,6 @@ api_key_env = "QIN_API_KEY"
 context_window = 128000
 max_output_tokens = 8192
 supports_tools = true
-supports_parallel_tools = false
 supports_native_search = false
 stream = true
 
@@ -38,9 +37,7 @@ vector_encoding = "f32"
 max_iterations = 24
 max_tool_calls = 80
 wall_time_seconds = 900
-model = "primary"
 summary_model = "summary"
-live_reasoning = false
 
 [context]
 compact_trigger_ratio = 0.72
@@ -61,15 +58,6 @@ database = "qin.db"
 journal_mode = "auto"
 write_profile = "auto"
 busy_timeout_ms = 5000
-retention_days = 0
-
-[storage.low_write]
-tmp_spool_dir = "/tmp/qin-spool"
-flush_every_turns = 8
-flush_interval_seconds = 1800
-flush_on_clean_shutdown = true
-cross_invocation_buffer = false
-explicit_memory_durable = true
 
 [knowledge]
 enabled = true
@@ -118,5 +106,3 @@ show_commands = true
 stream_command_output = true
 command_heartbeat_seconds = 5
 command_output_max_bytes = 262144
-color = "auto"
-final_answer_to_stdout = true

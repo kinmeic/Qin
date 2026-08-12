@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,7 @@ pub fn load(path: &Path, input: &InputConfig) -> Result<LoadedPrompt> {
             path.display()
         )
     })?;
-    let mut file = File::open(&canonical_path)?;
+    let mut file = open_no_follow(&canonical_path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         bail!(
@@ -74,6 +74,17 @@ pub fn load(path: &Path, input: &InputConfig) -> Result<LoadedPrompt> {
         byte_len: bytes.len(),
         sha256: hash,
     })
+}
+
+fn open_no_follow(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    Ok(options.open(path)?)
 }
 
 #[cfg(test)]

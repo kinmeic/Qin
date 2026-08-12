@@ -20,7 +20,7 @@ use crate::state::StateStore;
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("Error: {error:#}");
+        eprintln!("Error: {}", terminal(&event::redact(&format!("{error:#}"))));
         std::process::exit(1);
     }
 }
@@ -48,15 +48,23 @@ async fn run() -> Result<()> {
                 ConfigCommand::Path => {
                     if resolver.config_path().exists() {
                         let config = config::load(&resolver)?;
-                        println!("Scope: {}", resolver.scope().label());
-                        println!("Configuration: {}", resolver.config_path().display());
-                        println!("Database: {}", resolver.database_path(&config)?.display());
+                        events.configure(&config.ui);
+                        println!("Scope: {}", terminal(resolver.scope().label()));
+                        println!(
+                            "Configuration: {}",
+                            terminal(&resolver.config_path().display().to_string())
+                        );
+                        println!(
+                            "Database: {}",
+                            terminal(&resolver.database_path(&config)?.display().to_string())
+                        );
                     } else {
                         events.config_path(&resolver)?;
                     }
                 }
                 ConfigCommand::Check => {
                     let loaded = config::load(&resolver)?;
+                    events.configure(&loaded.ui);
                     loaded.validate(true)?;
                     events.success(&format!(
                         "Configuration is valid: {}",
@@ -85,7 +93,7 @@ async fn run() -> Result<()> {
             .await?;
         }
         Command::New { prompt } => {
-            let (config, resolver, mut store) = open(&explicit_config)?;
+            let (config, resolver, mut store) = open(&explicit_config, &events)?;
             let cwd = std::env::current_dir()?;
             let title = prompt
                 .first()
@@ -110,7 +118,7 @@ async fn run() -> Result<()> {
             drop(resolver);
         }
         Command::Sessions => {
-            let (_, _, store) = open(&explicit_config)?;
+            let (_, _, store) = open(&explicit_config, &events)?;
             let current = store.current_session()?;
             for session in store.list_sessions(100)? {
                 println!(
@@ -122,25 +130,25 @@ async fn run() -> Result<()> {
                     },
                     short_id(&session.id),
                     session.updated_at,
-                    session.title
+                    terminal(&session.title)
                 );
             }
         }
         Command::Use { session_id } => {
-            let (_, _, mut store) = open(&explicit_config)?;
+            let (_, _, mut store) = open(&explicit_config, &events)?;
             store.use_session(&session_id)?;
             events.success(&format!("Active session: {session_id}"))?;
         }
         Command::Show { session_id } => {
-            let (_, _, store) = open(&explicit_config)?;
+            let (_, _, store) = open(&explicit_config, &events)?;
             let id = session_id
                 .or(store.current_session()?)
                 .context("There is no active session")?;
             for message in store.load_messages(&id)? {
                 println!(
                     "[{}] {}",
-                    message.role,
-                    message.content.unwrap_or_else(|| "[tool_calls]".into())
+                    terminal(&message.role),
+                    terminal(&message.content.unwrap_or_else(|| "[tool_calls]".into()))
                 );
             }
         }
@@ -149,7 +157,7 @@ async fn run() -> Result<()> {
             handle_knowledge(command, &explicit_config, &events).await?
         }
         Command::Sync => {
-            let (_, _, mut store) = open(&explicit_config)?;
+            let (_, _, mut store) = open(&explicit_config, &events)?;
             store.checkpoint()?;
             events.success(&format!(
                 "Database synchronized: {}",
@@ -161,10 +169,14 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn open(explicit: &Option<PathBuf>) -> Result<(config::Config, ConfigPathResolver, StateStore)> {
+fn open(
+    explicit: &Option<PathBuf>,
+    events: &EventSink,
+) -> Result<(config::Config, ConfigPathResolver, StateStore)> {
     let resolver = ConfigPathResolver::new(explicit.clone(), false)?;
     let config = config::load(&resolver)?;
     config.validate(false)?;
+    events.configure(&config.ui);
     let store = StateStore::open(&config, &resolver)?;
     Ok((config, resolver, store))
 }
@@ -176,7 +188,7 @@ async fn execute_from_file(
     yes: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let (config, _resolver, mut store) = open(explicit)?;
+    let (config, _resolver, mut store) = open(explicit, events)?;
     events.tool_started("read_prompt_file", &format!("path={}", path.display()))?;
     let loaded = prompt_file::load(path, &config.input)
         .with_context(|| format!("Unable to load prompt file {}", path.display()))?;
@@ -205,7 +217,7 @@ async fn execute_prompt(
     yes: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let (config, _resolver, mut store) = open(explicit)?;
+    let (config, _resolver, mut store) = open(explicit, events)?;
     let id = store.ensure_current_session(&std::env::current_dir()?)?;
     execute_with(
         &config, &mut store, &id, prompt, source, path, events, yes, dry_run,
@@ -248,11 +260,11 @@ async fn handle_memory(
     explicit: &Option<PathBuf>,
     events: &EventSink,
 ) -> Result<()> {
-    let (config, _resolver, mut store) = open(explicit)?;
+    let (config, _resolver, mut store) = open(explicit, events)?;
     match command {
         MemoryCommand::List => {
             for row in store.list_knowledge(Some("memory"))? {
-                println!("{}\t{}", short_id(&row.id), row.content)
+                println!("{}\t{}", short_id(&row.id), terminal(&row.content))
             }
         }
         MemoryCommand::Add { text } => {
@@ -265,7 +277,12 @@ async fn handle_memory(
         }
         MemoryCommand::Search { query, limit } => {
             for hit in knowledge::search(&store, &config, &query, Some("memory"), limit).await? {
-                println!("{:.3}\t{}\t{}", hit.score, short_id(&hit.id), hit.content)
+                println!(
+                    "{:.3}\t{}\t{}",
+                    hit.score,
+                    short_id(&hit.id),
+                    terminal(&hit.content)
+                )
             }
         }
         MemoryCommand::Delete { id } => {
@@ -283,11 +300,16 @@ async fn handle_knowledge(
     explicit: &Option<PathBuf>,
     events: &EventSink,
 ) -> Result<()> {
-    let (config, _resolver, mut store) = open(explicit)?;
+    let (config, _resolver, mut store) = open(explicit, events)?;
     match command {
         KnowledgeCommand::List => {
             for row in store.list_knowledge(None)? {
-                println!("{}\t{}\t{}", short_id(&row.id), row.kind, row.title)
+                println!(
+                    "{}\t{}\t{}",
+                    short_id(&row.id),
+                    terminal(&row.kind),
+                    terminal(&row.title)
+                )
             }
         }
         KnowledgeCommand::Add { path } => {
@@ -300,8 +322,8 @@ async fn handle_knowledge(
                     "{:.3}\t{}\t{}\n{}",
                     hit.score,
                     short_id(&hit.id),
-                    hit.title,
-                    hit.content
+                    terminal(&hit.title),
+                    terminal(&hit.content)
                 )
             }
         }
@@ -319,13 +341,21 @@ async fn handle_knowledge(
 }
 
 fn doctor(explicit: &Option<PathBuf>, events: &EventSink) -> Result<()> {
-    let (config, resolver, store) = open(explicit)?;
-    println!("Configuration: {}", resolver.config_path().display());
-    println!("Database: {}", store.path().display());
-    println!("Model: {}", config.primary_model()?.model);
+    let (config, resolver, store) = open(explicit, events)?;
+    println!(
+        "Configuration: {}",
+        terminal(&resolver.config_path().display().to_string())
+    );
+    println!(
+        "Database: {}",
+        terminal(&store.path().display().to_string())
+    );
+    println!("Model: {}", terminal(&config.primary_model()?.model));
     println!(
         "Embedding: {} ({} dimensions, {})",
-        config.embeddings.model, config.embeddings.dimensions, config.embeddings.vector_encoding
+        terminal(&config.embeddings.model),
+        config.embeddings.dimensions,
+        terminal(&config.embeddings.vector_encoding)
     );
     println!(
         "Platform: {}/{}",
@@ -344,4 +374,8 @@ fn doctor(explicit: &Option<PathBuf>, events: &EventSink) -> Result<()> {
 }
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+fn terminal(value: &str) -> String {
+    event::sanitize_terminal(value)
 }
