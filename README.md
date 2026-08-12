@@ -51,6 +51,18 @@ To install the release binary and supporting files:
 
 OpenWrt devices vary by CPU architecture, libc, and ABI. Cross-compile for the exact device target first, then use the files under `packaging/openwrt` to build an `opkg` package.
 
+### Prebuilt releases
+
+Tagged releases publish checksummed archives for Linux (`x86_64`, `arm64`), macOS (`x86_64`, Apple Silicon `arm64`), and OpenWrt (`x86_64`, `aarch64_cortex-a53`). OpenWrt releases also include installable `.ipk` packages:
+
+```sh
+opkg install qin_VERSION-1_aarch64_cortex-a53.ipk
+# or
+opkg install qin_VERSION-1_x86_64.ipk
+```
+
+After installing, copy or rename `/etc/qin/config.toml.example` to `/etc/qin/config.toml`, edit it, and run `qin config check`.
+
 ## Configuration
 
 Configuration and persistent state use platform-appropriate directories by default:
