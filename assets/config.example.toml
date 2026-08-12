@@ -1,0 +1,123 @@
+# qin configuration
+# Prefer environment variables for secrets, for example:
+#   export QIN_API_KEY="sk-..."
+
+version = 1
+default_model = "primary"
+
+[models.primary]
+base_url = "https://api.openai.com/v1"
+api_style = "chat_completions"
+model = "gpt-4o-mini"
+api_key_env = "QIN_API_KEY"
+context_window = 128000
+max_output_tokens = 8192
+supports_tools = true
+supports_parallel_tools = false
+supports_native_search = false
+stream = false
+
+[models.summary]
+base_url = "https://api.openai.com/v1"
+api_style = "chat_completions"
+model = "gpt-4o-mini"
+api_key_env = "QIN_API_KEY"
+context_window = 128000
+max_output_tokens = 2048
+supports_tools = false
+
+[embeddings]
+base_url = "https://api.openai.com/v1"
+model = "text-embedding-3-small"
+api_key_env = "QIN_API_KEY"
+dimensions = 1536
+batch_size = 32
+vector_encoding = "f32"
+
+[agent]
+max_iterations = 24
+max_tool_calls = 80
+wall_time_seconds = 900
+model = "primary"
+summary_model = "summary"
+live_reasoning = false
+
+[context]
+compact_trigger_ratio = 0.72
+compact_target_ratio = 0.45
+reserve_output_tokens = 8192
+reserve_safety_tokens = 2048
+protect_recent_tokens = 16000
+tool_result_max_tokens = 6000
+
+[input]
+fromfile_max_bytes = 1048576
+allow_utf8_bom = true
+reject_nul = true
+
+[storage]
+data_dir = ""
+database = "qin.db"
+journal_mode = "auto"
+write_profile = "auto"
+busy_timeout_ms = 5000
+retention_days = 0
+
+[storage.low_write]
+tmp_spool_dir = "/tmp/qin-spool"
+flush_every_turns = 8
+flush_interval_seconds = 1800
+flush_on_clean_shutdown = true
+cross_invocation_buffer = false
+explicit_memory_durable = true
+
+[knowledge]
+enabled = true
+recall_limit = 8
+max_context_tokens = 2500
+retrieval = "hybrid"
+vector_weight = 0.70
+keyword_weight = 0.20
+importance_weight = 0.10
+index_backend = "auto"
+chunk_tokens = 600
+chunk_overlap_tokens = 80
+auto_extract = true
+auto_extract_every_turns = 1
+max_auto_memories_per_run = 3
+
+[permissions]
+approval = "on_risk"
+workspace_write = true
+allow_shell = true
+elevation = "auto"
+trash_instead_of_delete = true
+command_timeout_seconds = 120
+max_output_bytes = 1048576
+
+[search]
+order = ["exa", "brave", "native"]
+max_results = 8
+timeout_seconds = 15
+
+[search.exa]
+enabled = false
+api_key_env = "EXA_API_KEY"
+
+[search.brave]
+enabled = false
+api_key_env = "BRAVE_API_KEY"
+
+[search.native]
+enabled = false
+model = "primary"
+
+[ui]
+show_tool_events = true
+show_commands = true
+stream_command_output = true
+command_heartbeat_seconds = 5
+command_output_max_bytes = 262144
+color = "auto"
+final_answer_to_stdout = true
+
