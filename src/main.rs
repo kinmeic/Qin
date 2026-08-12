@@ -20,7 +20,7 @@ use crate::state::StateStore;
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("错误：{error:#}");
+        eprintln!("Error: {error:#}");
         std::process::exit(1);
     }
 }
@@ -48,9 +48,9 @@ async fn run() -> Result<()> {
                 ConfigCommand::Path => {
                     if resolver.config_path().exists() {
                         let config = config::load(&resolver)?;
-                        println!("范围：{}", resolver.scope().label());
-                        println!("配置：{}", resolver.config_path().display());
-                        println!("数据库：{}", resolver.database_path(&config)?.display());
+                        println!("Scope: {}", resolver.scope().label());
+                        println!("Configuration: {}", resolver.config_path().display());
+                        println!("Database: {}", resolver.database_path(&config)?.display());
                     } else {
                         events.config_path(&resolver)?;
                     }
@@ -58,7 +58,10 @@ async fn run() -> Result<()> {
                 ConfigCommand::Check => {
                     let loaded = config::load(&resolver)?;
                     loaded.validate(true)?;
-                    events.success(&format!("配置有效：{}", resolver.config_path().display()))?;
+                    events.success(&format!(
+                        "Configuration is valid: {}",
+                        resolver.config_path().display()
+                    ))?;
                 }
             }
         }
@@ -68,7 +71,7 @@ async fn run() -> Result<()> {
         Command::Run { prompt } => {
             let prompt = prompt.join(" ");
             if prompt.trim().is_empty() {
-                bail!("提示词不能为空")
+                bail!("The prompt cannot be empty")
             }
             execute_prompt(
                 prompt,
@@ -89,7 +92,7 @@ async fn run() -> Result<()> {
                 .map(|_| prompt.join(" "))
                 .map(|v| v.chars().take(60).collect::<String>());
             let id = store.new_session(&cwd, title.as_deref())?;
-            events.success(&format!("已创建并切换到新会话：{id}"))?;
+            events.success(&format!("Created and switched to a new session: {id}"))?;
             if !prompt.is_empty() {
                 execute_with(
                     &config,
@@ -126,13 +129,13 @@ async fn run() -> Result<()> {
         Command::Use { session_id } => {
             let (_, _, mut store) = open(&explicit_config)?;
             store.use_session(&session_id)?;
-            events.success(&format!("当前会话：{session_id}"))?;
+            events.success(&format!("Active session: {session_id}"))?;
         }
         Command::Show { session_id } => {
             let (_, _, store) = open(&explicit_config)?;
             let id = session_id
                 .or(store.current_session()?)
-                .context("当前没有会话")?;
+                .context("There is no active session")?;
             for message in store.load_messages(&id)? {
                 println!(
                     "[{}] {}",
@@ -148,7 +151,10 @@ async fn run() -> Result<()> {
         Command::Sync => {
             let (_, _, mut store) = open(&explicit_config)?;
             store.checkpoint()?;
-            events.success(&format!("数据库已同步：{}", store.path().display()))?;
+            events.success(&format!(
+                "Database synchronized: {}",
+                store.path().display()
+            ))?;
         }
         Command::Doctor => doctor(&explicit_config, &events)?,
     }
@@ -173,7 +179,7 @@ async fn execute_from_file(
     let (config, _resolver, mut store) = open(explicit)?;
     events.tool_started("read_prompt_file", &format!("path={}", path.display()))?;
     let loaded = prompt_file::load(path, &config.input)
-        .with_context(|| format!("无法加载提示词文件 {}", path.display()))?;
+        .with_context(|| format!("Unable to load prompt file {}", path.display()))?;
     events.prompt_file_loaded(&loaded)?;
     let id = store.ensure_current_session(&std::env::current_dir()?)?;
     execute_with(
@@ -252,9 +258,9 @@ async fn handle_memory(
         MemoryCommand::Add { text } => {
             let added = knowledge::add_memory(&mut store, &config, &text).await?;
             events.success(if added {
-                "记忆已保存"
+                "Memory saved"
             } else {
-                "相同记忆已存在"
+                "An identical memory already exists"
             })?
         }
         MemoryCommand::Search { query, limit } => {
@@ -264,9 +270,9 @@ async fn handle_memory(
         }
         MemoryCommand::Delete { id } => {
             if !store.delete_knowledge(&id)? {
-                bail!("记忆不存在：{id}")
+                bail!("Memory does not exist: {id}")
             }
-            events.success("记忆已删除")?
+            events.success("Memory deleted")?
         }
     }
     Ok(())
@@ -286,7 +292,7 @@ async fn handle_knowledge(
         }
         KnowledgeCommand::Add { path } => {
             let count = knowledge::add_path(&mut store, &config, &path).await?;
-            events.success(&format!("知识库新增 {count} 个文档"))?
+            events.success(&format!("Added {count} document(s) to the knowledge base"))?
         }
         KnowledgeCommand::Search { query, limit } => {
             for hit in knowledge::search(&store, &config, &query, None, limit).await? {
@@ -301,36 +307,40 @@ async fn handle_knowledge(
         }
         KnowledgeCommand::Remove { id } => {
             if !store.delete_knowledge(&id)? {
-                bail!("知识条目不存在：{id}")
+                bail!("Knowledge entry does not exist: {id}")
             }
-            events.success("知识条目已删除")?
+            events.success("Knowledge entry deleted")?
         }
-        KnowledgeCommand::Reindex => {
-            events.success("flat 向量索引以 canonical BLOB 为准，无需重建")?
-        }
+        KnowledgeCommand::Reindex => events.success(
+            "The flat vector index uses canonical BLOB data and does not need rebuilding",
+        )?,
     }
     Ok(())
 }
 
 fn doctor(explicit: &Option<PathBuf>, events: &EventSink) -> Result<()> {
     let (config, resolver, store) = open(explicit)?;
-    println!("配置：{}", resolver.config_path().display());
-    println!("数据库：{}", store.path().display());
-    println!("模型：{}", config.primary_model()?.model);
+    println!("Configuration: {}", resolver.config_path().display());
+    println!("Database: {}", store.path().display());
+    println!("Model: {}", config.primary_model()?.model);
     println!(
-        "Embedding：{} ({} dimensions, {})",
+        "Embedding: {} ({} dimensions, {})",
         config.embeddings.model, config.embeddings.dimensions, config.embeddings.vector_encoding
     );
-    println!("平台：{}/{}", std::env::consts::OS, std::env::consts::ARCH);
     println!(
-        "Shell：{}",
+        "Platform: {}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    println!(
+        "Shell: {}",
         if config.permissions.allow_shell {
             "enabled"
         } else {
             "disabled"
         }
     );
-    events.success("基础诊断通过")
+    events.success("Basic diagnostics passed")
 }
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)

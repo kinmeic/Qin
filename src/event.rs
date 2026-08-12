@@ -59,7 +59,7 @@ impl EventSink {
             let level = if elevated {
                 "sudo/root"
             } else {
-                "普通权限"
+                "standard privileges"
             };
             self.stderr(
                 "command_started",
@@ -85,12 +85,12 @@ impl EventSink {
             let level = if elevated {
                 "sudo/root"
             } else {
-                "普通权限"
+                "standard privileges"
             };
             self.stderr(
                 "command_preview",
                 &format!(
-                    "→ 准备执行命令 [{level}]  cwd={}  timeout={}s\n  $ {}",
+                    "-> Preparing command [{level}]  cwd={}  timeout={}s\n  $ {}",
                     cwd.display(),
                     timeout,
                     redact(command)
@@ -109,7 +109,10 @@ impl EventSink {
 
     pub fn command_heartbeat(&self, seconds: u64) -> Result<()> {
         if !self.quiet {
-            self.stderr("command_heartbeat", &format!("… 命令仍在运行  {seconds}s"))?;
+            self.stderr(
+                "command_heartbeat",
+                &format!("... Command still running  {seconds}s"),
+            )?;
         }
         Ok(())
     }
@@ -123,9 +126,9 @@ impl EventSink {
                 "command_failed"
             },
             &format!(
-                "{} 命令执行{}  exit={}  {:.2}s",
+                "{} Command {}  exit={}  {:.2}s",
                 if ok { "✓" } else { "✗" },
-                if ok { "成功" } else { "失败" },
+                if ok { "succeeded" } else { "failed" },
                 code.map_or_else(|| "signal".into(), |v| v.to_string()),
                 elapsed_ms as f64 / 1000.0
             ),
@@ -142,7 +145,7 @@ impl EventSink {
             self.stderr(
                 "tool_finished",
                 &format!(
-                    "✓ 已加载提示词文件  path={}  bytes={}  sha256={}",
+                    "OK Loaded prompt file  path={}  bytes={}  sha256={}",
                     loaded.canonical_path.display(),
                     loaded.byte_len,
                     short_hash
@@ -180,31 +183,31 @@ impl EventSink {
                     "scope": outcome.scope.label(),
                     "config_path": outcome.config_path,
                     "backup_path": outcome.backup_path,
-                    "next_action": "编辑模型与 Embedding 配置，然后运行 qin config check"
+                    "next_action": "Edit the model and embedding settings, then run qin config check"
                 }))?
             );
             return Ok(());
         }
 
         if outcome.created {
-            println!("✓ qin 配置文件已创建");
+            println!("OK qin configuration file created");
         } else {
-            println!("✓ qin 配置文件已存在，未作修改");
+            println!("OK qin configuration file already exists; no changes made");
         }
-        println!("  范围：{}", outcome.scope.label());
-        println!("  路径：{}", outcome.config_path.display());
+        println!("  Scope: {}", outcome.scope.label());
+        println!("  Path: {}", outcome.config_path.display());
         if cfg!(target_os = "macos") {
-            println!("  编辑：open -e {}", shell_quote(&outcome.config_path));
+            println!("  Edit: open -e {}", shell_quote(&outcome.config_path));
         } else {
             println!(
-                "  编辑：${{EDITOR:-vi}} {}",
+                "  Edit: ${{EDITOR:-vi}} {}",
                 shell_quote(&outcome.config_path)
             );
         }
         if let Some(backup) = outcome.backup_path.as_ref() {
-            println!("  备份：{}", backup.display());
+            println!("  Backup: {}", backup.display());
         }
-        println!("  下一步：编辑模型与 Embedding 配置，然后运行 qin config check");
+        println!("  Next: edit the model and embedding settings, then run qin config check");
         Ok(())
     }
 
@@ -218,8 +221,8 @@ impl EventSink {
                 }))?
             );
         } else {
-            println!("范围：{}", resolver.scope().label());
-            println!("配置：{}", resolver.config_path().display());
+            println!("Scope: {}", resolver.scope().label());
+            println!("Configuration: {}", resolver.config_path().display());
         }
         Ok(())
     }

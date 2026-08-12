@@ -33,67 +33,67 @@ pub fn definitions(config: &Config) -> Vec<Value> {
     let mut tools = vec![
         tool(
             "list_directory",
-            "列出目录内容",
+            "List directory contents",
             json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         ),
         tool(
             "read_file",
-            "读取 UTF-8 文本文件",
+            "Read a UTF-8 text file",
             json!({"type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["path"]}),
         ),
         tool(
             "stat_path",
-            "查看路径类型、大小和权限",
+            "Inspect a path's type, size, and permissions",
             json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         ),
         tool(
             "create_directory",
-            "创建目录",
+            "Create a directory",
             json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         ),
         tool(
             "write_file",
-            "写入 UTF-8 文件，会覆盖已有内容",
+            "Write a UTF-8 file, replacing any existing content",
             json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         ),
         tool(
             "move_path",
-            "移动或重命名文件/目录",
+            "Move or rename a file or directory",
             json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["source","destination"]}),
         ),
         tool(
             "copy_path",
-            "复制文件",
+            "Copy a file",
             json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["source","destination"]}),
         ),
         tool(
             "remove_path",
-            "删除文件或目录（危险操作）",
+            "Delete a file or directory (dangerous operation)",
             json!({"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean"}},"required":["path"]}),
         ),
         tool(
             "apply_patch",
-            "对文件执行精确文本替换",
+            "Apply an exact text replacement to a file",
             json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}),
         ),
         tool(
             "search_memory",
-            "语义搜索长期记忆",
+            "Semantically search long-term memory",
             json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}),
         ),
         tool(
             "save_memory",
-            "保存用户偏好、事实或可复用流程到长期记忆",
+            "Save a user preference, fact, or reusable procedure to long-term memory",
             json!({"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}),
         ),
         tool(
             "web_search",
-            "使用 Exa、Brave、模型原生搜索顺序搜索互联网",
+            "Search the internet using Exa, then Brave, then model-native search",
             json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}),
         ),
     ];
     if config.permissions.allow_shell {
-        tools.push(tool("shell", "执行 Shell 命令。执行前会显示并按风险请求审批", json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"}},"required":["command"]})));
+        tools.push(tool("shell", "Run a shell command. The command is displayed and approval is requested according to risk before execution", json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"}},"required":["command"]})));
     }
     tools
 }
@@ -109,7 +109,7 @@ pub async fn execute(
     ctx: &mut ToolContext<'_>,
 ) -> Result<ToolResult> {
     let args: Value = serde_json::from_str(arguments)
-        .with_context(|| format!("工具 {name} 参数不是有效 JSON"))?;
+        .with_context(|| format!("Arguments for tool {name} are not valid JSON"))?;
     let started = Instant::now();
     let audit_args = safe_args(name, &args);
     ctx.events.tool_started(name, &audit_args)?;
@@ -163,7 +163,7 @@ async fn execute_inner(name: &str, args: &Value, ctx: &mut ToolContext<'_>) -> R
         "search_memory" => search_memory(args, ctx).await,
         "save_memory" => save_memory(args, ctx).await,
         "web_search" => web_search(args, ctx).await,
-        _ => bail!("未知工具：{name}"),
+        _ => bail!("Unknown tool: {name}"),
     }
 }
 
@@ -199,12 +199,16 @@ fn read_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         .min(ctx.config.permissions.max_output_bytes as u64);
     let metadata = fs::metadata(&path)?;
     if !metadata.is_file() {
-        bail!("不是普通文件：{}", path.display())
+        bail!("Not a regular file: {}", path.display())
     }
     if metadata.len() > max {
-        bail!("文件 {} bytes 超过读取上限 {}", metadata.len(), max)
+        bail!(
+            "File size {} bytes exceeds the read limit of {}",
+            metadata.len(),
+            max
+        )
     }
-    text_result(fs::read_to_string(path).context("文件不是有效 UTF-8 文本")?)
+    text_result(fs::read_to_string(path).context("The file is not valid UTF-8 text")?)
 }
 
 fn stat_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
@@ -229,14 +233,14 @@ fn stat_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
 
 fn create_directory(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve(ctx.cwd, string(args, "path")?);
-    approve_mutation(ctx, &format!("创建目录 {}", path.display()))?;
+    approve_mutation(ctx, &format!("Create directory {}", path.display()))?;
     if !ctx.dry_run {
         fs::create_dir_all(&path)?;
     }
     text_result(if ctx.dry_run {
-        "dry-run：未创建".into()
+        "Dry run: directory not created".into()
     } else {
-        format!("已创建 {}", path.display())
+        format!("Created {}", path.display())
     })
 }
 
@@ -246,7 +250,7 @@ fn write_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     let content = string(args, "content")?;
     approve_mutation(
         ctx,
-        &format!("写入文件 {}（{} bytes）", path.display(), content.len()),
+        &format!("Write {} ({} bytes)", path.display(), content.len()),
     )?;
     if !ctx.dry_run {
         if let Some(parent) = path.parent() {
@@ -255,9 +259,9 @@ fn write_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         fs::write(&path, content)?;
     }
     text_result(if ctx.dry_run {
-        "dry-run：未写入".into()
+        "Dry run: file not written".into()
     } else {
-        format!("已写入 {} bytes", content.len())
+        format!("Wrote {} bytes", content.len())
     })
 }
 
@@ -266,9 +270,9 @@ fn move_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     let dst = resolve(ctx.cwd, string(args, "destination")?);
     reject_symlink_target(&dst)?;
     if dst.exists() && !args["overwrite"].as_bool().unwrap_or(false) {
-        bail!("目标已存在：{}", dst.display())
+        bail!("Destination already exists: {}", dst.display())
     }
-    approve_mutation(ctx, &format!("移动 {} → {}", src.display(), dst.display()))?;
+    approve_mutation(ctx, &format!("Move {} -> {}", src.display(), dst.display()))?;
     if !ctx.dry_run {
         if dst.exists() {
             remove_existing(&dst)?;
@@ -276,9 +280,9 @@ fn move_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         fs::rename(&src, &dst)?;
     }
     text_result(if ctx.dry_run {
-        "dry-run：未移动".into()
+        "Dry run: path not moved".into()
     } else {
-        "移动完成".into()
+        "Move completed".into()
     })
 }
 
@@ -287,12 +291,12 @@ fn copy_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     let dst = resolve(ctx.cwd, string(args, "destination")?);
     reject_symlink_target(&dst)?;
     if !src.is_file() {
-        bail!("首版 copy_path 只复制普通文件")
+        bail!("copy_path currently supports regular files only")
     }
     if dst.exists() && !args["overwrite"].as_bool().unwrap_or(false) {
-        bail!("目标已存在：{}", dst.display())
+        bail!("Destination already exists: {}", dst.display())
     }
-    approve_mutation(ctx, &format!("复制 {} → {}", src.display(), dst.display()))?;
+    approve_mutation(ctx, &format!("Copy {} -> {}", src.display(), dst.display()))?;
     if !ctx.dry_run {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
@@ -300,9 +304,9 @@ fn copy_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         fs::copy(&src, &dst)?;
     }
     text_result(if ctx.dry_run {
-        "dry-run：未复制".into()
+        "Dry run: file not copied".into()
     } else {
-        "复制完成".into()
+        "Copy completed".into()
     })
 }
 
@@ -313,11 +317,11 @@ fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     approve(
         ctx,
         &format!(
-            "{} {}？[y/N] ",
+            "{} {}? [y/N] ",
             if use_trash {
-                "移入 qin 回收目录"
+                "Move to the qin trash directory"
             } else {
-                "永久删除"
+                "Permanently delete"
             },
             path.display()
         ),
@@ -329,7 +333,7 @@ fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
                 .store
                 .path()
                 .parent()
-                .context("数据库没有父目录")?
+                .context("The database has no parent directory")?
                 .join("trash");
             fs::create_dir_all(&trash)?;
             let name = path
@@ -343,7 +347,7 @@ fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         } else {
             if path.is_dir() {
                 if !args["recursive"].as_bool().unwrap_or(false) {
-                    bail!("删除目录必须设置 recursive=true")
+                    bail!("Deleting a directory requires recursive=true")
                 }
                 fs::remove_dir_all(&path)?;
             } else {
@@ -352,11 +356,11 @@ fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         }
     }
     text_result(if ctx.dry_run {
-        "dry-run：未删除".into()
+        "Dry run: path not removed".into()
     } else if use_trash {
-        "已移入 qin 回收目录".into()
+        "Moved to the qin trash directory".into()
     } else {
-        "删除完成".into()
+        "Deletion completed".into()
     })
 }
 
@@ -368,16 +372,16 @@ fn apply_patch(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     let content = fs::read_to_string(&path)?;
     let count = content.matches(old).count();
     if count != 1 {
-        bail!("old_text 必须且只能匹配一次，实际匹配 {count} 次")
+        bail!("old_text must match exactly once; found {count} matches")
     }
-    approve_mutation(ctx, &format!("修改文件 {}", path.display()))?;
+    approve_mutation(ctx, &format!("Modify file {}", path.display()))?;
     if !ctx.dry_run {
         fs::write(path, content.replacen(old, new, 1))?;
     }
     text_result(if ctx.dry_run {
-        "dry-run：未修改".into()
+        "Dry run: file not modified".into()
     } else {
-        "补丁已应用".into()
+        "Patch applied".into()
     })
 }
 
@@ -392,13 +396,13 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         .command_preview(ctx.cwd, command, elevated, timeout)?;
     approve(
         ctx,
-        &format!("允许执行命令 `{}`？[y/N] ", redact(command)),
+        &format!("Allow command `{}`? [y/N] ", redact(command)),
         elevated || dangerous(command),
     )?;
     ctx.events
         .command_started(ctx.cwd, command, elevated, timeout)?;
     if ctx.dry_run {
-        return text_result("dry-run：命令未执行".into());
+        return text_result("Dry run: command not executed".into());
     }
     let started = Instant::now();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -417,8 +421,8 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let stdout = child.stdout.take().context("无法捕获 stdout")?;
-    let stderr = child.stderr.take().context("无法捕获 stderr")?;
+    let stdout = child.stdout.take().context("Unable to capture stdout")?;
+    let stderr = child.stderr.take().context("Unable to capture stderr")?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_line_reader("stdout", stdout, tx.clone());
     spawn_line_reader("stderr", stderr, tx.clone());
@@ -448,11 +452,11 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
             _ = heartbeat.tick() => ctx.events.command_heartbeat(started.elapsed().as_secs())?,
             _ = &mut deadline => {
                 child.kill().await.ok();
-                bail!("命令执行超时（{timeout}s）")
+                bail!("Command timed out after {timeout}s")
             },
             _ = tokio::signal::ctrl_c() => {
                 child.kill().await.ok();
-                bail!("用户取消命令")
+                bail!("Command canceled by the user")
             }
         }
     }
@@ -477,15 +481,15 @@ async fn search_memory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolRe
     text_result(serde_json::to_string_pretty(&hits)?)
 }
 async fn save_memory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
-    approve_mutation(ctx, "保存一条长期记忆")?;
+    approve_mutation(ctx, "Save an item to long-term memory")?;
     if ctx.dry_run {
-        return text_result("dry-run：未保存".into());
+        return text_result("Dry run: memory not saved".into());
     }
     let added = knowledge::add_memory(ctx.store, ctx.config, string(args, "content")?).await?;
     text_result(if added {
-        "记忆已保存".into()
+        "Memory saved".into()
     } else {
-        "相同记忆已存在".into()
+        "An identical memory already exists".into()
     })
 }
 
@@ -510,7 +514,7 @@ async fn web_search(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
             Err(error) => errors.push(format!("{provider}: {error}")),
         }
     }
-    bail!("没有搜索后端成功：{}", errors.join("; "))
+    bail!("No search backend succeeded: {}", errors.join("; "))
 }
 
 async fn search_exa(config: &Config, query: &str, limit: usize) -> Result<String> {
@@ -557,7 +561,7 @@ async fn search_brave(config: &Config, query: &str, limit: usize) -> Result<Stri
 async fn search_native(config: &Config, query: &str) -> Result<String> {
     let model = config.primary_model()?;
     if !model.supports_native_search {
-        bail!("主模型未声明 supports_native_search=true");
+        bail!("The primary model does not declare supports_native_search=true");
     }
     let endpoint = format!("{}/responses", model.base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
@@ -577,7 +581,7 @@ async fn search_native(config: &Config, query: &str) -> Result<String> {
         .await?;
     let status = response.status();
     if !status.is_success() {
-        bail!("模型原生搜索 HTTP {status}");
+        bail!("Model-native search returned HTTP {status}");
     }
     let value = response.json::<Value>().await?;
     if let Some(text) = value["output_text"].as_str() {
@@ -588,7 +592,7 @@ async fn search_native(config: &Config, query: &str) -> Result<String> {
 
 fn approve_mutation(ctx: &ToolContext<'_>, message: &str) -> Result<()> {
     if !ctx.config.permissions.workspace_write {
-        bail!("配置禁止写入工作区")
+        bail!("The configuration does not allow workspace writes")
     }
     approve(ctx, message, false)
 }
@@ -600,17 +604,22 @@ fn approve(ctx: &ToolContext<'_>, message: &str, high_risk: bool) -> Result<()> 
         return Ok(());
     }
     if !io::stdin().is_terminal() {
-        bail!("非交互环境需要审批；请审核后使用 --yes（极高风险操作仍不跳过）")
+        bail!(
+            "Approval is required in a non-interactive environment; review the action and use --yes (extremely high-risk actions are never bypassed)"
+        )
     }
     ctx.events.approval(message)?;
     eprint!("{message}");
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
-    if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes" | "是") {
+    if matches!(
+        answer.trim().to_lowercase().as_str(),
+        "y" | "yes" | "\u{662f}"
+    ) {
         Ok(())
     } else {
-        bail!("用户拒绝执行")
+        bail!("Execution was declined by the user")
     }
 }
 fn dangerous(command: &str) -> bool {
@@ -632,7 +641,7 @@ fn dangerous(command: &str) -> bool {
 }
 fn elevation_program(configured: &str) -> Result<&str> {
     if configured == "disabled" {
-        bail!("配置已禁止提权")
+        bail!("Privilege elevation is disabled by configuration")
     }
     if configured == "doas" {
         return Ok("doas");
@@ -645,7 +654,9 @@ fn elevation_program(configured: &str) -> Result<&str> {
     } else if command_exists("sudo") {
         Ok("sudo")
     } else {
-        bail!("没有找到可用的 doas/sudo；OpenWrt 通常应直接以 root 运行管理员任务")
+        bail!(
+            "No usable doas or sudo executable was found; on OpenWrt, administrative tasks are usually run directly as root"
+        )
     }
 }
 fn command_exists(name: &str) -> bool {
@@ -660,7 +671,10 @@ fn guard_delete(path: &Path, cwd: &Path) -> Result<()> {
         || home.as_deref() == Some(canonical.as_path())
         || canonical == cwd.canonicalize()?
     {
-        bail!("拒绝删除宽泛危险目录：{}", canonical.display())
+        bail!(
+            "Refusing to delete a broad, dangerous directory: {}",
+            canonical.display()
+        )
     }
     Ok(())
 }
@@ -674,7 +688,10 @@ fn remove_existing(path: &Path) -> Result<()> {
 }
 fn reject_symlink_target(path: &Path) -> Result<()> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        bail!("拒绝通过符号链接写入目标：{}", path.display());
+        bail!(
+            "Refusing to write through a symbolic-link target: {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -689,7 +706,7 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
 fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args[key]
         .as_str()
-        .with_context(|| format!("缺少字符串参数 {key}"))
+        .with_context(|| format!("Missing string argument: {key}"))
 }
 fn text(content: String) -> ToolResult {
     ToolResult {
@@ -718,7 +735,7 @@ fn truncate(mut value: String, max: usize) -> String {
             .last()
             .unwrap_or(0);
         value.truncate(boundary);
-        value.push_str("\n[输出已截断]");
+        value.push_str("\n[Output truncated]");
     }
     value
 }

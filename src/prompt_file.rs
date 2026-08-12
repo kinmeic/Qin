@@ -16,17 +16,23 @@ pub struct LoadedPrompt {
 }
 
 pub fn load(path: &Path, input: &InputConfig) -> Result<LoadedPrompt> {
-    let canonical_path = path
-        .canonicalize()
-        .with_context(|| format!("文件不存在或路径不可访问：{}", path.display()))?;
+    let canonical_path = path.canonicalize().with_context(|| {
+        format!(
+            "The file does not exist or is not accessible: {}",
+            path.display()
+        )
+    })?;
     let mut file = File::open(&canonical_path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
-        bail!("fromfile 只接受普通文件：{}", canonical_path.display());
+        bail!(
+            "fromfile accepts regular files only: {}",
+            canonical_path.display()
+        );
     }
     if metadata.len() > input.fromfile_max_bytes {
         bail!(
-            "文件大小 {} bytes，超过 input.fromfile_max_bytes={} 的限制",
+            "The file is {} bytes, exceeding input.fromfile_max_bytes={}",
             metadata.len(),
             input.fromfile_max_bytes
         );
@@ -38,28 +44,28 @@ pub fn load(path: &Path, input: &InputConfig) -> Result<LoadedPrompt> {
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > input.fromfile_max_bytes {
         bail!(
-            "读取过程中发现文件超过 input.fromfile_max_bytes={} 的限制",
+            "The file exceeded input.fromfile_max_bytes={} while being read",
             input.fromfile_max_bytes
         );
     }
     if input.reject_nul && bytes.contains(&0) {
-        bail!("文件包含 NUL 字节，疑似二进制文件");
+        bail!("The file contains NUL bytes and appears to be binary");
     }
 
     let hash = hex::encode(Sha256::digest(&bytes));
     let content_bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         if !input.allow_utf8_bom {
-            bail!("配置禁止读取带 UTF-8 BOM 的文件");
+            bail!("The configuration does not allow UTF-8 BOM input");
         }
         &bytes[3..]
     } else {
         &bytes[..]
     };
     let content = std::str::from_utf8(content_bytes)
-        .context("文件不是有效的 UTF-8 文本")?
+        .context("The file is not valid UTF-8 text")?
         .to_string();
     if content.trim().is_empty() {
-        bail!("提示词文件为空");
+        bail!("The prompt file is empty");
     }
 
     Ok(LoadedPrompt {
@@ -79,9 +85,9 @@ mod tests {
     fn reads_utf8_and_strips_bom() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&[0xEF, 0xBB, 0xBF]).unwrap();
-        file.write_all("执行测试".as_bytes()).unwrap();
+        file.write_all("Run the test".as_bytes()).unwrap();
         let loaded = load(file.path(), &InputConfig::default()).unwrap();
-        assert_eq!(loaded.content, "执行测试");
+        assert_eq!(loaded.content, "Run the test");
         assert_eq!(loaded.byte_len, 15);
     }
 

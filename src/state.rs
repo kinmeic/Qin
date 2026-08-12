@@ -77,15 +77,17 @@ struct PendingAudit {
 impl StateStore {
     pub fn open(config: &Config, resolver: &ConfigPathResolver) -> Result<Self> {
         let path = resolver.database_path(config)?;
-        let parent = path.parent().context("数据库路径没有父目录")?;
+        let parent = path
+            .parent()
+            .context("The database path has no parent directory")?;
         let parent_existed = parent.exists();
         fs::create_dir_all(parent)
-            .with_context(|| format!("无法创建数据目录 {}", parent.display()))?;
+            .with_context(|| format!("Unable to create data directory {}", parent.display()))?;
         if !parent_existed && resolver.scope() != ConfigScope::Explicit {
             set_directory_permissions(parent, resolver.scope())?;
         }
         let connection = Connection::open(&path)
-            .with_context(|| format!("无法打开数据库 {}", path.display()))?;
+            .with_context(|| format!("Unable to open database {}", path.display()))?;
         connection.busy_timeout(Duration::from_millis(config.storage.busy_timeout_ms))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let journal = choose_journal(config, &path);
@@ -135,7 +137,7 @@ impl StateStore {
                 } else {
                     return Err(first_error).with_context(|| {
                         format!(
-                            "会话 {session_id} 正由另一个 qin 进程使用；锁文件：{}",
+                            "Session {session_id} is in use by another qin process; lock file: {}",
                             path.display()
                         )
                     });
@@ -249,7 +251,7 @@ impl StateStore {
 
     pub fn new_session(&mut self, cwd: &Path, title: Option<&str>) -> Result<String> {
         let id = Uuid::new_v4().to_string();
-        let title = title.unwrap_or("新会话");
+        let title = title.unwrap_or("New session");
         let cwd = cwd.to_string_lossy();
         let transaction = self.connection.transaction()?;
         transaction.execute(
@@ -267,7 +269,7 @@ impl StateStore {
 
     pub fn use_session(&mut self, id: &str) -> Result<()> {
         if !self.session_exists(id)? {
-            bail!("会话不存在：{id}");
+            bail!("Session does not exist: {id}");
         }
         self.connection.execute(
             "INSERT INTO app_state(key,value) VALUES ('current_session',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",

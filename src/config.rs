@@ -21,9 +21,9 @@ pub enum ConfigScope {
 impl ConfigScope {
     pub fn label(self) -> &'static str {
         match self {
-            Self::User => "用户级配置",
-            Self::System => "系统级配置",
-            Self::Explicit => "指定配置",
+            Self::User => "user",
+            Self::System => "system",
+            Self::Explicit => "explicit",
         }
     }
 }
@@ -50,8 +50,9 @@ impl ConfigPathResolver {
             });
         }
 
-        let dirs = ProjectDirs::from("", "", "qin")
-            .context("无法确定当前用户的配置目录，请使用 --config 指定路径")?;
+        let dirs = ProjectDirs::from("", "", "qin").context(
+            "Unable to determine the user configuration directory; specify a path with --config",
+        )?;
         Ok(Self {
             config_path: dirs.config_dir().join("config.toml"),
             scope: ConfigScope::User,
@@ -76,13 +77,14 @@ impl ConfigPathResolver {
             return Ok(self
                 .config_path
                 .parent()
-                .context("配置路径没有父目录")?
+                .context("The configuration path has no parent directory")?
                 .join(&config.storage.database));
         }
         if self.scope == ConfigScope::System {
             return Ok(PathBuf::from("/var/lib/qin").join(&config.storage.database));
         }
-        let dirs = ProjectDirs::from("", "", "qin").context("无法确定数据目录")?;
+        let dirs =
+            ProjectDirs::from("", "", "qin").context("Unable to determine the data directory")?;
         Ok(dirs.data_dir().join(&config.storage.database))
     }
 }
@@ -156,9 +158,10 @@ impl Default for ModelConfig {
 impl ModelConfig {
     pub fn resolve_api_key(&self) -> Result<String> {
         if let Some(name) = self.api_key_env.as_deref() {
-            let value = std::env::var(name).with_context(|| format!("环境变量 {name} 尚未设置"))?;
+            let value = std::env::var(name)
+                .with_context(|| format!("Environment variable {name} is not set"))?;
             if value.trim().is_empty() {
-                bail!("环境变量 {name} 为空");
+                bail!("Environment variable {name} is empty");
             }
             return Ok(value);
         }
@@ -169,7 +172,7 @@ impl ModelConfig {
         {
             return Ok(value.to_string());
         }
-        bail!("模型没有配置 api_key_env 或 api_key")
+        bail!("The model does not define api_key_env or api_key")
     }
 }
 
@@ -407,53 +410,65 @@ impl Default for UiConfig {
 
 fn resolve_secret(env_name: Option<&str>, inline: Option<&str>, label: &str) -> Result<String> {
     if let Some(name) = env_name {
-        return std::env::var(name).with_context(|| format!("{label} 环境变量 {name} 尚未设置"));
+        return std::env::var(name)
+            .with_context(|| format!("{label} environment variable {name} is not set"));
     }
     inline
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
-        .with_context(|| format!("{label} 没有配置密钥"))
+        .with_context(|| format!("No secret is configured for {label}"))
 }
 
 impl Config {
     pub fn primary_model(&self) -> Result<&ModelConfig> {
-        self.models
-            .get(&self.default_model)
-            .with_context(|| format!("default_model={} 在 [models] 中不存在", self.default_model))
+        self.models.get(&self.default_model).with_context(|| {
+            format!(
+                "default_model={} does not exist in [models]",
+                self.default_model
+            )
+        })
     }
 
     pub fn validate(&self, check_secret: bool) -> Result<()> {
         if self.version != 1 {
-            bail!("不支持的配置版本 {}，当前只支持 version=1", self.version);
+            bail!(
+                "Unsupported configuration version {}; only version=1 is supported",
+                self.version
+            );
         }
         let model = self.primary_model()?;
         if model.base_url.trim().is_empty() || !model.base_url.starts_with("http") {
-            bail!("models.{}.base_url 必须是 HTTP(S) URL", self.default_model);
+            bail!(
+                "models.{}.base_url must be an HTTP(S) URL",
+                self.default_model
+            );
         }
         if model.api_style != "chat_completions" {
-            bail!("当前代码只支持 api_style=chat_completions");
+            bail!("Only api_style=chat_completions is currently supported");
         }
         if model.model.trim().is_empty() {
-            bail!("models.{}.model 不能为空", self.default_model);
+            bail!("models.{}.model cannot be empty", self.default_model);
         }
         if model.max_output_tokens == 0 || model.max_output_tokens >= model.context_window {
-            bail!("max_output_tokens 必须大于 0 且小于 context_window");
+            bail!("max_output_tokens must be greater than 0 and less than context_window");
         }
         if self.input.fromfile_max_bytes == 0 {
-            bail!("input.fromfile_max_bytes 必须大于 0");
+            bail!("input.fromfile_max_bytes must be greater than 0");
         }
         if !(0.1..1.0).contains(&self.context.compact_trigger_ratio)
             || !(0.1..self.context.compact_trigger_ratio)
                 .contains(&self.context.compact_target_ratio)
         {
-            bail!("context 压缩比例必须满足 0.1 <= target < trigger < 1.0");
+            bail!("Context compression ratios must satisfy 0.1 <= target < trigger < 1.0");
         }
         if self.knowledge.enabled {
             if self.embeddings.model.trim().is_empty() || self.embeddings.dimensions == 0 {
-                bail!("启用知识库时必须配置 embeddings.model 和 dimensions");
+                bail!(
+                    "embeddings.model and dimensions are required when the knowledge base is enabled"
+                );
             }
             if !matches!(self.embeddings.vector_encoding.as_str(), "f32" | "f16") {
-                bail!("embeddings.vector_encoding 只支持 f32 或 f16");
+                bail!("embeddings.vector_encoding supports only f32 or f16");
             }
         }
         if check_secret {
@@ -482,9 +497,16 @@ pub struct InitOutcome {
 
 pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Result<InitOutcome> {
     let path = resolver.config_path();
-    let parent = path.parent().context("配置路径没有父目录")?;
+    let parent = path
+        .parent()
+        .context("The configuration path has no parent directory")?;
     let parent_existed = parent.exists();
-    fs::create_dir_all(parent).with_context(|| format!("无法创建配置目录 {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Unable to create configuration directory {}",
+            parent.display()
+        )
+    })?;
     if !parent_existed || resolver.scope() != ConfigScope::Explicit {
         set_dir_permissions(parent, resolver.scope())?;
     }
@@ -506,8 +528,12 @@ pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Resul
     if path.exists() {
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         let backup = path.with_extension(format!("toml.bak.{stamp}"));
-        fs::rename(path, &backup)
-            .with_context(|| format!("无法把已有配置备份到 {}", backup.display()))?;
+        fs::rename(path, &backup).with_context(|| {
+            format!(
+                "Unable to back up the existing configuration to {}",
+                backup.display()
+            )
+        })?;
         backup_path = Some(backup);
     }
 
@@ -532,13 +558,18 @@ pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Resul
 
 fn persist_template(path: &Path, parent: &Path) -> Result<()> {
     let mut temp = NamedTempFile::new_in(parent)
-        .with_context(|| format!("无法在 {} 创建临时文件", parent.display()))?;
+        .with_context(|| format!("Unable to create a temporary file in {}", parent.display()))?;
     set_file_permissions(temp.path())?;
     temp.write_all(CONFIG_TEMPLATE.as_bytes())?;
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path)
         .map_err(|error| error.error)
-        .with_context(|| format!("配置文件已存在或无法创建：{}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "The configuration file already exists or cannot be created: {}",
+                path.display()
+            )
+        })?;
     set_file_permissions(path)?;
     Ok(())
 }
@@ -546,12 +577,15 @@ fn persist_template(path: &Path, parent: &Path) -> Result<()> {
 pub fn load(resolver: &ConfigPathResolver) -> Result<Config> {
     let path = resolver.config_path();
     if !path.exists() {
-        bail!("配置文件不存在：{}。请先运行 qin init", path.display());
+        bail!(
+            "Configuration file not found: {}. Run qin init first",
+            path.display()
+        );
     }
-    let content =
-        fs::read_to_string(path).with_context(|| format!("无法读取配置文件 {}", path.display()))?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Unable to read configuration file {}", path.display()))?;
     let mut config: Config = toml::from_str(&content)
-        .with_context(|| format!("配置文件格式错误：{}", path.display()))?;
+        .with_context(|| format!("Invalid configuration file format: {}", path.display()))?;
     if is_openwrt() {
         if config.storage.write_profile == "auto" {
             config.storage.write_profile = "low_write".into();
@@ -620,7 +654,7 @@ fn set_file_permissions(_path: &Path) -> Result<()> {
 
 fn open_editor(path: &Path) -> Result<()> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        bail!("当前不是交互式终端，不能使用 --edit");
+        bail!("--edit requires an interactive terminal");
     }
 
     let status =
@@ -631,10 +665,10 @@ fn open_editor(path: &Path) -> Result<()> {
         } else {
             Command::new("vi").arg(path).status()
         }
-        .with_context(|| format!("无法打开编辑器编辑 {}", path.display()))?;
+        .with_context(|| format!("Unable to open an editor for {}", path.display()))?;
 
     if !status.success() {
-        bail!("编辑器退出状态异常：{status}");
+        bail!("The editor exited unsuccessfully: {status}");
     }
     Ok(())
 }

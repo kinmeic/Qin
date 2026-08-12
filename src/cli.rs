@@ -7,27 +7,27 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "qin",
     version,
-    about = "一次调用即退出的命令行 AI Agent",
+    about = "A command-line AI agent that exits after each task",
     long_about = None
 )]
 pub struct Cli {
-    /// 使用指定配置文件
+    /// Use a specific configuration file
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// 使用 JSON 事件输出
+    /// Emit events as JSON
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// 隐藏普通进度信息
+    /// Hide routine progress messages
     #[arg(long, short = 'q', global = true)]
     pub quiet: bool,
 
-    /// 批准普通写入和命令；极高风险操作仍会确认
+    /// Approve ordinary writes and commands; extremely high-risk actions still require confirmation
     #[arg(long, global = true)]
     pub yes: bool,
 
-    /// 只规划和读取，不执行写操作或命令
+    /// Plan and read only; do not perform writes or run commands
     #[arg(long, global = true)]
     pub dry_run: bool,
 
@@ -37,61 +37,61 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// 创建 qin 配置文件并显示实际路径
+    /// Create a qin configuration file and display its path
     Init {
-        /// 创建系统级配置
+        /// Create a system-wide configuration
         #[arg(long, conflicts_with = "config")]
         system: bool,
 
-        /// 备份后重建已有配置
+        /// Back up and replace an existing configuration
         #[arg(long)]
         force: bool,
 
-        /// 创建后打开编辑器
+        /// Open the file in an editor after creation
         #[arg(long)]
         edit: bool,
     },
 
-    /// 读取 UTF-8 文本文件并把正文作为提示词执行
+    /// Read a UTF-8 text file and use its contents as the prompt
     Fromfile {
         #[arg(value_name = "PATH")]
         path: PathBuf,
     },
 
-    /// 创建并切换到新会话，可附带首个提示词
+    /// Create and switch to a new session, optionally with an initial prompt
     New {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
 
-    /// 列出最近会话
+    /// List recent sessions
     Sessions,
 
-    /// 切换当前会话
+    /// Switch the active session
     Use { session_id: String },
 
-    /// 显示当前或指定会话
+    /// Show the active or specified session
     Show { session_id: Option<String> },
 
-    /// 长期记忆管理
+    /// Manage long-term memory
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
     },
 
-    /// 文档知识库管理
+    /// Manage the document knowledge base
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommand,
     },
 
-    /// 将数据库 WAL/缓冲同步到持久存储
+    /// Flush the database WAL and buffered state to durable storage
     Sync,
 
-    /// 检查配置、数据库和平台能力
+    /// Check configuration, database, and platform capabilities
     Doctor,
 
-    /// 查看或检查配置
+    /// View or validate configuration
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -106,9 +106,9 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
-    /// 显示实际配置路径
+    /// Display the active configuration path
     Path,
-    /// 检查配置和密钥引用
+    /// Validate configuration and secret references
     Check,
 }
 
@@ -211,8 +211,8 @@ mod tests {
     #[test]
     fn inserts_run_before_bare_prompt() {
         assert_eq!(
-            normalize_args(strings(&["qin", "帮我检查目录"])),
-            strings(&["qin", "run", "帮我检查目录"])
+            normalize_args(strings(&["qin", "inspect this directory"])),
+            strings(&["qin", "run", "inspect this directory"])
         );
     }
 

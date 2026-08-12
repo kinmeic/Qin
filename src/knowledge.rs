@@ -37,13 +37,22 @@ struct EmbeddingData {
 }
 
 pub async fn add_memory(store: &mut StateStore, config: &Config, content: &str) -> Result<bool> {
-    add_text(store, config, "memory", "长期记忆", None, content, 0.8).await
+    add_text(
+        store,
+        config,
+        "memory",
+        "Long-term memory",
+        None,
+        content,
+        0.8,
+    )
+    .await
 }
 
 pub async fn add_path(store: &mut StateStore, config: &Config, path: &Path) -> Result<usize> {
     let canonical = path
         .canonicalize()
-        .with_context(|| format!("路径不可访问：{}", path.display()))?;
+        .with_context(|| format!("Path is not accessible: {}", path.display()))?;
     let mut files = Vec::new();
     collect_files(&canonical, &mut files)?;
     let mut added = 0;
@@ -77,10 +86,12 @@ async fn add_text(
     importance: f32,
 ) -> Result<bool> {
     if content.trim().is_empty() {
-        bail!("知识内容不能为空");
+        bail!("Knowledge content cannot be empty");
     }
     if contains_injection(content) {
-        bail!("知识内容包含疑似提示词注入指令，已拒绝保存");
+        bail!(
+            "Knowledge content appears to contain a prompt-injection instruction and was rejected"
+        );
     }
     let chunks = chunk_text(
         content,
@@ -89,14 +100,14 @@ async fn add_text(
     );
     let embeddings = embed(config, &chunks).await?;
     if embeddings.len() != chunks.len() {
-        bail!("Embedding 返回数量与 chunk 数不一致");
+        bail!("The number of embeddings does not match the number of chunks");
     }
     if embeddings
         .iter()
         .any(|vector| vector.len() != config.embeddings.dimensions)
     {
         bail!(
-            "Embedding 返回维度与配置 dimensions={} 不一致",
+            "The embedding dimensions do not match the configured dimensions={}",
             config.embeddings.dimensions
         );
     }
@@ -134,10 +145,10 @@ pub async fn search(
         .await?
         .into_iter()
         .next()
-        .context("Embedding 响应为空")?;
+        .context("The embedding response was empty")?;
     if query_vector.len() != config.embeddings.dimensions {
         bail!(
-            "查询向量维度与配置 dimensions={} 不一致",
+            "The query-vector dimensions do not match the configured dimensions={}",
             config.embeddings.dimensions
         );
     }
@@ -219,8 +230,8 @@ pub async fn auto_extract(
         "stream": false,
         "max_tokens": 700,
         "messages": [
-            {"role":"system","content":"从对话中提取0到3条值得长期记忆的用户偏好、项目事实、关键决定或可复用流程。忽略临时调试细节。只输出JSON字符串数组。"},
-            {"role":"user","content":format!("用户：{}\n助手：{}",user.chars().take(2500).collect::<String>(),assistant.chars().take(2500).collect::<String>())}
+            {"role":"system","content":"Extract zero to three items from the conversation that are worth retaining as long-term memory: user preferences, project facts, key decisions, or reusable procedures. Ignore transient debugging details. Output only a JSON array of strings."},
+            {"role":"user","content":format!("User: {}\nAssistant: {}",user.chars().take(2500).collect::<String>(),assistant.chars().take(2500).collect::<String>())}
         ]
     });
     let response = reqwest::Client::builder()
@@ -271,11 +282,11 @@ async fn embed(config: &Config, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         })
         .send()
         .await
-        .with_context(|| format!("Embedding 请求失败：{endpoint}"))?;
+        .with_context(|| format!("Embedding request failed: {endpoint}"))?;
     let status = response.status();
     if !status.is_success() {
         bail!(
-            "Embedding API 返回 {}：{}",
+            "The embedding API returned {}: {}",
             status,
             response
                 .text()
@@ -317,10 +328,10 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
     if !path.is_dir() {
-        bail!("知识导入只支持普通文件或目录");
+        bail!("Knowledge import supports regular files and directories only");
     }
     if files.len() >= 1000 {
-        bail!("一次最多导入 1000 个文件");
+        bail!("A single import is limited to 1,000 files");
     }
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -376,8 +387,8 @@ fn contains_injection(content: &str) -> bool {
     [
         "ignore previous instructions",
         "ignore all previous",
-        "忽略之前的指令",
-        "你现在是dan",
+        "\u{5ffd}\u{7565}\u{4e4b}\u{524d}\u{7684}\u{6307}\u{4ee4}",
+        "\u{4f60}\u{73b0}\u{5728}\u{662f}dan",
         "<|im_start|>system",
     ]
     .iter()
@@ -444,7 +455,7 @@ mod tests {
             ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
         let mut store = StateStore::open(&config, &resolver).unwrap();
         assert!(
-            add_memory(&mut store, &config, "用户偏好 Rust")
+            add_memory(&mut store, &config, "The user prefers Rust")
                 .await
                 .unwrap()
         );

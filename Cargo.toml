@@ -3,7 +3,7 @@ name = "qin"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A small cross-platform command-line AI agent"
+description = "Use natural language to operate Linux, macOS, and OpenWrt without memorizing commands or flags"
 license = "Apache-2.0"
 
 [dependencies]
