@@ -143,7 +143,7 @@ pub fn run(
         &[
             (
                 "on_risk",
-                "approve writes, destructive actions, and unknown shell commands",
+                "auto-run proven read-only and new workspace paths; approve riskier actions",
             ),
             ("always", "approve every tool call"),
             (

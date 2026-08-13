@@ -84,7 +84,7 @@ Configuration and persistent state use platform-appropriate directories by defau
 - OpenWrt system data: `/etc/qin/qin.db` by default, so it survives systems where `/var` is tmpfs; set `storage.data_dir` to durable external storage when available
 - macOS user configuration and data: platform application-support directories for `qin`
 
-Run `qin config path` and `qin doctor` to see the exact active paths. Use `qin init --system` when you intentionally want a system-wide configuration. An explicitly selected configuration stores its database beside that configuration unless `storage.data_dir` overrides the location.
+Run `qin config path` and `qin doctor` to see the exact active paths. Use `qin init --system` when you intentionally want a system-wide configuration. When `sudo qin` is invoked from a normal Linux/macOS user session, qin follows `SUDO_UID` and reuses that user's configuration and data directories; it does not require a second configuration. To intentionally use the system profile, pass `--config /etc/qin/config.toml`. An explicitly selected configuration stores its database beside that configuration unless `storage.data_dir` overrides the location.
 
 ### Optional Redis session storage
 
@@ -248,7 +248,7 @@ The model can request local tools for directory listing, file inspection, readin
 
 ## Safety model
 
-`qin` reduces accidental damage through path validation, risk classification, approvals, command redaction, timeouts, and conservative defaults. With `permissions.approval = "on_risk"`, read-only tools and recognized read-only shell commands such as `date`, `pwd`, and `find ... -print` run without an approval prompt. Writes, unknown shell commands, external-path access, destructive commands, and privilege elevation remain subject to approval. Use `--dry-run` to allow planning and read-only inspection without performing writes or commands. `--yes` can approve ordinary mutations, but it does not bypass confirmation for extremely high-risk actions.
+`qin` reduces accidental damage through path validation, risk classification, approvals, command redaction, timeouts, and conservative defaults. With `permissions.approval = "on_risk"`, read-only tools and recognized read-only shell commands such as `date`, `pwd`, `find ... -print`, `systemctl status`, `journalctl`, and `ip ... show` run without an approval prompt. Creating a new file or directory and copying to an empty destination inside the current workspace also run without a prompt. Overwrites, moves, unknown or ambiguous shell commands, external-path access, destructive commands, and privilege elevation remain subject to approval. At a command prompt, entering `All` approves subsequent shell commands for that task only; it resets on the next invocation and does not bypass Forbidden rules. Commands resolved from untrusted `PATH` directories are not auto-approved. Broad recursive deletion, raw-device destruction, fork bombs, and kill-all operations are refused even after confirmation, `All`, or `--yes`. Use `--dry-run` to allow planning and read-only inspection without performing writes or commands.
 
 These controls are guardrails, not a complete operating-system sandbox. Review displayed commands, use normal user privileges by default, protect your configuration and database, and keep backups of important data.
 

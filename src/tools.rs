@@ -22,6 +22,7 @@ pub struct ToolContext<'a> {
     pub session_id: &'a str,
     pub cwd: &'a Path,
     pub assume_yes: bool,
+    pub approve_all_commands: &'a mut bool,
     pub dry_run: bool,
 }
 
@@ -29,6 +30,7 @@ pub struct ToolContext<'a> {
 pub struct ToolResult {
     pub content: String,
     pub exit_code: Option<i32>,
+    pub completion_summary: Option<String>,
 }
 
 pub fn definitions(config: &Config) -> Vec<Value> {
@@ -151,11 +153,12 @@ pub async fn execute(
             // emitting tool_finished as well would duplicate the line.
             // Dry runs never reach command_finished, so keep the generic line.
             if name != "shell" || ctx.dry_run {
-                ctx.events.tool_finished(
-                    name,
-                    &one_line(&value.content),
-                    started.elapsed().as_millis(),
-                )?;
+                let summary = value
+                    .completion_summary
+                    .clone()
+                    .unwrap_or_else(|| one_line(&value.content));
+                ctx.events
+                    .tool_finished(name, &summary, started.elapsed().as_millis())?;
             }
         }
         Err(error) => {
@@ -360,6 +363,7 @@ fn create_directory(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         ctx,
         &format!("Create directory {}", path.display()),
         &[&path],
+        true,
     )?;
     if !ctx.dry_run {
         fs::create_dir_all(&path)?;
@@ -374,6 +378,7 @@ fn create_directory(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
 fn write_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_target(ctx.cwd, string(args, "path")?)?;
     reject_symlink_target(&path)?;
+    let creates_new_file = !path.exists();
     let content = string(args, "content")?;
     if content.len() > ctx.config.permissions.max_output_bytes {
         bail!("File content exceeds permissions.max_output_bytes");
@@ -382,6 +387,7 @@ fn write_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         ctx,
         &format!("Write {} ({} bytes)", path.display(), content.len()),
         &[&path],
+        creates_new_file,
     )?;
     if !ctx.dry_run {
         if let Some(parent) = path.parent() {
@@ -410,6 +416,7 @@ fn move_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         ctx,
         &format!("Move {} -> {}", src.display(), dst.display()),
         &[&src, &dst],
+        false,
     )?;
     if !ctx.dry_run {
         if dst.exists() && (src.is_dir() || dst.is_dir()) {
@@ -434,10 +441,12 @@ fn copy_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     if dst.exists() && !args["overwrite"].as_bool().unwrap_or(false) {
         bail!("Destination already exists: {}", dst.display())
     }
+    let creates_new_file = !dst.exists();
     approve_path_mutation(
         ctx,
         &format!("Copy {} -> {}", src.display(), dst.display()),
         &[&src, &dst],
+        creates_new_file,
     )?;
     if !ctx.dry_run {
         if let Some(parent) = dst.parent() {
@@ -527,7 +536,12 @@ fn apply_patch(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     if count != 1 {
         bail!("old_text must match exactly once; found {count} matches")
     }
-    approve_path_mutation(ctx, &format!("Modify file {}", path.display()), &[&path])?;
+    approve_path_mutation(
+        ctx,
+        &format!("Modify file {}", path.display()),
+        &[&path],
+        false,
+    )?;
     if !ctx.dry_run {
         atomic_write(&path, content.replacen(old, new, 1).as_bytes())?;
     }
@@ -548,18 +562,36 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     if ctx.dry_run {
         return text_result("Dry run: command not executed".into());
     }
-    let high_risk = elevated || dangerous(command) || invokes_elevation(command);
-    if high_risk || ctx.config.permissions.approval == "always" || !is_read_only_command(command) {
+    if let Some(reason) = forbidden_reason(command) {
+        bail!("Refusing forbidden command: {reason}");
+    }
+    let invokes_elevation = invokes_elevation(command);
+    let high_risk = elevated || dangerous(command) || invokes_elevation;
+    let needs_approval =
+        high_risk || ctx.config.permissions.approval == "always" || !is_read_only_command(command);
+    if needs_approval && !*ctx.approve_all_commands {
         let message = if ctx.events.shows_command_details() {
             // tool_started already displays the full command.
-            "Allow this command? [y/N] ".to_string()
+            "Allow this command? [y/N/All] ".to_string()
         } else {
-            format!("Allow command `{}`? [y/N] ", redact(command))
+            format!("Allow command `{}`? [y/N/All] ", redact(command))
         };
-        approve(ctx, &message, high_risk)?;
+        if approve_command(ctx, &message, high_risk)? == ApprovalDecision::All {
+            *ctx.approve_all_commands = true;
+            ctx.events.warning(
+                "All subsequent shell commands in this task are approved; forbidden commands remain blocked",
+            )?;
+        }
     }
-    ctx.events.command_started(ctx.cwd, elevated, timeout)?;
+    let interactive_terminal = (elevated || invokes_elevation) && io::stdin().is_terminal();
+    ctx.events.command_started(
+        ctx.cwd,
+        elevated || invokes_elevation,
+        timeout,
+        interactive_terminal,
+    )?;
     let started = Instant::now();
+    let mut terminal_mode = TerminalModeGuard::capture(interactive_terminal);
     let shell = "/bin/sh";
     let mut process = if elevated && unsafe { libc::geteuid() } != 0 {
         let mut p = Command::new(elevation_program(&ctx.config.permissions.elevation)?);
@@ -573,13 +605,29 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     #[cfg(unix)]
     process.process_group(0);
     remove_secret_environment(&mut process, ctx.config);
+    remove_shell_startup_environment(&mut process);
     let mut child = process
         .current_dir(ctx.cwd)
+        .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let mut process_group = ProcessGroupGuard::new(child.id());
+    let child_pid = child.id();
+    let mut foreground_group =
+        match ForegroundProcessGroupGuard::attach(interactive_terminal, child_pid) {
+            Ok(guard) => guard,
+            Err(error) => {
+                #[cfg(unix)]
+                if let Some(pid) = child_pid.and_then(|pid| i32::try_from(pid).ok()) {
+                    // SAFETY: pid is the freshly spawned process-group identifier.
+                    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+                child.kill().await.ok();
+                return Err(error);
+            }
+        };
+    let mut process_group = ProcessGroupGuard::new(child_pid);
     let stdout = child.stdout.take().context("Unable to capture stdout")?;
     let stderr = child.stderr.take().context("Unable to capture stderr")?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
@@ -590,9 +638,12 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let mut output_truncated = false;
     let mut streamed_bytes = 0_usize;
     let mut stream_truncated_notice = false;
-    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(
-        ctx.config.ui.command_heartbeat_seconds.max(1),
-    ));
+    let heartbeat_period =
+        std::time::Duration::from_secs(ctx.config.ui.command_heartbeat_seconds.max(1));
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat_period,
+        heartbeat_period,
+    );
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout));
     tokio::pin!(deadline);
     loop {
@@ -623,7 +674,9 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                 }
                 None => break,
             },
-            _ = heartbeat.tick() => ctx.events.command_heartbeat(started.elapsed().as_secs())?,
+            _ = heartbeat.tick(), if !interactive_terminal => {
+                ctx.events.command_heartbeat(started.elapsed().as_secs())?
+            },
             _ = &mut deadline => {
                 child.kill().await.ok();
                 bail!("Command timed out after {timeout}s")
@@ -636,6 +689,12 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     }
     let status = child.wait().await?;
     process_group.disarm();
+    foreground_group
+        .restore()
+        .context("Unable to return terminal control to qin")?;
+    terminal_mode
+        .restore()
+        .context("Unable to restore the terminal input mode")?;
     if output_truncated {
         append_truncation_marker(&mut output, ctx.config.permissions.max_output_bytes);
     }
@@ -650,11 +709,147 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     Ok(ToolResult {
         content: redact(&truncate(output, ctx.config.permissions.max_output_bytes)),
         exit_code: status.code(),
+        completion_summary: None,
     })
 }
 
 struct ProcessGroupGuard {
     pid: Option<u32>,
+}
+
+#[cfg(unix)]
+struct TerminalModeGuard {
+    original: Option<libc::termios>,
+}
+
+#[cfg(unix)]
+impl TerminalModeGuard {
+    fn capture(enabled: bool) -> Self {
+        if !enabled {
+            return Self { original: None };
+        }
+        let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: mode points to valid writable storage and STDIN_FILENO is
+        // checked as a terminal before this guard is enabled.
+        let original = (unsafe { libc::tcgetattr(libc::STDIN_FILENO, mode.as_mut_ptr()) } == 0)
+            .then(|| {
+                // SAFETY: tcgetattr returned success and initialized mode.
+                unsafe { mode.assume_init() }
+            });
+        Self { original }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if let Some(mode) = &self.original {
+            // SAFETY: mode was returned by tcgetattr for this terminal.
+            if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, mode) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.original = None;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        // Restores echo and other flags even if sudo is killed on timeout.
+        let _ = self.restore();
+    }
+}
+
+#[cfg(not(unix))]
+struct TerminalModeGuard;
+
+#[cfg(not(unix))]
+impl TerminalModeGuard {
+    fn capture(_enabled: bool) -> Self {
+        Self
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct ForegroundProcessGroupGuard {
+    original: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl ForegroundProcessGroupGuard {
+    fn attach(enabled: bool, pid: Option<u32>) -> Result<Self> {
+        if !enabled {
+            return Ok(Self { original: None });
+        }
+        let pid = pid
+            .and_then(|pid| i32::try_from(pid).ok())
+            .context("Unable to determine the interactive command process group")?;
+        // SAFETY: STDIN_FILENO is a terminal here and tcgetpgrp only queries it.
+        let original = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+        if original < 0 {
+            return Err(io::Error::last_os_error())
+                .context("Unable to read the terminal foreground process group");
+        }
+        set_terminal_foreground_group(pid)
+            .context("Unable to give the interactive command control of the terminal")?;
+        // The child may have received SIGTTIN during the small handoff window.
+        // SAFETY: pid is the freshly spawned process-group identifier.
+        let _ = unsafe { libc::kill(-pid, libc::SIGCONT) };
+        Ok(Self {
+            original: Some(original),
+        })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if let Some(original) = self.original {
+            set_terminal_foreground_group(original)?;
+            self.original = None;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForegroundProcessGroupGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(unix)]
+fn set_terminal_foreground_group(group: libc::pid_t) -> io::Result<()> {
+    // tcsetpgrp may be called while qin is temporarily in the background
+    // during restoration. Ignore SIGTTOU only for the duration of this call.
+    // SAFETY: signal handlers are restored immediately and group is a process
+    // group obtained from tcgetpgrp or the freshly spawned child pid.
+    let result = unsafe {
+        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let result = libc::tcsetpgrp(libc::STDIN_FILENO, group);
+        libc::signal(libc::SIGTTOU, previous);
+        result
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+struct ForegroundProcessGroupGuard;
+
+#[cfg(not(unix))]
+impl ForegroundProcessGroupGuard {
+    fn attach(_enabled: bool, _pid: Option<u32>) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl ProcessGroupGuard {
@@ -724,7 +919,13 @@ async fn web_search(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
             _ => continue,
         };
         match result {
-            Ok(value) => return text_result(value),
+            Ok(value) => {
+                return Ok(ToolResult {
+                    content: value.content,
+                    exit_code: None,
+                    completion_summary: Some(web_result_summary(value.result_count)),
+                });
+            }
             Err(error) => errors.push(format!("{provider}: {error}")),
         }
     }
@@ -734,7 +935,20 @@ async fn web_search(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     bail!("No search backend succeeded: {}", errors.join("; "))
 }
 
-async fn search_exa(config: &Config, query: &str, limit: usize) -> Result<String> {
+struct WebSearchOutput {
+    content: String,
+    result_count: Option<usize>,
+}
+
+fn web_result_summary(result_count: Option<usize>) -> String {
+    match result_count {
+        Some(1) => "1 result".into(),
+        Some(count) => format!("{count} results"),
+        None => "completed".into(),
+    }
+}
+
+async fn search_exa(config: &Config, query: &str, limit: usize) -> Result<WebSearchOutput> {
     let key = config.search.exa.secret("Exa")?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(
@@ -756,9 +970,15 @@ async fn search_exa(config: &Config, query: &str, limit: usize) -> Result<String
         config.permissions.max_output_bytes.saturating_mul(4),
     )
     .await?;
-    Ok(serde_json::to_string_pretty(&value["results"])?)
+    let results = value["results"]
+        .as_array()
+        .context("Exa response did not contain a results array")?;
+    Ok(WebSearchOutput {
+        content: serde_json::to_string_pretty(results)?,
+        result_count: Some(results.len()),
+    })
 }
-async fn search_brave(config: &Config, query: &str, limit: usize) -> Result<String> {
+async fn search_brave(config: &Config, query: &str, limit: usize) -> Result<WebSearchOutput> {
     let key = config.search.brave.secret("Brave")?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(
@@ -780,10 +1000,16 @@ async fn search_brave(config: &Config, query: &str, limit: usize) -> Result<Stri
         config.permissions.max_output_bytes.saturating_mul(4),
     )
     .await?;
-    Ok(serde_json::to_string_pretty(&value["web"]["results"])?)
+    let results = value["web"]["results"]
+        .as_array()
+        .context("Brave response did not contain a web results array")?;
+    Ok(WebSearchOutput {
+        content: serde_json::to_string_pretty(results)?,
+        result_count: Some(results.len()),
+    })
 }
 
-async fn search_native(config: &Config, query: &str) -> Result<String> {
+async fn search_native(config: &Config, query: &str) -> Result<WebSearchOutput> {
     let model = config
         .search
         .native
@@ -830,9 +1056,15 @@ async fn search_native(config: &Config, query: &str) -> Result<String> {
     )
     .await?;
     if let Some(text) = value["output_text"].as_str() {
-        return Ok(text.to_string());
+        return Ok(WebSearchOutput {
+            content: text.to_string(),
+            result_count: None,
+        });
     }
-    Ok(serde_json::to_string_pretty(&value["output"])?)
+    Ok(WebSearchOutput {
+        content: serde_json::to_string_pretty(&value["output"])?,
+        result_count: None,
+    })
 }
 
 async fn read_json_limited(response: reqwest::Response, max_bytes: usize) -> Result<Value> {
@@ -855,18 +1087,34 @@ async fn read_json_limited(response: reqwest::Response, max_bytes: usize) -> Res
     Ok(serde_json::from_slice(&body)?)
 }
 
-fn approve_path_mutation(ctx: &ToolContext<'_>, message: &str, paths: &[&Path]) -> Result<()> {
+fn approve_path_mutation(
+    ctx: &ToolContext<'_>,
+    message: &str,
+    paths: &[&Path],
+    reversible_without_overwrite: bool,
+) -> Result<()> {
     if !ctx.config.permissions.workspace_write {
         bail!("The configuration does not allow workspace writes")
     }
     if ctx.dry_run {
         return Ok(());
     }
-    approve(
-        ctx,
-        message,
-        paths.iter().any(|path| is_external_path(ctx.cwd, path)),
-    )
+    let external = paths.iter().any(|path| is_external_path(ctx.cwd, path));
+    if auto_approves_path_mutation(ctx.config, ctx.cwd, paths, reversible_without_overwrite) {
+        return Ok(());
+    }
+    approve(ctx, message, external)
+}
+
+fn auto_approves_path_mutation(
+    config: &Config,
+    cwd: &Path,
+    paths: &[&Path],
+    reversible_without_overwrite: bool,
+) -> bool {
+    config.permissions.approval == "on_risk"
+        && reversible_without_overwrite
+        && paths.iter().all(|path| !is_external_path(cwd, path))
 }
 
 fn approve_external_access(ctx: &ToolContext<'_>, path: &Path, action: &str) -> Result<()> {
@@ -906,6 +1154,42 @@ fn approve(ctx: &ToolContext<'_>, message: &str, high_risk: bool) -> Result<()> 
         bail!("Execution was declined by the user")
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecision {
+    Once,
+    All,
+}
+
+fn approve_command(
+    ctx: &ToolContext<'_>,
+    message: &str,
+    high_risk: bool,
+) -> Result<ApprovalDecision> {
+    if ctx.assume_yes && !high_risk {
+        return Ok(ApprovalDecision::Once);
+    }
+    if ctx.config.permissions.approval == "never" && !high_risk {
+        return Ok(ApprovalDecision::Once);
+    }
+    if !io::stdin().is_terminal() {
+        bail!(
+            "Approval is required in a non-interactive environment; review the action and use --yes (extremely high-risk actions are never bypassed)"
+        )
+    }
+    ctx.events.approval_prompt(message)?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    parse_command_approval(&answer).context("Execution was declined by the user")
+}
+
+fn parse_command_approval(answer: &str) -> Option<ApprovalDecision> {
+    match answer.trim().to_lowercase().as_str() {
+        "y" | "yes" | "\u{662f}" => Some(ApprovalDecision::Once),
+        "a" | "all" | "\u{5168}\u{90e8}" => Some(ApprovalDecision::All),
+        _ => None,
+    }
+}
 fn dangerous(command: &str) -> bool {
     let lower = command.to_lowercase();
     let compact: String = lower
@@ -942,6 +1226,301 @@ fn dangerous(command: &str) -> bool {
         || ((compact.contains("curl") || compact.contains("wget"))
             && (compact.contains("|sh") || compact.contains("|bash")))
         || firewall_mutation(command)
+}
+
+fn forbidden_reason(command: &str) -> Option<&'static str> {
+    forbidden_reason_inner(command, 0)
+}
+
+fn forbidden_reason_inner(command: &str, depth: usize) -> Option<&'static str> {
+    if depth > 3 {
+        return Some("nested shell execution exceeded the safety parser limit");
+    }
+    let compact: String = command
+        .chars()
+        .filter(|value| !value.is_whitespace())
+        .collect();
+    if compact.contains(":(){:|:&};:") {
+        return Some("fork bomb");
+    }
+    let commands = shell_commands_for_guard(command)?;
+    for tokens in commands {
+        let tokens = unwrap_command_prefixes(&tokens);
+        let Some(program) = tokens.first().and_then(|value| {
+            Path::new(value)
+                .file_name()
+                .and_then(|value| value.to_str())
+        }) else {
+            continue;
+        };
+        if let Some(reason) = nested_shell_forbidden_reason(program, tokens, depth) {
+            return Some(reason);
+        }
+        if program == "rm" && recursive_rm_targets_forbidden(tokens) {
+            return Some("recursive deletion of a broad system or home directory");
+        }
+        if (program == "mkfs" || program.starts_with("mkfs."))
+            && tokens.iter().any(|value| is_raw_block_device(value))
+        {
+            return Some("formatting a raw block device");
+        }
+        if program == "dd"
+            && tokens
+                .iter()
+                .filter_map(|value| value.strip_prefix("of="))
+                .any(is_raw_block_device)
+        {
+            return Some("overwriting a raw block device");
+        }
+        if program == "wipefs"
+            && tokens
+                .iter()
+                .any(|value| matches!(value.as_str(), "-a" | "--all"))
+            && tokens.iter().any(|value| is_raw_block_device(value))
+        {
+            return Some("erasing signatures from a raw block device");
+        }
+        if tokens.windows(2).any(|pair| {
+            matches!(pair[0].as_str(), ">" | ">>" | ">|" | "1>" | "1>>")
+                && is_raw_block_device(&pair[1])
+        }) {
+            return Some("redirecting output to a raw block device");
+        }
+        if program == "kill" && tokens.iter().skip(1).any(|value| value == "-1") {
+            return Some("killing all accessible processes");
+        }
+    }
+    None
+}
+
+fn nested_shell_forbidden_reason(
+    program: &str,
+    tokens: &[String],
+    depth: usize,
+) -> Option<&'static str> {
+    if !matches!(program, "sh" | "bash" | "zsh" | "ksh" | "dash") {
+        return None;
+    }
+    let index = tokens.iter().position(|value| value == "-c")?;
+    let script = tokens.get(index + 1)?;
+    forbidden_reason_inner(&script.replace(QUOTED_REDIRECT, ">"), depth + 1)
+}
+
+const QUOTED_REDIRECT: char = '\u{e000}';
+
+fn shell_commands_for_guard(command: &str) -> Option<Vec<Vec<String>>> {
+    let mut commands = Vec::new();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        if escaped {
+            token.push(if quote.is_some() && character == '>' {
+                QUOTED_REDIRECT
+            } else {
+                character
+            });
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                } else if character == '>' {
+                    token.push(QUOTED_REDIRECT);
+                } else {
+                    token.push(character);
+                }
+            }
+            Some('"') => {
+                if character == '"' {
+                    quote = None;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '>' {
+                    token.push(QUOTED_REDIRECT);
+                } else {
+                    token.push(character);
+                }
+            }
+            _ if character == '\\' => escaped = true,
+            _ if matches!(character, '\'' | '"') => quote = Some(character),
+            _ if character.is_whitespace() => push_guard_token(&mut tokens, &mut token),
+            _ if character == '>' => {
+                push_guard_token(&mut tokens, &mut token);
+                let mut operator = String::from(">");
+                if characters
+                    .peek()
+                    .is_some_and(|next| matches!(next, '>' | '|'))
+                {
+                    operator.push(characters.next().expect("peeked redirection operator"));
+                }
+                tokens.push(operator);
+            }
+            _ if matches!(character, ';' | '|' | '&') => {
+                push_guard_token(&mut tokens, &mut token);
+                if !tokens.is_empty() {
+                    commands.push(std::mem::take(&mut tokens));
+                }
+            }
+            _ => token.push(character),
+        }
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    push_guard_token(&mut tokens, &mut token);
+    if !tokens.is_empty() {
+        commands.push(tokens);
+    }
+    Some(commands)
+}
+
+fn push_guard_token(tokens: &mut Vec<String>, token: &mut String) {
+    if !token.is_empty() {
+        tokens.push(std::mem::take(token));
+    }
+}
+
+fn unwrap_command_prefixes(mut tokens: &[String]) -> &[String] {
+    loop {
+        let Some(program) = tokens.first().map(String::as_str) else {
+            return tokens;
+        };
+        if matches!(program, "command" | "exec") {
+            tokens = &tokens[1..];
+            continue;
+        }
+        if !matches!(program, "sudo" | "doas" | "env") {
+            return tokens;
+        }
+        let mut index = 1;
+        while index < tokens.len() {
+            let value = tokens[index].as_str();
+            let takes_value = matches!(
+                value,
+                "-u" | "-g"
+                    | "-h"
+                    | "-p"
+                    | "-C"
+                    | "-T"
+                    | "-R"
+                    | "-D"
+                    | "--user"
+                    | "--group"
+                    | "--host"
+                    | "--prompt"
+                    | "--chdir"
+                    | "--unset"
+            );
+            if takes_value {
+                index = index.saturating_add(2);
+            } else if value.starts_with('-') || (program == "env" && value.contains('=')) {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+        tokens = &tokens[index.min(tokens.len())..];
+    }
+}
+
+fn recursive_rm_targets_forbidden(tokens: &[String]) -> bool {
+    let mut options = true;
+    let mut recursive = false;
+    for value in tokens.iter().skip(1) {
+        if options && value == "--" {
+            options = false;
+        } else if options
+            && (value == "--recursive"
+                || (value.starts_with('-')
+                    && !value.starts_with("--")
+                    && value.chars().skip(1).any(|flag| matches!(flag, 'r' | 'R'))))
+        {
+            recursive = true;
+        }
+    }
+    recursive
+        && tokens
+            .iter()
+            .skip(1)
+            .filter(|value| !value.starts_with('-'))
+            .any(|value| broad_delete_target(value))
+}
+
+fn broad_delete_target(value: &str) -> bool {
+    let without_glob = value.trim_end_matches('*');
+    let without_glob = if without_glob == "/" {
+        without_glob
+    } else {
+        without_glob.trim_end_matches('/')
+    };
+    if matches!(without_glob, "~" | "$HOME" | "${HOME}") {
+        return true;
+    }
+    let normalized = lexical_absolute_path(without_glob);
+    let home = std::env::var_os("HOME").and_then(|value| PathBuf::from(value).canonicalize().ok());
+    normalized.as_deref() == Some(Path::new("/"))
+        || home
+            .as_deref()
+            .is_some_and(|home| normalized.as_deref() == Some(home))
+        || normalized.as_deref().is_some_and(|path| {
+            matches!(
+                path.to_str(),
+                Some(
+                    "/bin"
+                        | "/boot"
+                        | "/dev"
+                        | "/etc"
+                        | "/home"
+                        | "/lib"
+                        | "/lib64"
+                        | "/opt"
+                        | "/root"
+                        | "/sbin"
+                        | "/usr"
+                        | "/var"
+                )
+            )
+        })
+}
+
+fn lexical_absolute_path(value: &str) -> Option<PathBuf> {
+    if !value.starts_with('/') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in value.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut path = PathBuf::from("/");
+    for part in parts {
+        path.push(part);
+    }
+    Some(path)
+}
+
+fn is_raw_block_device(value: &str) -> bool {
+    let value = value.trim_matches(|character| matches!(character, '\'' | '"'));
+    [
+        "/dev/sd",
+        "/dev/hd",
+        "/dev/vd",
+        "/dev/xvd",
+        "/dev/nvme",
+        "/dev/mmcblk",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
 }
 
 fn invokes_elevation(command: &str) -> bool {
@@ -984,8 +1563,15 @@ fn is_read_only_command(command: &str) -> bool {
                 | "pwd"
                 | "whoami"
                 | "id"
+                | "groups"
+                | "tty"
                 | "uname"
+                | "arch"
+                | "nproc"
                 | "hostname"
+                | "hostnamectl"
+                | "timedatectl"
+                | "localectl"
                 | "uptime"
                 | "ls"
                 | "dir"
@@ -1022,6 +1608,40 @@ fn is_read_only_command(command: &str) -> bool {
                 | "ss"
                 | "netstat"
                 | "lsof"
+                | "lscpu"
+                | "lsmem"
+                | "lsusb"
+                | "lspci"
+                | "getent"
+                | "sysctl"
+                | "mount"
+                | "swapon"
+                | "systemctl"
+                | "journalctl"
+                | "dmesg"
+                | "ip"
+                | "iptables"
+                | "ip6tables"
+                | "nft"
+                | "dpkg-query"
+                | "dpkg"
+                | "apt-cache"
+                | "apt"
+                | "rpm"
+                | "pacman"
+                | "apk"
+                | "md5sum"
+                | "sha1sum"
+                | "sha224sum"
+                | "sha256sum"
+                | "sha384sum"
+                | "sha512sum"
+                | "b2sum"
+                | "cmp"
+                | "diff"
+                | "diff3"
+                | "od"
+                | "strings"
         );
         if !allowed || has_mutating_read_command_options(&program, args) {
             return false;
@@ -1032,16 +1652,43 @@ fn is_read_only_command(command: &str) -> bool {
 
 fn trusted_program_name(token: &str) -> Option<String> {
     let path = Path::new(token);
-    if token.contains('/')
-        && (!path.is_absolute()
-            || !matches!(
-                path.parent().and_then(Path::to_str),
-                Some("/bin" | "/usr/bin" | "/sbin" | "/usr/sbin")
-            ))
-    {
-        return None;
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if token.contains('/') {
+        return (path.is_absolute() && is_trusted_executable_path(path)).then_some(name);
     }
-    path.file_name()?.to_str().map(str::to_ascii_lowercase)
+    if matches!(
+        name.as_str(),
+        "pwd" | "type" | "printf" | "echo" | "test" | "true" | "false"
+    ) {
+        return Some(name);
+    }
+    let paths = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&paths) {
+        let candidate = directory.join(token);
+        if candidate.is_file() {
+            return is_trusted_executable_path(&candidate).then_some(name);
+        }
+    }
+    None
+}
+
+fn is_trusted_executable_path(path: &Path) -> bool {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    trusted_executable_directory(path.parent()) && trusted_executable_directory(canonical.parent())
+}
+
+fn trusted_executable_directory(directory: Option<&Path>) -> bool {
+    matches!(
+        directory.and_then(Path::to_str),
+        Some(
+            "/bin"
+                | "/usr/bin"
+                | "/sbin"
+                | "/usr/sbin"
+                | "/System/Cryptexes/App/usr/bin"
+                | "/System/Cryptexes/App/usr/sbin"
+        )
+    )
 }
 
 fn has_mutating_read_command_options(program: &str, args: &[&str]) -> bool {
@@ -1082,15 +1729,269 @@ fn has_mutating_read_command_options(program: &str, args: &[&str]) -> bool {
         }),
         "uniq" => uniq_has_output_path(args),
         "blkid" => args.iter().any(|value| {
-            matches!(*value, "-w" | "--cache-file")
+            matches!(*value, "-w" | "--cache-file" | "-g" | "--garbage-collect")
                 || (value.starts_with("-w") && value.len() > 2)
                 || value.starts_with("--cache-file=")
         }),
         "ss" => args.iter().any(|value| {
             matches!(*value, "-K" | "--kill") || short_option_cluster_contains(value, 'K')
         }),
+        "hostnamectl" => !read_only_subcommand(args, &["status"], true),
+        "timedatectl" => !read_only_subcommand(
+            args,
+            &["status", "show", "timesync-status", "show-timesync"],
+            true,
+        ),
+        "localectl" => !read_only_subcommand(
+            args,
+            &[
+                "status",
+                "list-locales",
+                "list-keymaps",
+                "list-x11-keymap-models",
+                "list-x11-keymap-layouts",
+                "list-x11-keymap-variants",
+                "list-x11-keymap-options",
+            ],
+            true,
+        ),
+        "systemctl" => !read_only_subcommand(
+            args,
+            &[
+                "status",
+                "show",
+                "cat",
+                "help",
+                "list-units",
+                "list-unit-files",
+                "list-dependencies",
+                "is-active",
+                "is-failed",
+                "is-enabled",
+                "get-default",
+                "get-property",
+            ],
+            true,
+        ),
+        "journalctl" => journalctl_mutates(args),
+        "dmesg" => args.iter().any(|value| {
+            matches!(*value, "-c" | "-C" | "--clear" | "--read-clear")
+                || short_option_cluster_contains(value, 'c')
+                || short_option_cluster_contains(value, 'C')
+        }),
+        "ip" => !ip_query(args),
+        "iptables" | "ip6tables" => !iptables_query(args),
+        "nft" => !nft_query(args),
+        "sysctl" => args.iter().any(|value| {
+            matches!(*value, "-w" | "--write" | "-p" | "--load" | "--system")
+                || value.starts_with("--load=")
+                || value.contains('=')
+        }),
+        "mount" => args
+            .iter()
+            .any(|value| !matches!(*value, "-l" | "--show-labels" | "-v" | "--verbose")),
+        "swapon" => args.iter().any(|value| {
+            !matches!(
+                *value,
+                "-s" | "--summary" | "--show" | "--noheadings" | "--raw" | "--bytes"
+            )
+        }),
+        "dpkg" => {
+            let queries = args.iter().any(|value| {
+                matches!(
+                    *value,
+                    "-l" | "--list"
+                        | "-s"
+                        | "--status"
+                        | "-S"
+                        | "--search"
+                        | "--print-architecture"
+                        | "--print-foreign-architectures"
+                        | "--get-selections"
+                )
+            });
+            let mutations = args.iter().any(|value| {
+                matches!(
+                    *value,
+                    "-i" | "--install"
+                        | "--unpack"
+                        | "--configure"
+                        | "-r"
+                        | "--remove"
+                        | "-P"
+                        | "--purge"
+                        | "--update-avail"
+                        | "--merge-avail"
+                        | "--clear-avail"
+                        | "--set-selections"
+                )
+            });
+            !queries || mutations
+        }
+        "apt-cache" => {
+            apt_custom_configuration(args)
+                || args
+                    .iter()
+                    .any(|value| matches!(*value, "-g" | "--generate"))
+                || !read_only_subcommand(
+                    args,
+                    &[
+                        "show", "search", "policy", "depends", "rdepends", "showpkg", "stats",
+                        "dump", "dotty", "xvcg", "madison",
+                    ],
+                    false,
+                )
+        }
+        "apt" => {
+            apt_custom_configuration(args)
+                || !read_only_subcommand(args, &["list", "show", "search"], false)
+        }
+        "rpm" => {
+            !args
+                .iter()
+                .any(|value| *value == "--query" || value.starts_with("-q"))
+                || args.iter().any(|value| {
+                    matches!(
+                        *value,
+                        "--install" | "--upgrade" | "--erase" | "--rebuilddb" | "--setperms"
+                    )
+                })
+        }
+        "pacman" => {
+            !args
+                .iter()
+                .any(|value| *value == "--query" || value.starts_with("-Q"))
+                || args.iter().any(|value| {
+                    value.starts_with("-S") || value.starts_with("-R") || value.starts_with("-U")
+                })
+        }
+        "apk" => !read_only_subcommand(
+            args,
+            &["info", "search", "list", "policy", "stats", "version"],
+            false,
+        ),
         _ => false,
     }
+}
+
+fn read_only_subcommand(args: &[&str], allowed: &[&str], allow_no_subcommand: bool) -> bool {
+    first_subcommand(args).is_some_and(|value| allowed.contains(&value))
+        || (allow_no_subcommand && first_subcommand(args).is_none())
+}
+
+fn first_subcommand<'a>(args: &'a [&str]) -> Option<&'a str> {
+    let mut skip_value = false;
+    for value in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if matches!(
+            *value,
+            "-t" | "--type"
+                | "--state"
+                | "-p"
+                | "--property"
+                | "--job-mode"
+                | "--kill-whom"
+                | "--signal"
+                | "--root"
+                | "--image"
+                | "--lines"
+                | "--output"
+                | "-o"
+                | "--option"
+                | "-c"
+                | "--config-file"
+                | "--target-release"
+                | "--host-architecture"
+                | "--host"
+                | "-H"
+                | "--machine"
+                | "-M"
+        ) {
+            skip_value = true;
+            continue;
+        }
+        if value.starts_with('-') {
+            continue;
+        }
+        return Some(value);
+    }
+    None
+}
+
+fn journalctl_mutates(args: &[&str]) -> bool {
+    args.iter().any(|value| {
+        matches!(
+            *value,
+            "--rotate"
+                | "--sync"
+                | "--flush"
+                | "--relinquish-var"
+                | "--setup-keys"
+                | "--update-catalog"
+        ) || value.starts_with("--vacuum-")
+            || value.starts_with("--rotate=")
+            || value.starts_with("--sync=")
+            || value.starts_with("--flush=")
+            || value.starts_with("--relinquish-var=")
+            || value.starts_with("--setup-keys=")
+            || value.starts_with("--update-catalog=")
+    })
+}
+
+fn ip_query(args: &[&str]) -> bool {
+    const OBJECTS: &[&str] = &[
+        "address",
+        "addr",
+        "a",
+        "link",
+        "l",
+        "route",
+        "r",
+        "rule",
+        "neighbour",
+        "neighbor",
+        "neigh",
+    ];
+    const MUTATIONS: &[&str] = &[
+        "add", "delete", "del", "change", "replace", "set", "flush", "append", "prepend",
+    ];
+    !args.iter().any(|value| {
+        matches!(*value, "-b" | "-batch" | "--batch" | "-force" | "--force")
+            || value.starts_with("--batch=")
+    }) && args.iter().any(|value| OBJECTS.contains(value))
+        && !args.iter().any(|value| MUTATIONS.contains(value))
+}
+
+fn iptables_query(args: &[&str]) -> bool {
+    args.iter()
+        .any(|value| matches!(*value, "-L" | "--list" | "-S" | "--list-rules"))
+        && !args
+            .iter()
+            .any(|value| matches!(*value, "-M" | "--modprobe") || value.starts_with("--modprobe="))
+        && !firewall_mutation(&format!("iptables {}", args.join(" ")))
+}
+
+fn nft_query(args: &[&str]) -> bool {
+    !args.iter().any(|value| {
+        matches!(*value, "-f" | "--file" | "-i" | "--interactive") || value.starts_with("--file=")
+    }) && read_only_subcommand(args, &["list"], false)
+        && !args.iter().any(|value| {
+            matches!(
+                *value,
+                "add" | "create" | "insert" | "delete" | "flush" | "replace" | "rename"
+            )
+        })
+}
+
+fn apt_custom_configuration(args: &[&str]) -> bool {
+    args.iter().any(|value| {
+        matches!(*value, "-o" | "--option" | "-c" | "--config-file")
+            || value.starts_with("--option=")
+            || value.starts_with("--config-file=")
+    })
 }
 
 fn short_option_cluster_contains(value: &str, option: char) -> bool {
@@ -1224,6 +2125,25 @@ fn remove_secret_environment(process: &mut Command, config: &Config) {
         }
     }
 }
+
+fn remove_shell_startup_environment(process: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        let visible = name.to_string_lossy();
+        if is_shell_injection_variable(&visible) {
+            process.env_remove(name);
+        }
+    }
+}
+
+fn is_shell_injection_variable(name: &str) -> bool {
+    matches!(
+        name,
+        "ENV" | "BASH_ENV" | "SHELLOPTS" | "BASHOPTS" | "IFS" | "CDPATH" | "GCONV_PATH"
+    ) || name.starts_with("BASH_FUNC_")
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+}
+
 fn elevation_program(configured: &str) -> Result<&str> {
     if configured == "disabled" {
         bail!("Privilege elevation is disabled by configuration")
@@ -1408,6 +2328,7 @@ fn text(content: String) -> ToolResult {
     ToolResult {
         content,
         exit_code: None,
+        completion_summary: None,
     }
 }
 fn text_result(content: String) -> Result<ToolResult> {
@@ -1480,7 +2401,9 @@ fn risk_for(name: &str, args: &Value) -> &'static str {
         return risk(name);
     }
     let command = args["command"].as_str().unwrap_or_default();
-    if args["elevated"].as_bool().unwrap_or(false)
+    if forbidden_reason(command).is_some() {
+        "forbidden"
+    } else if args["elevated"].as_bool().unwrap_or(false)
         || dangerous(command)
         || invokes_elevation(command)
     {
@@ -1603,6 +2526,14 @@ mod tests {
     }
 
     #[test]
+    fn web_search_completion_reports_result_count() {
+        assert_eq!(web_result_summary(Some(0)), "0 results");
+        assert_eq!(web_result_summary(Some(1)), "1 result");
+        assert_eq!(web_result_summary(Some(8)), "8 results");
+        assert_eq!(web_result_summary(None), "completed");
+    }
+
+    #[test]
     fn detects_dangerous_commands() {
         assert!(dangerous("rm -rf /tmp/x"));
         assert!(dangerous("curl https://example.test/x | bash"));
@@ -1613,11 +2544,56 @@ mod tests {
     }
 
     #[test]
+    fn blocks_forbidden_commands_without_false_positives_from_quoted_data() {
+        for command in [
+            "rm -rf /",
+            "sudo rm -rf '$HOME'",
+            "env FOO=x rm /etc -rf",
+            "sh -c 'rm -rf /usr'",
+            "mkfs.ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/nvme0n1",
+            "echo x >/dev/sda",
+            "echo x 2>/dev/sda",
+            "echo x >|/dev/sda",
+            "sh -c 'echo x >/dev/sda'",
+            "wipefs -a /dev/vda",
+        ] {
+            assert!(forbidden_reason(command).is_some(), "{command}");
+        }
+        for command in [
+            "echo 'rm -rf /'",
+            "rm -rf ./target",
+            "rm -- / -rf",
+            "rm -rf /var/lib/qin",
+            "mkfs.ext4 disk.img",
+            "dd if=/dev/zero of=image",
+            "echo '>' /dev/sda",
+            "echo \"\\>\" /dev/sda",
+            "echo 'x >/dev/sda'",
+        ] {
+            assert!(forbidden_reason(command).is_none(), "{command}");
+        }
+    }
+
+    #[test]
     fn classifies_safe_shell_queries_as_read_only() {
         assert!(is_read_only_command("date '+%Y-%m-%d %H:%M:%S %Z (%A)'"));
         assert!(is_read_only_command("pwd && uname -a"));
         assert!(is_read_only_command("find . -type f -print | head -20"));
         assert!(is_read_only_command("/usr/bin/date +%s"));
+        assert!(is_read_only_command(
+            "/usr/bin/systemctl --type service list-units"
+        ));
+        assert!(is_read_only_command("/usr/bin/systemctl status sshd"));
+        assert!(is_read_only_command("/usr/bin/journalctl -u sshd -n 20"));
+        assert!(is_read_only_command("/usr/bin/dmesg --level err"));
+        assert!(is_read_only_command("/usr/bin/ip -j address show"));
+        assert!(is_read_only_command("/usr/bin/iptables -L -n"));
+        assert!(is_read_only_command("/usr/bin/nft list ruleset"));
+        assert!(is_read_only_command("/usr/bin/dpkg -l openssh-server"));
+        assert!(is_read_only_command("/usr/bin/apt-cache policy qin"));
+        assert!(is_read_only_command("/usr/sbin/sysctl kernel.hostname"));
+        assert!(is_read_only_command("/usr/bin/mount"));
         assert!(!is_read_only_command("date > now.txt"));
         assert!(!is_read_only_command("sudo date"));
         assert!(!is_read_only_command("printf x; touch created"));
@@ -1636,7 +2612,76 @@ mod tests {
         assert!(!is_read_only_command("uniq input.txt output.txt"));
         assert!(!is_read_only_command("ss --kill dst 192.0.2.1"));
         assert!(!is_read_only_command("ss -Knt dst 192.0.2.1"));
+        assert!(!is_read_only_command("/usr/bin/systemctl restart sshd"));
+        assert!(!is_read_only_command("/usr/bin/systemctl enable status"));
+        assert!(!is_read_only_command(
+            "/usr/bin/journalctl --vacuum-time=1d"
+        ));
+        assert!(!is_read_only_command("/usr/bin/dmesg -C"));
+        assert!(!is_read_only_command("/usr/bin/ip link set eth0 down"));
+        assert!(!is_read_only_command("/usr/bin/ip -batch route"));
+        assert!(!is_read_only_command("/usr/bin/iptables -D INPUT 1"));
+        assert!(!is_read_only_command(
+            "/usr/bin/iptables -L --modprobe=/tmp/run-me"
+        ));
+        assert!(!is_read_only_command("/usr/bin/nft flush ruleset"));
+        assert!(!is_read_only_command("/usr/bin/nft -f list"));
+        assert!(!is_read_only_command(
+            "/usr/bin/dpkg --install package.deb -l"
+        ));
+        assert!(!is_read_only_command("/usr/bin/apt install qin"));
+        assert!(!is_read_only_command(
+            "/usr/bin/apt-cache --generate policy qin"
+        ));
+        assert!(!is_read_only_command(
+            "/usr/bin/apt -o APT::Update::Post-Invoke=touch list"
+        ));
+        assert!(!is_read_only_command(
+            "/usr/sbin/sysctl -w kernel.hostname=changed"
+        ));
+        assert!(!is_read_only_command("/usr/bin/mount /dev/sda1 /mnt"));
         assert!(!is_read_only_command("git status"));
+        assert!(!is_read_only_command("/tmp/date"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_classifier_rejects_symlinks_from_untrusted_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("date");
+        symlink("/usr/bin/date", &fake).unwrap();
+        assert!(trusted_program_name(fake.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn identifies_hidden_shell_and_loader_injection_variables() {
+        for name in [
+            "ENV",
+            "BASH_ENV",
+            "BASH_FUNC_date%%",
+            "LD_PRELOAD",
+            "LD_DEBUG_OUTPUT",
+            "DYLD_INSERT_LIBRARIES",
+            "GCONV_PATH",
+        ] {
+            assert!(is_shell_injection_variable(name), "{name}");
+        }
+        for name in ["PATH", "LANG", "TERM", "HOME"] {
+            assert!(!is_shell_injection_variable(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn parses_one_time_and_task_wide_command_approvals() {
+        assert_eq!(parse_command_approval("y\n"), Some(ApprovalDecision::Once));
+        assert_eq!(parse_command_approval("ALL\n"), Some(ApprovalDecision::All));
+        assert_eq!(
+            parse_command_approval("\u{5168}\u{90e8}\n"),
+            Some(ApprovalDecision::All)
+        );
+        assert_eq!(parse_command_approval("n\n"), None);
     }
 
     #[test]
@@ -1650,6 +2695,38 @@ mod tests {
             risk_for("shell", &json!({"command": "date", "elevated": true})),
             "destructive"
         );
+    }
+
+    #[test]
+    fn on_risk_only_auto_approves_non_overwriting_workspace_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let internal = resolve_target(dir.path(), "new.txt").unwrap();
+        let external = dir
+            .path()
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join("outside.txt");
+        assert!(auto_approves_path_mutation(
+            &config,
+            dir.path(),
+            &[internal.as_path()],
+            true,
+        ));
+        assert!(!auto_approves_path_mutation(
+            &config,
+            dir.path(),
+            &[internal.as_path()],
+            false,
+        ));
+        assert!(!auto_approves_path_mutation(
+            &config,
+            dir.path(),
+            &[external.as_path()],
+            true,
+        ));
     }
 
     #[test]
@@ -1713,6 +2790,7 @@ mod tests {
         let mut store = StateStore::open(&config, &resolver).unwrap();
         let session = store.new_session(dir.path(), Some("tools")).unwrap();
         let events = EventSink::new(true, false, false);
+        let mut approve_all_commands = false;
         let mut context = ToolContext {
             config: &config,
             events: &events,
@@ -1720,6 +2798,7 @@ mod tests {
             session_id: &session,
             cwd: dir.path(),
             assume_yes: true,
+            approve_all_commands: &mut approve_all_commands,
             dry_run: false,
         };
         let result = execute(
@@ -1750,6 +2829,7 @@ mod tests {
             .new_session(dir.path(), Some("readonly-shell"))
             .unwrap();
         let events = EventSink::new(true, false, false);
+        let mut approve_all_commands = false;
         let mut context = ToolContext {
             config: &config,
             events: &events,
@@ -1757,6 +2837,7 @@ mod tests {
             session_id: &session,
             cwd: dir.path(),
             assume_yes: false,
+            approve_all_commands: &mut approve_all_commands,
             dry_run: false,
         };
         let result = execute(
@@ -1772,6 +2853,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_wide_approval_runs_later_unknown_shell_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.storage.database = "approve-all-shell.db".into();
+        config.ui.command_heartbeat_seconds = 60;
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("approve-all")).unwrap();
+        let events = EventSink::new(true, false, false);
+        let mut approve_all_commands = true;
+        let mut context = ToolContext {
+            config: &config,
+            events: &events,
+            store: &mut store,
+            session_id: &session,
+            cwd: dir.path(),
+            assume_yes: false,
+            approve_all_commands: &mut approve_all_commands,
+            dry_run: false,
+        };
+        execute(
+            "call-approved-for-task",
+            "shell",
+            r#"{"command":"touch approved-for-task"}"#,
+            &mut context,
+        )
+        .await
+        .unwrap();
+        assert!(dir.path().join("approved-for-task").is_file());
+    }
+
+    #[tokio::test]
     async fn rejects_model_calls_to_disabled_tools() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -1783,6 +2898,7 @@ mod tests {
         let mut store = StateStore::open(&config, &resolver).unwrap();
         let session = store.new_session(dir.path(), Some("tools")).unwrap();
         let events = EventSink::new(true, false, false);
+        let mut approve_all_commands = false;
         let mut context = ToolContext {
             config: &config,
             events: &events,
@@ -1790,6 +2906,7 @@ mod tests {
             session_id: &session,
             cwd: dir.path(),
             assume_yes: true,
+            approve_all_commands: &mut approve_all_commands,
             dry_run: false,
         };
         let error = execute(

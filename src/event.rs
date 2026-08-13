@@ -71,14 +71,17 @@ impl EventSink {
         if !self.quiet && self.show_tool_events.get() {
             self.stderr(
                 "tool_finished",
-                &format!("✓ {name}  {summary}  {elapsed_ms}ms"),
+                &tool_finished_message(name, summary, elapsed_ms),
             )?;
         }
         Ok(())
     }
 
     pub fn tool_failed(&self, name: &str, error: &str, elapsed_ms: u128) -> Result<()> {
-        self.stderr("tool_failed", &format!("✗ {name}  {error}  {elapsed_ms}ms"))
+        self.stderr(
+            "tool_failed",
+            &format!("✗ {name}  {error}  {}", format_elapsed(elapsed_ms)),
+        )
     }
 
     pub fn command_started(
@@ -86,6 +89,7 @@ impl EventSink {
         cwd: &std::path::Path,
         elevated: bool,
         timeout: u64,
+        interactive_terminal: bool,
     ) -> Result<()> {
         if self.quiet || !self.show_commands.get() {
             return Ok(());
@@ -98,11 +102,11 @@ impl EventSink {
             "standard privileges"
         };
         let message = format!(
-            "▸ Running [{level}]  cwd={}  timeout={}s",
+            "▸ Running [{level}]  cwd={}  timeout={}",
             cwd.display(),
-            timeout
+            format_elapsed(timeout as u128 * 1_000)
         );
-        if self.terminal {
+        if self.terminal && !interactive_terminal {
             // Transient status line: the heartbeat or command_finished
             // rewrites this same line instead of appending a new one.
             if self.status_line_open.replace(false) {
@@ -133,7 +137,10 @@ impl EventSink {
         if self.quiet || !self.show_commands.get() {
             return Ok(());
         }
-        let message = format!("... Command still running  {seconds}s");
+        let message = format!(
+            "... Command still running  {}",
+            format_elapsed(seconds as u128 * 1_000)
+        );
         if self.terminal {
             // Rewrite a single status line in place instead of appending.
             let message = sanitize_terminal(&redact(&message));
@@ -155,12 +162,12 @@ impl EventSink {
         }
         // Success stays minimal: exit=0 is implied. Failures show the code.
         let message = if ok {
-            format!("✓ Command succeeded  {:.2}s", elapsed_ms as f64 / 1000.0)
+            format!("✓ Command succeeded  {}", format_elapsed(elapsed_ms))
         } else {
             format!(
-                "✗ Command failed  exit={}  {:.2}s",
+                "✗ Command failed  exit={}  {}",
                 code.map_or_else(|| "signal".into(), |v| v.to_string()),
-                elapsed_ms as f64 / 1000.0
+                format_elapsed(elapsed_ms)
             )
         };
         self.stderr(
@@ -333,6 +340,38 @@ impl EventSink {
     }
 }
 
+fn format_elapsed(elapsed_ms: u128) -> String {
+    const CENTISECONDS_PER_MINUTE: u128 = 6_000;
+    const CENTISECONDS_PER_HOUR: u128 = 60 * CENTISECONDS_PER_MINUTE;
+
+    // Round once before splitting into units so values such as 59.999s
+    // normalize to 1m 00.00s rather than producing an invalid 60.00s field.
+    let centiseconds = elapsed_ms.saturating_add(5) / 10;
+    let hours = centiseconds / CENTISECONDS_PER_HOUR;
+    let after_hours = centiseconds % CENTISECONDS_PER_HOUR;
+    let minutes = after_hours / CENTISECONDS_PER_MINUTE;
+    let after_minutes = after_hours % CENTISECONDS_PER_MINUTE;
+    let seconds = after_minutes / 100;
+    let hundredths = after_minutes % 100;
+
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}.{hundredths:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}.{hundredths:02}s")
+    } else {
+        format!("{seconds}.{hundredths:02}s")
+    }
+}
+
+fn tool_finished_message(name: &str, summary: &str, elapsed_ms: u128) -> String {
+    let elapsed = format_elapsed(elapsed_ms);
+    if summary.is_empty() {
+        format!("✓ {name}  {elapsed}")
+    } else {
+        format!("✓ {name}  {elapsed}  {summary}")
+    }
+}
+
 /// ANSI color per system event kind; command output itself stays uncolored so
 /// it stands apart from qin's own messages.
 fn event_color(event: &str) -> Option<&'static str> {
@@ -493,5 +532,30 @@ mod tests {
         for event in ["phase", "success", "session", "final_answer"] {
             assert!(!indented_event(event), "{event}");
         }
+    }
+
+    #[test]
+    fn formats_elapsed_times_in_seconds_minutes_and_hours() {
+        assert_eq!(format_elapsed(0), "0.00s");
+        assert_eq!(format_elapsed(247), "0.25s");
+        assert_eq!(format_elapsed(1_862), "1.86s");
+        assert_eq!(format_elapsed(59_994), "59.99s");
+        assert_eq!(format_elapsed(59_999), "1m 00.00s");
+        assert_eq!(format_elapsed(60_000), "1m 00.00s");
+        assert_eq!(format_elapsed(125_180), "2m 05.18s");
+        assert_eq!(format_elapsed(3_600_000), "1h 00m 00.00s");
+        assert_eq!(format_elapsed(3_787_420), "1h 03m 07.42s");
+    }
+
+    #[test]
+    fn tool_completion_puts_elapsed_time_before_summary() {
+        assert_eq!(
+            tool_finished_message("web_search", "8 results", 1_699),
+            "✓ web_search  1.70s  8 results"
+        );
+        assert_eq!(
+            tool_finished_message("read_file", "", 247),
+            "✓ read_file  0.25s"
+        );
     }
 }

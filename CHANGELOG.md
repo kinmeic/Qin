@@ -2,6 +2,20 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.2.9
+
+- Fixed `sudo qin` to reuse the invoking user's configuration and SQLite data directories instead of unexpectedly switching to `/etc/qin` and `/var/lib/qin`.
+- Preserved the invoking user's ownership when root creates or updates that user's configuration and database files.
+- Standardized tool and shell durations with two-decimal seconds, switching to minutes after one minute and hours after one hour.
+- Replaced the stray JSON `[` in web-search completion events with a result count and placed elapsed time before the count.
+- Refined `approval = "on_risk"` with command-specific read-only rules for system, network, service, log, and package diagnostics, while rejecting option combinations that can write or execute helper programs.
+- Allowed new files, directories, and non-overwriting copies inside the current workspace without a prompt; overwrites, moves, external paths, unknown shell commands, elevation, and destructive actions still require approval.
+- Added an unconditional safety floor for recursive deletion of broad system/home paths, raw-device formatting or overwrites, fork bombs, and kill-all commands.
+- Prevented read-only auto-approval from trusting executables resolved from user-writable `PATH` directories, and removed shell startup, exported-function, and dynamic-loader injection variables from child environments.
+- Added `[y/N/All]` command approval; `All` approves subsequent shell commands only for the current task, while Forbidden operations remain blocked.
+- Fixed interactive sudo prompts by handing the child process group foreground terminal control, giving prompts a newline-delimited terminal area, pausing heartbeats, inheriting stdin explicitly, and restoring qin's foreground group and terminal echo/mode after completion, cancellation, or timeout.
+- Delayed the first ordinary command heartbeat until the configured interval instead of displaying `Command still running  0s` immediately.
+
 ## 0.2.8
 
 - Added `qin update` with platform-aware GitHub release discovery, SHA-256 verification, bounded downloads, and atomic executable replacement.

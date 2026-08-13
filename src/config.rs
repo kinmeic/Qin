@@ -1,8 +1,14 @@
 use std::collections::{BTreeMap, HashSet};
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::ptr;
 
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
@@ -40,6 +46,8 @@ impl ConfigScope {
 pub struct ConfigPathResolver {
     config_path: PathBuf,
     scope: ConfigScope,
+    user_data_dir: Option<PathBuf>,
+    owner_uid: Option<u32>,
 }
 
 impl ConfigPathResolver {
@@ -48,13 +56,29 @@ impl ConfigPathResolver {
             return Ok(Self {
                 config_path: absolute(path)?,
                 scope: ConfigScope::Explicit,
+                user_data_dir: None,
+                owner_uid: None,
             });
         }
 
-        if force_system || is_root() || is_openwrt() {
+        if force_system || is_openwrt() {
             return Ok(Self {
                 config_path: PathBuf::from("/etc/qin/config.toml"),
                 scope: ConfigScope::System,
+                user_data_dir: None,
+                owner_uid: None,
+            });
+        }
+
+        if is_root() {
+            if let Some((owner_uid, home)) = sudo_user_home() {
+                return Self::for_user_home(home, Some(owner_uid));
+            }
+            return Ok(Self {
+                config_path: PathBuf::from("/etc/qin/config.toml"),
+                scope: ConfigScope::System,
+                user_data_dir: None,
+                owner_uid: None,
             });
         }
 
@@ -64,6 +88,18 @@ impl ConfigPathResolver {
         Ok(Self {
             config_path: dirs.config_dir().join("config.toml"),
             scope: ConfigScope::User,
+            user_data_dir: Some(dirs.data_dir().to_path_buf()),
+            owner_uid: None,
+        })
+    }
+
+    fn for_user_home(home: PathBuf, owner_uid: Option<u32>) -> Result<Self> {
+        let (config_dir, data_dir) = user_project_directories(&home);
+        Ok(Self {
+            config_path: config_dir.join("config.toml"),
+            scope: ConfigScope::User,
+            user_data_dir: Some(data_dir),
+            owner_uid,
         })
     }
 
@@ -91,9 +127,99 @@ impl ConfigPathResolver {
         if self.scope == ConfigScope::System {
             return Ok(system_data_directory(is_openwrt()).join(&config.storage.database));
         }
-        let dirs =
-            ProjectDirs::from("", "", "qin").context("Unable to determine the data directory")?;
-        Ok(dirs.data_dir().join(&config.storage.database))
+        self.user_data_dir
+            .as_ref()
+            .context("Unable to determine the user data directory")
+            .map(|path| path.join(&config.storage.database))
+    }
+
+    pub(crate) fn ensure_owner(&self, path: &Path) -> Result<()> {
+        if let Some(uid) = self.owner_uid {
+            set_owner(path, uid)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn owner_uid(&self) -> Option<u32> {
+        self.owner_uid
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn user_project_directories(home: &Path) -> (PathBuf, PathBuf) {
+    let directory = home.join("Library/Application Support/qin");
+    (directory.clone(), directory)
+}
+
+#[cfg(target_os = "windows")]
+fn user_project_directories(home: &Path) -> (PathBuf, PathBuf) {
+    let directory = home.join("AppData/Roaming/qin");
+    (directory.clone(), directory)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn user_project_directories(home: &Path) -> (PathBuf, PathBuf) {
+    (home.join(".config/qin"), home.join(".local/share/qin"))
+}
+
+#[cfg(unix)]
+fn sudo_user_home() -> Option<(u32, PathBuf)> {
+    if !is_root() {
+        return None;
+    }
+    let uid = std::env::var("SUDO_UID")
+        .ok()?
+        .parse::<libc::uid_t>()
+        .ok()?;
+    let home = passwd_home(uid)?;
+    Some((uid, home))
+}
+
+#[cfg(not(unix))]
+fn sudo_user_home() -> Option<(u32, PathBuf)> {
+    None
+}
+
+#[cfg(unix)]
+fn passwd_home(uid: libc::uid_t) -> Option<PathBuf> {
+    const MAX_PASSWD_BUFFER: usize = 1024 * 1024;
+    let configured_size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let initial_size = if configured_size > 0 {
+        (configured_size as usize).clamp(1024, MAX_PASSWD_BUFFER)
+    } else {
+        4096
+    };
+    let mut buffer = vec![0u8; initial_size];
+
+    loop {
+        let mut passwd = MaybeUninit::<libc::passwd>::uninit();
+        let mut result = ptr::null_mut();
+        let error = unsafe {
+            libc::getpwuid_r(
+                uid,
+                passwd.as_mut_ptr(),
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if error == libc::ERANGE && buffer.len() < MAX_PASSWD_BUFFER {
+            buffer.resize((buffer.len() * 2).min(MAX_PASSWD_BUFFER), 0);
+            continue;
+        }
+        if error != 0 || result.is_null() {
+            return None;
+        }
+
+        let passwd = unsafe { passwd.assume_init_ref() };
+        if passwd.pw_dir.is_null() {
+            return None;
+        }
+        let home = unsafe { CStr::from_ptr(passwd.pw_dir) }.to_str().ok()?;
+        if home.is_empty() || !Path::new(home).is_absolute() {
+            return None;
+        }
+        return Some(PathBuf::from(home));
     }
 }
 
@@ -1068,6 +1194,9 @@ pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Resul
         }
         return Err(error);
     }
+    resolver.ensure_owner(parent)?;
+    resolver.ensure_owner(path)?;
+    sync_config_directory(parent)?;
 
     let outcome = InitOutcome {
         created: true,
@@ -1159,6 +1288,8 @@ pub(crate) fn write_config_content(
         }
         return Err(error);
     }
+    resolver.ensure_owner(parent)?;
+    resolver.ensure_owner(path)?;
     sync_config_directory(parent)?;
     Ok(ConfigWriteOutcome {
         config_path: path.to_path_buf(),
@@ -1192,6 +1323,31 @@ fn sync_config_directory(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn sync_config_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn set_owner(path: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let source_path = path;
+    let path = CString::new(source_path.as_os_str().as_bytes())
+        .with_context(|| format!("Path contains a NUL byte: {}", path.display()))?;
+    let no_group = !0 as libc::gid_t;
+    let result = unsafe { libc::chown(path.as_ptr(), uid as libc::uid_t, no_group) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "Unable to preserve the original user's ownership for {}",
+                source_path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_owner(_path: &Path, _uid: u32) -> Result<()> {
     Ok(())
 }
 
@@ -1350,6 +1506,43 @@ mod tests {
         let resolver = ConfigPathResolver::new(Some(path.clone()), false).unwrap();
         assert_eq!(resolver.config_path(), path);
         assert_eq!(resolver.scope(), ConfigScope::Explicit);
+    }
+
+    #[test]
+    fn sudo_profile_reuses_the_original_users_config_and_data_directories() {
+        let resolver =
+            ConfigPathResolver::for_user_home(PathBuf::from("/home/alice"), Some(1000)).unwrap();
+        assert_eq!(resolver.scope(), ConfigScope::User);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            resolver.config_path(),
+            Path::new("/home/alice/Library/Application Support/qin/config.toml")
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            resolver.config_path(),
+            Path::new("/home/alice/AppData/Roaming/qin/config.toml")
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(
+            resolver.config_path(),
+            Path::new("/home/alice/.config/qin/config.toml")
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            resolver.database_path(&Config::default()).unwrap(),
+            PathBuf::from("/home/alice/Library/Application Support/qin/qin.db")
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            resolver.database_path(&Config::default()).unwrap(),
+            PathBuf::from("/home/alice/AppData/Roaming/qin/qin.db")
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(
+            resolver.database_path(&Config::default()).unwrap(),
+            PathBuf::from("/home/alice/.local/share/qin/qin.db")
+        );
     }
 
     #[test]

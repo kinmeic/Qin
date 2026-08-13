@@ -75,6 +75,7 @@ pub struct KnowledgeInsert {
 pub struct StateStore {
     backend: Backend,
     path: PathBuf,
+    database_owner_uid: Option<u32>,
     pending_audits: Vec<PendingAudit>,
     notice: Option<String>,
 }
@@ -376,6 +377,7 @@ impl StateStore {
                 persistence: MemoryPersistence::File(path.clone()),
             })),
             path,
+            database_owner_uid: None,
             pending_audits: Vec::new(),
             notice: None,
         })
@@ -442,6 +444,7 @@ impl StateStore {
                 },
             })),
             path: PathBuf::from(format!("redis:{key}")),
+            database_owner_uid: None,
             pending_audits: Vec::new(),
             notice: None,
         })
@@ -465,6 +468,9 @@ impl StateStore {
                 .file_name()
                 .context("The database path has no file name")?,
         );
+        if config.storage.data_dir.trim().is_empty() {
+            resolver.ensure_owner(&canonical_parent)?;
+        }
         prepare_database_file(&path)?;
         let connection = Connection::open_with_flags(
             &path,
@@ -491,6 +497,7 @@ impl StateStore {
         let mut store = Self {
             backend: Backend::Sqlite(connection),
             path,
+            database_owner_uid: resolver.owner_uid(),
             pending_audits: Vec::new(),
             notice: None,
         };
@@ -1262,7 +1269,10 @@ impl StateStore {
                             );
                         }
                         if metadata.permissions().mode() & 0o777 != 0o600 {
-                            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                        }
+                        if let Some(uid) = self.database_owner_uid {
+                            crate::config::set_owner(&path, uid)?;
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

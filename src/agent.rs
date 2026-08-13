@@ -187,6 +187,7 @@ async fn run_loop(
     started: tokio::time::Instant,
 ) -> Result<String> {
     let mut tool_count = 0_u32;
+    let mut approve_all_commands = false;
 
     for iteration in 0..config.agent.max_iterations {
         let remaining = remaining_time(config, started)?;
@@ -252,6 +253,7 @@ async fn run_loop(
                 session_id,
                 cwd,
                 assume_yes: options.assume_yes,
+                approve_all_commands: &mut approve_all_commands,
                 dry_run: options.dry_run,
             };
             let remaining = remaining_time(config, started)?;

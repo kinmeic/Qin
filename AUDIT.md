@@ -11,7 +11,7 @@ This repository was audited for correctness, security, and performance in August
 - Streaming responses stop at `[DONE]`, validate tool calls, and enforce output limits across text and tool-call arguments.
 - Total wall time now covers model calls and tool execution, and cancellation no longer allows the agent to continue after an interrupted command.
 - Models can explicitly disable tool schemas with `supports_tools = false`.
-- Invalid or unsupported configuration values are rejected instead of being silently ignored.
+- Invalid known configuration values are rejected; unknown fields are reported as warnings and ignored for forward compatibility.
 - Redis recovery now reconciles the remote session with a newer outage-time JSON session, including same-second message sequence changes, and removes the obsolete JSON file after migration.
 - The configuration wizard honors `--dry-run`, preserves existing inline/legacy API keys unless explicitly replaced, and reports failed backup restoration instead of hiding it.
 - Runtime distribution, platform, and kernel fields are optional and platform-specific; unavailable values are omitted rather than fabricated.
@@ -28,6 +28,12 @@ This repository was audited for correctness, security, and performance in August
 - Session lock names are hashed and private, and an advisory operating-system lock avoids stale-file ownership races without persistent flash writes.
 - Destructive command detection was expanded, and path operations outside the workspace are always treated as high risk.
 - `on_risk` shell auto-approval rejects multiline/comment ambiguity, untrusted executable paths, and side-effecting options such as `date --set`, `find -fprint`, `rg --pre`, `sort -o`, and `ss --kill`.
+- Common service, journal, kernel, network, firewall, and package queries use command-specific read-only rules; batch files, generated caches, helper executables, custom package-manager configuration, and mutating subcommands remain approval-gated.
+- Read-only shell auto-approval resolves bare executables through `PATH` and trusts only system executable directories; shell startup, exported-function, and dynamic-loader injection variables are removed before execution.
+- Non-overwriting file/directory creation inside the workspace is treated as reversible, while overwrite, move, and external-path operations remain approval-gated.
+- Catastrophic recursive deletion, raw-device destruction, fork bombs, and kill-all commands are classified as forbidden and refused rather than offered for approval.
+- Task-scoped `All` approval is explicit, limited to subsequent shell commands in the current run, and cannot bypass Forbidden rules or structured-tool external-path checks.
+- Interactive privilege prompts no longer share a transient heartbeat line; the child process group temporarily receives foreground terminal control, heartbeats pause while sudo owns the terminal, stdin is inherited explicitly, and guards restore qin's foreground group and terminal echo after normal exit, cancellation, or timeout.
 - tmpfs session state rejects symlinks, non-private ownership/modes, malformed data, unsupported versions, and values larger than 128 MiB; writes use private same-directory temporary files and atomic replacement.
 - Redis supports certificate-verified TLS, uses bounded connect/read/write operations, rejects malformed or wrongly typed state instead of silently overwriting it, and removes secret Redis URL environment variables from shell children.
 - Runtime-context values and remote updater error summaries are escaped/sanitized before display or model delivery.
