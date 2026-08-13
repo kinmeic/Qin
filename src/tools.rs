@@ -125,7 +125,7 @@ pub async fn execute(
     validate_argument_keys(name, &args)?;
     let started = Instant::now();
     let audit_args = truncate(safe_args(name, &args), 8_192);
-    ctx.events.tool_started(name, &audit_args)?;
+    ctx.events.tool_started(name, &display_args(name, &args))?;
     let preapproval = if !tool_enabled(name, ctx.config) {
         Err(anyhow::anyhow!(
             "Tool {name} is disabled by the current configuration"
@@ -543,11 +543,13 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     if ctx.dry_run {
         return text_result("Dry run: command not executed".into());
     }
-    approve(
-        ctx,
-        &format!("Allow command `{}`? [y/N] ", redact(command)),
-        elevated || dangerous(command),
-    )?;
+    let message = if ctx.events.shows_command_details() {
+        // The preview line above already displays the full command.
+        "Allow this command? [y/N] ".to_string()
+    } else {
+        format!("Allow command `{}`? [y/N] ", redact(command))
+    };
+    approve(ctx, &message, elevated || dangerous(command))?;
     ctx.events
         .command_started(ctx.cwd, command, elevated, timeout)?;
     let started = Instant::now();
@@ -1177,6 +1179,22 @@ fn truncate(mut value: String, max: usize) -> String {
     }
     value
 }
+/// Short human-readable argument summary for the `→ tool` event line; the
+/// full redacted JSON stays in the audit record.
+fn display_args(name: &str, args: &Value) -> String {
+    let key = match name {
+        "shell" => "command",
+        "web_search" | "search_knowledge" | "search_memory" => "query",
+        "save_memory" => "content",
+        _ => "path",
+    };
+    args[key]
+        .as_str()
+        .map(|value| one_line(&redact(value)))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| one_line(&truncate(safe_args(name, args), 200)))
+}
+
 fn safe_args(name: &str, args: &Value) -> String {
     let mut view = args.clone();
     if matches!(name, "write_file" | "apply_patch" | "save_memory") {
@@ -1305,6 +1323,23 @@ fn append_truncation_marker(output: &mut String, max_bytes: usize) {
 mod tests {
     use super::*;
     use crate::config::ConfigPathResolver;
+
+    #[test]
+    fn display_args_shows_a_friendly_summary() {
+        assert_eq!(
+            display_args(
+                "shell",
+                &json!({"command":"sudo apt-get update","timeout_seconds":300})
+            ),
+            "sudo apt-get update"
+        );
+        assert_eq!(
+            display_args("read_file", &json!({"path":"/etc/hosts"})),
+            "/etc/hosts"
+        );
+        assert!(display_args("stat_path", &json!({})).starts_with('{'));
+    }
+
     #[test]
     fn detects_dangerous_commands() {
         assert!(dangerous("rm -rf /tmp/x"));
@@ -1354,7 +1389,7 @@ mod tests {
             ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
         let mut store = StateStore::open(&config, &resolver).unwrap();
         let session = store.new_session(dir.path(), Some("tools")).unwrap();
-        let events = EventSink::new(true, false);
+        let events = EventSink::new(true, false, false);
         let mut context = ToolContext {
             config: &config,
             events: &events,
@@ -1389,7 +1424,7 @@ mod tests {
             ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
         let mut store = StateStore::open(&config, &resolver).unwrap();
         let session = store.new_session(dir.path(), Some("tools")).unwrap();
-        let events = EventSink::new(true, false);
+        let events = EventSink::new(true, false, false);
         let mut context = ToolContext {
             config: &config,
             events: &events,

@@ -8,6 +8,8 @@ use crate::prompt_file::LoadedPrompt;
 pub struct EventSink {
     quiet: bool,
     json: bool,
+    /// Stream live command output lines (hidden unless --verbose).
+    verbose: bool,
     show_tool_events: Cell<bool>,
     show_commands: Cell<bool>,
     /// stderr is an interactive terminal: heartbeats rewrite one line in place.
@@ -24,13 +26,14 @@ struct JsonEvent<'a> {
 }
 
 impl EventSink {
-    pub fn new(quiet: bool, json: bool) -> Self {
+    pub fn new(quiet: bool, json: bool, verbose: bool) -> Self {
         let terminal =
             !json && !cfg!(windows) && std::io::IsTerminal::is_terminal(&std::io::stderr());
         let color = terminal && std::env::var_os("NO_COLOR").is_none();
         Self {
             quiet,
             json,
+            verbose,
             show_tool_events: Cell::new(true),
             show_commands: Cell::new(true),
             terminal,
@@ -42,6 +45,12 @@ impl EventSink {
     pub fn configure(&self, ui: &UiConfig) {
         self.show_tool_events.set(ui.show_tool_events);
         self.show_commands.set(ui.show_commands);
+    }
+
+    /// Whether command preview lines are visible, so approval prompts can
+    /// refer to "this command" instead of repeating the full command line.
+    pub fn shows_command_details(&self) -> bool {
+        !self.quiet && self.show_commands.get()
     }
 
     pub fn phase(&self, message: &str) -> Result<()> {
@@ -125,7 +134,9 @@ impl EventSink {
     }
 
     pub fn command_output(&self, stream: &str, line: &str) -> Result<()> {
-        if !self.quiet && self.show_commands.get() {
+        // Live command output is hidden unless --verbose; JSON consumers
+        // always receive it as structured events.
+        if self.json || (self.verbose && !self.quiet && self.show_commands.get()) {
             self.stderr("command_output", &format!("  │ {stream}: {}", redact(line)))?;
         }
         Ok(())
@@ -219,7 +230,17 @@ impl EventSink {
                 }))?
             );
         } else {
-            println!("{}", sanitize_terminal(&answer));
+            let answer = sanitize_terminal(&answer);
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                // Render Markdown into readable terminal text; piped output
+                // keeps the raw Markdown for downstream tools.
+                print!(
+                    "{}",
+                    crate::markdown::render_for_terminal(&answer, self.color)
+                );
+            } else {
+                println!("{answer}");
+            }
         }
         Ok(())
     }

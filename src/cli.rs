@@ -23,6 +23,10 @@ pub struct Cli {
     #[arg(long, short = 'q', global = true)]
     pub quiet: bool,
 
+    /// Stream live command stdout/stderr lines (hidden by default)
+    #[arg(long, short = 'v', global = true)]
+    pub verbose: bool,
+
     /// Approve ordinary writes and commands; extremely high-risk actions still require confirmation
     #[arg(long, global = true)]
     pub yes: bool,
@@ -193,6 +197,8 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
             || value == "--json"
             || value == "--quiet"
             || value == "-q"
+            || value == "--verbose"
+            || value == "-v"
             || value == "--yes"
             || value == "--dry-run"
         {

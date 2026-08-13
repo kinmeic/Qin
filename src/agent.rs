@@ -982,7 +982,7 @@ mod tests {
             &mut store,
             &session,
             "List the directory",
-            &EventSink::new(true, false),
+            &EventSink::new(true, false, false),
             RunOptions {
                 source: "cli",
                 source_path: None,

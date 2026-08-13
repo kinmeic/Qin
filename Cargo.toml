@@ -1,6 +1,6 @@
 [package]
 name = "qin"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.85"
 description = "Use natural language to operate Linux, macOS, and OpenWrt without memorizing commands or flags"
@@ -29,6 +29,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "signal", "time"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
+unicode-width = "0.2.2"
 
 [profile.release]
 codegen-units = 1

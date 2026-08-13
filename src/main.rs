@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod event;
 mod knowledge;
+mod markdown;
 mod prompt_file;
 mod state;
 mod tools;
@@ -28,7 +29,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse_normalized();
-    let events = EventSink::new(cli.quiet, cli.json);
+    let events = EventSink::new(cli.quiet, cli.json, cli.verbose);
     let explicit_config = cli.config.clone();
     let assume_yes = cli.yes;
     let dry_run = cli.dry_run;
