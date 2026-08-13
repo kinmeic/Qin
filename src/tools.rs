@@ -924,8 +924,6 @@ fn dangerous(command: &str) -> bool {
         "reboot",
         "poweroff",
         "halt",
-        "iptables",
-        "nft ",
         "chmod -r",
         "chown -r",
         "find ",
@@ -941,6 +939,71 @@ fn dangerous(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
         || ((compact.contains("curl") || compact.contains("wget"))
             && (compact.contains("|sh") || compact.contains("|bash")))
+        || firewall_mutation(command)
+}
+
+/// Firewall commands are high-risk only when they mutate rules: read-only
+/// queries such as `iptables -L` or `nft list ruleset` stay approvable via
+/// --yes. Runs on the original command because iptables short flags are
+/// case-sensitive (`-d` destination vs `-D` delete).
+fn firewall_mutation(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    let iptables = lower.contains("iptables") || lower.contains("ip6tables");
+    let nft = lower.contains("nft ") || lower.contains("nft\t");
+    if !iptables && !nft {
+        return false;
+    }
+    // Loading a full ruleset always mutates.
+    if lower.contains("iptables-restore") || lower.contains("iptables-apply") {
+        return true;
+    }
+    if iptables {
+        let mutates = command
+            .split(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+            .any(|token| {
+                matches!(
+                    token,
+                    "-A" | "-I"
+                        | "-D"
+                        | "-F"
+                        | "-X"
+                        | "-N"
+                        | "-E"
+                        | "-P"
+                        | "-Z"
+                        | "--append"
+                        | "--insert"
+                        | "--delete"
+                        | "--flush"
+                        | "--new-chain"
+                        | "--delete-chain"
+                        | "--rename-chain"
+                        | "--policy"
+                        | "--zero"
+                )
+            });
+        if mutates {
+            return true;
+        }
+    }
+    if nft {
+        let normalized: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+        const NFT_MUTATING: &[&str] = &[
+            "nft add",
+            "nft create",
+            "nft insert",
+            "nft delete",
+            "nft flush",
+            "nft replace",
+            "nft rename",
+            "nft -f",
+            "nft --file",
+        ];
+        if NFT_MUTATING.iter().any(|sub| normalized.contains(sub)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn remove_secret_environment(process: &mut Command, config: &Config) {
@@ -1351,6 +1414,25 @@ mod tests {
         assert!(dangerous("unlink important.db"));
         assert!(!dangerous("cargo test"));
     }
+
+    #[test]
+    fn firewall_readonly_queries_are_not_dangerous() {
+        // Read-only listings stay approvable via --yes.
+        assert!(!dangerous(
+            "sudo -n iptables -L -n 2>/dev/null | head -30 || iptables -L -n | head -30"
+        ));
+        assert!(!dangerous("sudo nft list ruleset | head -40"));
+        assert!(!dangerous("iptables -t nat -S"));
+        // Mutations always require manual confirmation.
+        assert!(dangerous("iptables -F"));
+        assert!(dangerous("iptables -A INPUT -d 1.2.3.4 -j DROP"));
+        assert!(dangerous("ip6tables --flush"));
+        assert!(dangerous("iptables-restore < /tmp/rules"));
+        assert!(dangerous("nft add rule inet filter input drop"));
+        assert!(dangerous("nft flush ruleset"));
+        assert!(dangerous("iptables -L; iptables -D INPUT 1"));
+    }
+
     #[test]
     fn redacts_tokens() {
         assert!(!redact("curl -H 'Bearer abc123'").contains("abc123"));
