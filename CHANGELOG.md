@@ -2,6 +2,16 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.2.8
+
+- Added `qin update` with platform-aware GitHub release discovery, SHA-256 verification, bounded downloads, and atomic executable replacement.
+- Added optional Redis-backed lightweight session storage with TLS support, outage fallback, recovery reconciliation, and integrity checks.
+- Added an interactive configuration wizard with safe secret handling, backups, and dry-run support.
+- Added Linux distribution, distribution version, kernel, and macOS version details to model runtime context when available.
+- Improved `approval = "on_risk"` so recognized read-only shell queries run without approval while unsafe or ambiguous commands still require it.
+- Changed unknown configuration fields and sections to emit warnings and be ignored for forward compatibility; invalid known settings remain errors.
+- Hardened session files, Redis state handling, updater archives, runtime prompt escaping, and read-only command classification following a security audit.
+
 ## 0.2.0
 
 - Added automated, checksummed GitHub release builds for Linux, macOS, and OpenWrt, including legacy `.ipk` and OpenWrt 25.12.5 SDK-built apk v3 packages for `aarch64_cortex-a53` and `x86_64`.

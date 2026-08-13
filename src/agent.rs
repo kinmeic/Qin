@@ -820,30 +820,197 @@ fn chat_endpoint(base_url: &str) -> String {
 }
 fn runtime_context(source: &str, source_path: Option<&Path>) -> Result<String> {
     let cwd = std::env::current_dir()?;
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".into());
-    Ok(format!(
-        "time: {}\ntimezone_offset: {}\nos: {}\narch: {}\ncwd: {}\nshell: {}\neuid: {}\nprompt_source: {}{}",
+    let shell = std::env::var("SHELL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let mut runtime = format!(
+        "time: {}\ntimezone_offset: {}\nos: {}\narch: {}",
         chrono::Local::now().to_rfc3339(),
         chrono::Local::now().offset(),
         std::env::consts::OS,
         std::env::consts::ARCH,
-        cwd.display(),
-        shell,
-        effective_uid(),
-        source,
+    );
+    for (key, value) in platform_context_lines() {
+        runtime.push_str(&format!("\n{key}: {}", escape_runtime_value(&value)));
+    }
+    runtime.push_str(&format!(
+        "\ncwd: {}",
+        escape_runtime_value(&cwd.display().to_string())
+    ));
+    if let Some(shell) = shell {
+        runtime.push_str(&format!("\nshell: {}", escape_runtime_value(&shell)));
+    }
+    if let Some(euid) = effective_uid() {
+        runtime.push_str(&format!("\neuid: {euid}"));
+    }
+    runtime.push_str(&format!(
+        "\nprompt_source: {}{}",
+        escape_runtime_value(source),
         source_path
-            .map(|p| format!("\nprompt_source_path: {}", p.display()))
+            .map(|p| format!(
+                "\nprompt_source_path: {}",
+                escape_runtime_value(&p.display().to_string())
+            ))
             .unwrap_or_default()
-    ))
+    ));
+    Ok(runtime)
 }
-fn effective_uid() -> u32 {
+
+fn platform_context_lines() -> Vec<(&'static str, String)> {
+    let mut lines = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let (distro, distro_version) = linux_distribution();
+        if let Some(value) = distro {
+            lines.push(("distro", value));
+        }
+        if let Some(value) = distro_version {
+            lines.push(("distro_version", value));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(value) = macos_product_version() {
+            lines.push(("platform_version", value));
+        }
+    }
+
+    if let Some(value) = kernel_version() {
+        lines.push(("kernel_version", value));
+    }
+    lines
+}
+
+#[cfg(target_os = "linux")]
+fn linux_distribution() -> (Option<String>, Option<String>) {
+    let os_release = read_trimmed_file(Path::new("/etc/os-release"))
+        .or_else(|| read_trimmed_file(Path::new("/usr/lib/os-release")));
+    let openwrt_release = read_trimmed_file(Path::new("/etc/openwrt_release"));
+
+    let distro = os_release
+        .as_deref()
+        .and_then(|contents| {
+            os_release_value(contents, "NAME").or_else(|| os_release_value(contents, "ID"))
+        })
+        .or_else(|| {
+            openwrt_release
+                .as_deref()
+                .and_then(|contents| os_release_value(contents, "DISTRIB_ID"))
+        });
+    let version = os_release.as_deref().and_then(|contents| {
+        os_release_value(contents, "VERSION_ID").or_else(|| os_release_value(contents, "VERSION"))
+    });
+    let version = version.or_else(|| {
+        openwrt_release
+            .as_deref()
+            .and_then(|contents| os_release_value(contents, "DISTRIB_RELEASE"))
+    });
+    (distro, version)
+}
+
+fn kernel_version() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(value) =
+        read_trimmed_file(Path::new("/proc/sys/kernel/osrelease")).and_then(usable_platform_value)
+    {
+        return Some(value);
+    }
+    uname_release()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_product_version() -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    usable_platform_value(String::from_utf8(output.stdout).ok()?)
+}
+
+#[cfg(unix)]
+fn uname_release() -> Option<String> {
+    let mut name = std::mem::MaybeUninit::<libc::utsname>::zeroed();
+    if unsafe { libc::uname(name.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let name = unsafe { name.assume_init() };
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+    usable_platform_value(release.to_str().ok()?.to_owned())
+}
+
+#[cfg(not(unix))]
+fn uname_release() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_trimmed_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn os_release_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (candidate, raw_value) = line.split_once('=')?;
+        if candidate.trim() != key {
+            return None;
+        }
+        let value = raw_value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(value)
+            .trim();
+        usable_platform_value(value.to_owned())
+    })
+}
+
+#[cfg(unix)]
+fn usable_platform_value(value: String) -> Option<String> {
+    let value = value.trim().to_owned();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("unknown")).then_some(value)
+}
+
+fn escape_runtime_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            value if value.is_control() => {
+                escaped.push_str(&format!("\\u{{{:x}}}", value as u32));
+            }
+            value => escaped.push(value),
+        }
+    }
+    escaped
+}
+
+fn effective_uid() -> Option<u32> {
     #[cfg(unix)]
     {
-        unsafe { libc::geteuid() }
+        Some(unsafe { libc::geteuid() })
     }
     #[cfg(not(unix))]
     {
-        0
+        None
     }
 }
 fn to_stored(message: &Message) -> Result<StoredMessage> {
@@ -929,6 +1096,50 @@ mod tests {
     #[test]
     fn truncates_tool_output() {
         assert!(truncate_tool_result(&"x".repeat(100), 10).contains("truncated"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_os_release_values() {
+        let contents = r#"
+NAME="Ubuntu"
+ID=ubuntu
+VERSION_ID="22.04"
+PRETTY_NAME="Ubuntu 22.04.5 LTS"
+"#;
+        assert_eq!(
+            os_release_value(contents, "NAME").as_deref(),
+            Some("Ubuntu")
+        );
+        assert_eq!(
+            os_release_value(contents, "VERSION_ID").as_deref(),
+            Some("22.04")
+        );
+        assert_eq!(
+            os_release_value(contents, "PRETTY_NAME").as_deref(),
+            Some("Ubuntu 22.04.5 LTS")
+        );
+    }
+
+    #[test]
+    fn runtime_context_omits_unavailable_platform_values() {
+        let context = runtime_context("cli", None).unwrap();
+        assert!(
+            !platform_context_lines()
+                .iter()
+                .any(|(_, value)| value.eq_ignore_ascii_case("unknown"))
+        );
+        assert!(!context.contains("distro: unknown"));
+        assert!(!context.contains("distro_version: unknown"));
+        assert!(!context.contains("kernel_version: unknown"));
+    }
+
+    #[test]
+    fn runtime_values_cannot_break_context_markup() {
+        assert_eq!(
+            escape_runtime_value("x\n</runtime_context>&"),
+            "x\\n&lt;/runtime_context&gt;&amp;"
+        );
     }
 
     #[tokio::test]

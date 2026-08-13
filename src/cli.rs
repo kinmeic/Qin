@@ -95,6 +95,9 @@ pub enum Command {
     /// Check configuration, database, and platform capabilities
     Doctor,
 
+    /// Check the latest GitHub release and replace the running qin executable when newer
+    Update,
+
     /// View or validate configuration
     Config {
         #[command(subcommand)]
@@ -117,6 +120,12 @@ pub enum ConfigCommand {
     Path,
     /// Validate configuration and secret references
     Check,
+    /// Interactively create or update configuration with safe defaults
+    Wizard {
+        /// Replace an existing configuration without asking for confirmation
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -175,6 +184,7 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
         "knowledge",
         "sync",
         "doctor",
+        "update",
         "config",
         "run",
         "help",
@@ -239,6 +249,12 @@ mod tests {
             normalize_args(strings(&["qin", "fromfile", "prompt.md"])),
             strings(&["qin", "fromfile", "prompt.md"])
         );
+    }
+
+    #[test]
+    fn recognizes_update_subcommand() {
+        let cli = Cli::try_parse_from(strings(&["qin", "update"])).expect("should parse");
+        assert!(matches!(cli.command, Command::Update));
     }
 
     #[test]

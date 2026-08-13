@@ -240,6 +240,10 @@ impl EventSink {
         self.stderr("success", &format!("✓ {message}"))
     }
 
+    pub fn warning(&self, message: &str) -> Result<()> {
+        self.stderr("warning", &format!("⚠ {message}"))
+    }
+
     pub fn init_outcome(&self, outcome: &InitOutcome) -> Result<()> {
         if self.json {
             println!(
@@ -337,7 +341,7 @@ fn event_color(event: &str) -> Option<&'static str> {
         "tool_started" | "command_started" => "34",               // blue
         "tool_finished" | "command_finished" | "success" => "32", // green
         "tool_failed" | "command_failed" => "31",                 // red
-        "approval_required" => "33",                              // yellow
+        "approval_required" | "warning" => "33",                  // yellow
         "command_heartbeat" => "2",                               // dim
         _ => return None,
     })

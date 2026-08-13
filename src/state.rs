@@ -1,5 +1,8 @@
+use std::cell::RefCell;
+use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -7,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use crate::config::{Config, ConfigPathResolver, ConfigScope};
@@ -72,20 +76,28 @@ pub struct StateStore {
     backend: Backend,
     path: PathBuf,
     pending_audits: Vec<PendingAudit>,
+    notice: Option<String>,
 }
 
 enum Backend {
     Sqlite(Connection),
-    Memory(MemoryState),
+    Memory(Box<MemoryState>),
 }
 
-/// Memory-backed state used when `storage.enabled = false`: a single session
-/// is kept in a JSON file on a tmpfs (RAM-backed) location, so it survives
-/// process restarts but never touches the disk database and disappears on
-/// reboot. Starting a new session replaces the previous one entirely.
-#[derive(Default)]
+/// Lightweight state used when `storage.enabled = false`: a single session
+/// is kept in either Redis or a JSON file on a tmpfs (RAM-backed) location.
+/// Starting a new session replaces the previous one entirely.
 struct MemoryState {
     session: Option<MemorySession>,
+    persistence: MemoryPersistence,
+}
+
+enum MemoryPersistence {
+    File(PathBuf),
+    Redis {
+        connection: RefCell<redis::Connection>,
+        key: String,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -108,6 +120,18 @@ struct MemoryFile {
 
 const MEMORY_FILE_VERSION: u32 = 1;
 const MEMORY_FILE_NAME: &str = "qin-session.json";
+const MAX_MEMORY_STATE_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug)]
+struct InvalidRedisState(String);
+
+impl fmt::Display for InvalidRedisState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidRedisState {}
 
 /// Path of the tmpfs session file. `storage.data_dir` overrides the directory;
 /// otherwise a RAM-backed location is preferred: $XDG_RUNTIME_DIR or /dev/shm
@@ -138,13 +162,130 @@ fn memory_state_directory() -> PathBuf {
     std::env::temp_dir().join(format!("qin-{}", effective_uid()))
 }
 
-fn load_memory_session(path: &Path) -> Option<MemorySession> {
-    let bytes = fs::read(path).ok()?;
-    let file: MemoryFile = serde_json::from_slice(&bytes).ok()?;
-    if file.version != MEMORY_FILE_VERSION {
-        return None;
+fn load_memory_session(path: &Path) -> Result<Option<MemorySession>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Unable to inspect session state {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "Refusing to read session state from a non-regular file: {}",
+            path.display()
+        );
     }
-    file.session
+    if metadata.len() > MAX_MEMORY_STATE_BYTES {
+        bail!("Session state exceeds the 128 MiB size limit");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != effective_uid() || metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "Session state must be owned by the current user and accessible only to that user: {}",
+                path.display()
+            );
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    options
+        .open(path)
+        .with_context(|| format!("Unable to open session state {}", path.display()))?
+        .take(MAX_MEMORY_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MEMORY_STATE_BYTES {
+        bail!("Session state exceeds the 128 MiB size limit");
+    }
+    decode_memory_session(&bytes).with_context(|| {
+        format!(
+            "Session state is invalid or uses an unsupported version: {}",
+            path.display()
+        )
+    })
+}
+
+fn load_redis_session(
+    connection: &mut redis::Connection,
+    key: &str,
+) -> Result<Option<MemorySession>> {
+    let exists: bool = redis::cmd("EXISTS").arg(key).query(connection)?;
+    if !exists {
+        return Ok(None);
+    }
+    let value_type: String = redis::cmd("TYPE").arg(key).query(connection)?;
+    if value_type == "none" {
+        return Ok(None);
+    }
+    if value_type != "string" {
+        return Err(anyhow::Error::new(InvalidRedisState(format!(
+            "Redis key {key} has type {value_type}; qin requires a string"
+        ))));
+    }
+    let length: u64 = redis::cmd("STRLEN").arg(key).query(connection)?;
+    if length > MAX_MEMORY_STATE_BYTES {
+        return Err(anyhow::Error::new(InvalidRedisState(
+            "Redis qin session state exceeds the 128 MiB size limit".into(),
+        )));
+    }
+    let bytes: Vec<u8> = redis::cmd("GETRANGE")
+        .arg(key)
+        .arg(0)
+        .arg(MAX_MEMORY_STATE_BYTES as i64)
+        .query(connection)?;
+    decode_redis_session(&bytes)
+}
+
+fn decode_memory_session(bytes: &[u8]) -> Result<Option<MemorySession>> {
+    let file: MemoryFile = serde_json::from_slice(bytes)?;
+    if file.version != MEMORY_FILE_VERSION {
+        bail!("Unsupported qin session-state version: {}", file.version);
+    }
+    Ok(file.session)
+}
+
+fn decode_redis_session(bytes: &[u8]) -> Result<Option<MemorySession>> {
+    decode_memory_session(bytes).map_err(|error| {
+        anyhow::Error::new(InvalidRedisState(format!(
+            "Redis contains invalid qin session state: {error:#}"
+        )))
+    })
+}
+
+fn select_redis_session(
+    remote: Option<MemorySession>,
+    local: Option<MemorySession>,
+) -> (Option<MemorySession>, bool) {
+    match (remote, local) {
+        (None, None) => (None, false),
+        (None, Some(local)) => (Some(local), true),
+        (Some(remote), None) => (Some(remote), false),
+        (Some(remote), Some(local)) if memory_session_is_newer(&local, &remote) => {
+            (Some(local), true)
+        }
+        (Some(remote), Some(_)) => (Some(remote), false),
+    }
+}
+
+fn memory_session_is_newer(candidate: &MemorySession, current: &MemorySession) -> bool {
+    if candidate.updated_at != current.updated_at {
+        return candidate.updated_at > current.updated_at;
+    }
+    if candidate.id != current.id {
+        return false;
+    }
+    let candidate_seq = candidate.messages.last().map_or(0, |message| message.seq);
+    let current_seq = current.messages.last().map_or(0, |message| message.seq);
+    (candidate_seq, candidate.summary_through_seq) > (current_seq, current.summary_through_seq)
 }
 
 impl MemorySession {
@@ -205,15 +346,105 @@ struct PendingAudit {
 impl StateStore {
     pub fn open(config: &Config, resolver: &ConfigPathResolver) -> Result<Self> {
         if !config.persistence_enabled() {
+            if config.storage.redis.enabled {
+                match Self::open_redis(config) {
+                    Ok(store) => return Ok(store),
+                    Err(error) if error.downcast_ref::<InvalidRedisState>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        let path = memory_state_path(config)?;
+                        let mut store = Self::open_file_memory(path)?;
+                        store.notice = Some(format!(
+                            "Redis session store unavailable; using the JSON fallback ({error:#})"
+                        ));
+                        return Ok(store);
+                    }
+                }
+            }
             let path = memory_state_path(config)?;
-            let session = load_memory_session(&path);
-            return Ok(Self {
-                backend: Backend::Memory(MemoryState { session }),
-                path,
-                pending_audits: Vec::new(),
-            });
+            return Self::open_file_memory(path);
         }
         Self::open_sqlite(config, resolver)
+    }
+
+    fn open_file_memory(path: PathBuf) -> Result<Self> {
+        let session = load_memory_session(&path)?;
+        Ok(Self {
+            backend: Backend::Memory(Box::new(MemoryState {
+                session,
+                persistence: MemoryPersistence::File(path.clone()),
+            })),
+            path,
+            pending_audits: Vec::new(),
+            notice: None,
+        })
+    }
+
+    fn open_redis(config: &Config) -> Result<Self> {
+        let redis_config = &config.storage.redis;
+        let client = redis::Client::open(redis_config.resolve_url()?)
+            .context("Unable to create the Redis client")?;
+        let mut connection = client
+            .get_connection_with_timeout(Duration::from_millis(redis_config.connect_timeout_ms))
+            .context("Unable to connect to Redis")?;
+        let timeout = Duration::from_millis(redis_config.connect_timeout_ms);
+        connection
+            .set_read_timeout(Some(timeout))
+            .context("Unable to configure the Redis read timeout")?;
+        connection
+            .set_write_timeout(Some(timeout))
+            .context("Unable to configure the Redis write timeout")?;
+        redis::cmd("PING")
+            .query::<String>(&mut connection)
+            .context("Redis did not respond to PING")?;
+        let key = redis_config.key();
+        let remote_session = load_redis_session(&mut connection, &key)?;
+        let local_path = memory_state_path(config)?;
+        let local_session = load_memory_session(&local_path)?;
+        let (session, migrate_local) = select_redis_session(remote_session, local_session);
+        if migrate_local {
+            let file = MemoryFile {
+                version: MEMORY_FILE_VERSION,
+                session: session.clone(),
+            };
+            let bytes = serde_json::to_vec(&file)?;
+            redis::cmd("SET")
+                .arg(&key)
+                .arg(bytes)
+                .query::<()>(&mut connection)
+                .context("Unable to migrate the newer local qin session to Redis")?;
+        }
+        match fs::remove_file(&local_path) {
+            Ok(()) => {
+                if let Some(parent) = local_path.parent() {
+                    if let Err(error) = sync_state_directory(parent) {
+                        return Err(anyhow::Error::new(InvalidRedisState(format!(
+                            "The obsolete JSON fallback was removed, but its directory could not be synchronized: {error:#}"
+                        ))));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::Error::new(InvalidRedisState(format!(
+                    "Redis accepted the qin session, but the obsolete JSON fallback could not be removed from {}: {error}",
+                    local_path.display()
+                ))));
+            }
+        }
+        Ok(Self {
+            backend: Backend::Memory(Box::new(MemoryState {
+                session,
+                persistence: MemoryPersistence::Redis {
+                    connection: RefCell::new(connection),
+                    key: key.clone(),
+                },
+            })),
+            path: PathBuf::from(format!("redis:{key}")),
+            pending_audits: Vec::new(),
+            notice: None,
+        })
     }
 
     fn open_sqlite(config: &Config, resolver: &ConfigPathResolver) -> Result<Self> {
@@ -261,6 +492,7 @@ impl StateStore {
             backend: Backend::Sqlite(connection),
             path,
             pending_audits: Vec::new(),
+            notice: None,
         };
         store.migrate()?;
         store.secure_database_files()?;
@@ -269,6 +501,20 @@ impl StateStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn backend_label(&self) -> &'static str {
+        match &self.backend {
+            Backend::Sqlite(_) => "sqlite",
+            Backend::Memory(memory) => match &memory.persistence {
+                MemoryPersistence::File(_) => "tmpfs-json",
+                MemoryPersistence::Redis { .. } => "redis",
+            },
+        }
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     fn connection(&self) -> &Connection {
@@ -295,25 +541,60 @@ impl StateStore {
             session: memory.session.clone(),
         };
         let bytes = serde_json::to_vec(&file)?;
-        let parent = self
-            .path
-            .parent()
-            .context("The memory state path has no parent directory")?;
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        if bytes.len() as u64 > MAX_MEMORY_STATE_BYTES {
+            bail!("Session state exceeds the 128 MiB size limit");
         }
-        let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        match &memory.persistence {
+            MemoryPersistence::File(path) => {
+                let parent = path
+                    .parent()
+                    .context("The memory state path has no parent directory")?;
+                ensure_private_memory_directory(parent)?;
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                        bail!(
+                            "Refusing to replace a non-regular session-state path: {}",
+                            path.display()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
+                    format!(
+                        "Unable to create temporary session state in {}",
+                        parent.display()
+                    )
+                })?;
+                temporary.write_all(&bytes)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    temporary
+                        .as_file()
+                        .set_permissions(fs::Permissions::from_mode(0o600))?;
+                }
+                temporary.as_file().sync_all()?;
+                temporary
+                    .persist(path)
+                    .map_err(|error| error.error)
+                    .with_context(|| {
+                        format!("Unable to persist session state to {}", path.display())
+                    })?;
+                sync_state_directory(parent)?;
+                Ok(())
+            }
+            MemoryPersistence::Redis { connection, key } => {
+                let mut connection = connection.borrow_mut();
+                redis::cmd("SET")
+                    .arg(key)
+                    .arg(bytes)
+                    .query::<()>(&mut *connection)
+                    .context("Unable to persist the qin session to Redis")?;
+                Ok(())
+            }
         }
-        fs::rename(&temporary, &self.path)?;
-        Ok(())
     }
 
     pub fn lock_session(&self, session_id: &str) -> Result<SessionLock> {
@@ -1103,6 +1384,40 @@ fn ensure_private_lock_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn ensure_private_memory_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "The session-state path is not a private directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != effective_uid() {
+            bail!(
+                "The session-state directory is not owned by the current user: {}",
+                path.display()
+            );
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_state_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_state_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn effective_uid() -> u32 {
     #[cfg(unix)]
     {
@@ -1195,6 +1510,41 @@ mod tests {
         }
     }
 
+    fn memory_session_with_timestamp(timestamp: &str) -> MemorySession {
+        let mut session = MemorySession::new(Path::new("/tmp"), None);
+        session.updated_at = timestamp.into();
+        session
+    }
+
+    #[test]
+    fn newer_local_fallback_wins_when_redis_returns() {
+        let remote = memory_session_with_timestamp("2026-08-13 10:00:00");
+        let local = memory_session_with_timestamp("2026-08-13 10:01:00");
+        let local_id = local.id.clone();
+        let (selected, migrate) = select_redis_session(Some(remote), Some(local));
+        assert!(migrate);
+        assert_eq!(selected.unwrap().id, local_id);
+    }
+
+    #[test]
+    fn longer_local_fallback_wins_with_same_timestamp() {
+        let remote = memory_session_with_timestamp("2026-08-13 10:00:00");
+        let mut local = remote.clone();
+        local.messages.push(SequencedMessage {
+            seq: 1,
+            message: user_message("written during outage"),
+        });
+        let (selected, migrate) = select_redis_session(Some(remote), Some(local));
+        assert!(migrate);
+        assert_eq!(selected.unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn invalid_redis_state_is_not_an_availability_error() {
+        let error = decode_redis_session(b"not-json").err().unwrap();
+        assert!(error.downcast_ref::<InvalidRedisState>().is_some());
+    }
+
     #[test]
     fn memory_mode_persists_one_session_across_processes() {
         let (dir, mut store) = memory_store();
@@ -1227,6 +1577,46 @@ mod tests {
         assert!(store.load_messages(&first).unwrap().is_empty());
         assert!(store.resolve_session_id(&first).is_err());
         assert_eq!(store.list_sessions(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_redis_falls_back_to_the_json_memory_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut config = Config::default();
+        config.storage.data_dir = dir.path().to_string_lossy().into_owned();
+        config.storage.redis.enabled = true;
+        config.storage.redis.url = "not-a-redis-url".into();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        assert_eq!(store.backend_label(), "tmpfs-json");
+        assert!(store.notice().is_some());
+        let id = store.ensure_current_session(Path::new("/tmp")).unwrap();
+        store
+            .append_messages(&id, &[user_message("fallback")], Path::new("/tmp"))
+            .unwrap();
+        assert!(dir.path().join(MEMORY_FILE_NAME).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_state_refuses_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        fs::write(
+            &target,
+            serde_json::to_vec(&MemoryFile {
+                version: MEMORY_FILE_VERSION,
+                session: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let link = dir.path().join(MEMORY_FILE_NAME);
+        symlink(&target, &link).unwrap();
+        assert!(load_memory_session(&link).is_err());
     }
 
     #[test]

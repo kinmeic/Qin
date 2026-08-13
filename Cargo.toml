@@ -1,6 +1,6 @@
 [package]
 name = "qin"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 rust-version = "1.85"
 description = "Use natural language to operate Linux, macOS, and OpenWrt without memorizing commands or flags"
@@ -15,17 +15,22 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 directories = "6"
+flate2 = "1"
 futures-util = "0.3"
 fs2 = "0.4"
 half = { version = "2", features = ["serde"] }
 hex = "0.4"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+redis = { version = "1.2.2", default-features = false, features = ["tls-rustls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+serde_ignored = "0.1"
 serde_json = "1"
 sha2 = "0.10"
+semver = "1"
 tempfile = "3"
+tar = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "signal", "time"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }

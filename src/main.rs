@@ -7,6 +7,8 @@ mod markdown;
 mod prompt_file;
 mod state;
 mod tools;
+mod update;
+mod wizard;
 
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -18,6 +20,7 @@ use crate::cli::{Cli, Command, ConfigCommand, KnowledgeCommand, MemoryCommand};
 use crate::config::{ConfigPathResolver, InitOptions};
 use crate::event::EventSink;
 use crate::state::StateStore;
+use crate::update::UpdateOutcome;
 
 #[tokio::main]
 async fn main() {
@@ -49,8 +52,7 @@ async fn run() -> Result<()> {
             match command {
                 ConfigCommand::Path => {
                     if resolver.config_path().exists() {
-                        let config = config::load(&resolver)?;
-                        events.configure(&config.ui);
+                        let config = load_config(&resolver, &events)?;
                         println!("Scope: {}", terminal(resolver.scope().label()));
                         println!(
                             "Configuration: {}",
@@ -60,6 +62,11 @@ async fn run() -> Result<()> {
                             println!(
                                 "Database: {}",
                                 terminal(&resolver.database_path(&config)?.display().to_string())
+                            );
+                        } else if config.storage.redis.enabled {
+                            println!(
+                                "Session store: Redis (key prefix: {})",
+                                terminal(&config.storage.redis.key_prefix)
                             );
                         } else {
                             println!(
@@ -76,13 +83,15 @@ async fn run() -> Result<()> {
                     }
                 }
                 ConfigCommand::Check => {
-                    let loaded = config::load(&resolver)?;
-                    events.configure(&loaded.ui);
+                    let loaded = load_config(&resolver, &events)?;
                     loaded.validate(true)?;
                     events.success(&format!(
                         "Configuration is valid: {}",
                         resolver.config_path().display()
                     ))?;
+                }
+                ConfigCommand::Wizard { force } => {
+                    wizard::run(&resolver, assume_yes || force, dry_run)?;
                 }
             }
         }
@@ -188,9 +197,10 @@ async fn run() -> Result<()> {
         Command::Sync => {
             let (config, _, mut store) = open(&explicit_config, &events)?;
             if !config.persistence_enabled() {
-                events.success(
-                    "Session state lives in a tmpfs file and is written immediately; nothing to synchronize",
-                )?;
+                events.success(match store.backend_label() {
+                    "redis" => "Session state is stored in Redis and written immediately; nothing to synchronize",
+                    _ => "Session state lives in a tmpfs file and is written immediately; nothing to synchronize",
+                })?;
             } else {
                 store.checkpoint()?;
                 events.success(&format!(
@@ -200,6 +210,35 @@ async fn run() -> Result<()> {
             }
         }
         Command::Doctor => doctor(&explicit_config, &events)?,
+        Command::Update => {
+            let outcome = update::run(dry_run).await?;
+            let message = match outcome {
+                UpdateOutcome::UpToDate {
+                    current,
+                    executable,
+                } => format!(
+                    "qin is already up to date (v{current}); executable: {}",
+                    executable.display()
+                ),
+                UpdateOutcome::DryRun {
+                    current,
+                    latest,
+                    executable,
+                } => format!(
+                    "Dry run: qin would update from v{current} to v{latest}; executable: {}",
+                    executable.display()
+                ),
+                UpdateOutcome::Updated {
+                    current,
+                    latest,
+                    executable,
+                } => format!(
+                    "qin updated from v{current} to v{latest}; executable: {}",
+                    executable.display()
+                ),
+            };
+            events.success(&message)?;
+        }
     }
     Ok(())
 }
@@ -209,11 +248,34 @@ fn open(
     events: &EventSink,
 ) -> Result<(config::Config, ConfigPathResolver, StateStore)> {
     let resolver = ConfigPathResolver::new(explicit.clone(), false)?;
-    let config = config::load(&resolver)?;
+    let config = load_config(&resolver, events)?;
     config.validate(false)?;
-    events.configure(&config.ui);
     let store = StateStore::open(&config, &resolver)?;
+    if let Some(notice) = store.notice() {
+        events.warning(notice)?;
+    }
     Ok((config, resolver, store))
+}
+
+fn load_config(resolver: &ConfigPathResolver, events: &EventSink) -> Result<config::Config> {
+    let loaded = config::load_with_warnings(resolver)?;
+    events.configure(&loaded.config.ui);
+    if loaded.unknown_field_count > 0 {
+        let fields = loaded.unknown_fields.join(", ");
+        let omitted = loaded
+            .unknown_field_count
+            .saturating_sub(loaded.unknown_fields.len());
+        let suffix = if omitted == 0 {
+            String::new()
+        } else {
+            format!(", and {omitted} more")
+        };
+        events.warning(&format!(
+            "Ignoring unknown configuration field(s) in {}: {fields}{suffix}",
+            resolver.config_path().display()
+        ))?;
+    }
+    Ok(loaded.config)
 }
 
 async fn execute_from_file(
@@ -385,10 +447,13 @@ fn doctor(explicit: &Option<PathBuf>, events: &EventSink) -> Result<()> {
         "Database: {}",
         if config.persistence_enabled() {
             terminal(&store.path().display().to_string())
+        } else if store.backend_label() == "redis" {
+            terminal("Redis session backend")
         } else {
             terminal(&format!("{} (tmpfs session file)", store.path().display()))
         }
     );
+    println!("Session backend: {}", terminal(store.backend_label()));
     println!("Model: {}", terminal(&config.primary_model()?.model));
     if config.embeddings_active() {
         println!(

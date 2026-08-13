@@ -1,6 +1,6 @@
 # Code audit
 
-This repository was audited for correctness, security, and performance in August 2026. The audit covered configuration loading, model and search HTTP clients, the agent loop, context compression, local tools, privilege elevation, SQLite persistence, session locking, knowledge ingestion, embedding search, terminal output, installation, packaging, and CI.
+This repository was audited for correctness, security, and performance in August 2026. The audit covered configuration loading and the interactive wizard, model and search HTTP clients, the agent loop, context compression, local tools and approval classification, privilege elevation, SQLite/Redis/tmpfs persistence, session locking, runtime host context, self-update, knowledge ingestion, embedding search, terminal output, installation, packaging, dependencies, and CI.
 
 ## Fixed findings
 
@@ -12,6 +12,9 @@ This repository was audited for correctness, security, and performance in August
 - Total wall time now covers model calls and tool execution, and cancellation no longer allows the agent to continue after an interrupted command.
 - Models can explicitly disable tool schemas with `supports_tools = false`.
 - Invalid or unsupported configuration values are rejected instead of being silently ignored.
+- Redis recovery now reconciles the remote session with a newer outage-time JSON session, including same-second message sequence changes, and removes the obsolete JSON file after migration.
+- The configuration wizard honors `--dry-run`, preserves existing inline/legacy API keys unless explicitly replaced, and reports failed backup restoration instead of hiding it.
+- Runtime distribution, platform, and kernel fields are optional and platform-specific; unavailable values are omitted rather than fabricated.
 
 ### Security and privacy
 
@@ -24,6 +27,12 @@ This repository was audited for correctness, security, and performance in August
 - Command stdout and stderr use a bounded channel, terminal control characters are filtered, and live command output honors its configured byte limit.
 - Session lock names are hashed and private, and an advisory operating-system lock avoids stale-file ownership races without persistent flash writes.
 - Destructive command detection was expanded, and path operations outside the workspace are always treated as high risk.
+- `on_risk` shell auto-approval rejects multiline/comment ambiguity, untrusted executable paths, and side-effecting options such as `date --set`, `find -fprint`, `rg --pre`, `sort -o`, and `ss --kill`.
+- tmpfs session state rejects symlinks, non-private ownership/modes, malformed data, unsupported versions, and values larger than 128 MiB; writes use private same-directory temporary files and atomic replacement.
+- Redis supports certificate-verified TLS, uses bounded connect/read/write operations, rejects malformed or wrongly typed state instead of silently overwriting it, and removes secret Redis URL environment variables from shell children.
+- Runtime-context values and remote updater error summaries are escaped/sanitized before display or model delivery.
+- Self-update accepts only bounded GitHub release assets for the current platform, verifies SHA-256, rejects unsafe archive paths, and atomically replaces the executable.
+- The RustSec advisory database reports no known vulnerability in the locked dependency graph at the time of this audit.
 
 ### Performance and OpenWrt
 
@@ -40,6 +49,7 @@ This repository was audited for correctness, security, and performance in August
 - File-system path checks reduce common symlink attacks but cannot provide the guarantees of a kernel sandbox against a hostile process that races path changes.
 - Flat cosine search streams rows with bounded result memory, but remains CPU- and I/O-heavy for very large knowledge bases.
 - Session data and knowledge are protected by file permissions, not encrypted at rest.
+- Redis session locking is local to one host. Deployments that share one Redis database across machines must use a unique `storage.redis.key_prefix` per qin installation and must not concurrently write the same key.
 - The configured model provider receives prompts, selected history, runtime context, tool output, and recalled knowledge needed for a task.
 
 For higher-assurance environments, combine `qin` with a restricted OS account, a container or VM, read-only mounts, network egress controls, and encrypted storage.

@@ -50,8 +50,9 @@ reject_nul = true
 [storage]
 # When disabled, no SQLite database is used: a single session is kept in a
 # JSON file on tmpfs (RAM-backed; /dev/shm or $XDG_RUNTIME_DIR on Linux,
-# /tmp on OpenWrt). The session survives process restarts and is passed to
-# the next run as context, "qin new" wipes it, and it disappears on reboot.
+# /tmp on OpenWrt), unless the optional Redis backend below is available.
+# The session survives process restarts and is passed to the next run as
+# context, "qin new" wipes it, and it disappears on reboot when using tmpfs.
 # Embeddings, long-term memory, and cross-session recall stay disabled.
 # data_dir overrides the session-file directory when set.
 enabled = false
@@ -60,6 +61,19 @@ database = "qin.db"
 journal_mode = "auto"
 write_profile = "auto"
 busy_timeout_ms = 5000
+
+[storage.redis]
+# When enabled and storage.enabled=false, qin first tries Redis and avoids
+# writing qin-session.json. If Redis is unavailable, qin safely falls back to
+# the tmpfs JSON session file and prints a warning.
+enabled = false
+url = "redis://127.0.0.1:6379/0"
+# Prefer an environment variable when the URL contains a password or TLS
+# settings, for example: QIN_REDIS_URL=redis://:password@host:6379/0
+# url_env = "QIN_REDIS_URL"
+# Redis stores conversation content; use a private/authenticated instance.
+key_prefix = "qin"
+connect_timeout_ms = 1000
 
 [knowledge]
 # Requires storage.enabled=true and embeddings.enabled=true to take effect.

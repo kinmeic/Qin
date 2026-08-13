@@ -50,6 +50,9 @@ sudo qin "把生成的配置安装到 /etc/myapp"
 time: 2026-08-12T14:30:00+08:00
 timezone: Asia/Shanghai
 os: linux
+distro: Ubuntu
+distro_version: 22.04
+kernel_version: 6.8.0-31-generic
 arch: aarch64
 cwd: /home/user/project
 user: user
@@ -64,6 +67,8 @@ tty: true
 帮我把 xxx 目录下的所有文件移动到当前目录
 </user_request>
 ```
+
+Linux 优先读取 `/etc/os-release`，缺失时尝试 `/usr/lib/os-release`，OpenWrt 还兼容 `/etc/openwrt_release`；内核版本使用 `/proc/sys/kernel/osrelease`，并回退到 `uname`。macOS 的系统版本使用 `sw_vers`，内核版本使用 `uname`。其他 Unix 平台只在能可靠读取时加入相应字段；任何字段读取失败都省略，不填充 `unknown`。
 
 运行时数据应同时保存为本轮快照，但数据库中的用户消息仍保存用户原文，避免历史记录被机器信息污染。
 
@@ -437,13 +442,20 @@ allow_utf8_bom = true
 reject_nul = true
 
 [storage]
-enabled = false                # 默认关闭：不用 SQLite；单个会话保存在 tmpfs（内存文件系统）的 JSON 文件中，跨调用保留并作为上下文传给下次调用，new 完全清空，重启消失；同时禁用 embedding 与跨会话记忆召回
+enabled = false                # 默认关闭：不用 SQLite；单个会话保存在 tmpfs JSON 文件中，或在下方 Redis 可用时保存在 Redis；同时禁用 embedding 与跨会话记忆召回
 data_dir = ""                    # 空值表示平台默认目录
 database = "qin.db"
 journal_mode = "auto"            # auto | wal | persist | delete
 write_profile = "auto"            # auto | durable | low_write
 busy_timeout_ms = 5000
 retention_days = 0                # 0 表示不自动删除
+
+[storage.redis]
+enabled = false                 # 仅在 storage.enabled=false 时作为轻量会话后端
+url = "redis://127.0.0.1:6379/0"
+# url_env = "QIN_REDIS_URL"    # 推荐用于含密码的 URL
+key_prefix = "qin"
+connect_timeout_ms = 1000
 
 [storage.low_write]
 tmp_spool_dir = "/tmp/qin-spool"
@@ -469,7 +481,7 @@ auto_extract_every_turns = 1        # OpenWrt low_write 默认提升到 8
 max_auto_memories_per_run = 3
 
 [permissions]
-approval = "on_risk"             # always | on_risk | never
+approval = "on_risk"             # always | on_risk | never；on_risk 下只读工具/已识别只读 shell 不审批
 workspace_write = true
 allow_shell = true
 elevation = "auto"               # auto | sudo | doas | su | disabled
@@ -504,7 +516,9 @@ color = "auto"
 final_answer_to_stdout = true
 ```
 
-配置加载后应执行严格校验：比例范围、上下文预算关系、URL scheme、未知字段、重复模型名、密钥解析失败和模型能力冲突都应在发起请求前报错。
+Redis 支持 `redis://` 和校验证书的 `rediss://`。启动时连接、设置读写超时并执行 `PING`；网络不可用时显示原因并回退到私有 tmpfs JSON。Redis 恢复后比较两端会话时间和消息序号，迁移较新的状态，成功写入后删除 JSON，避免未来回退到过期副本。Redis 中 qin key 类型错误、JSON 损坏或版本不兼容属于数据完整性错误，必须明确失败，不能静默覆盖。
+
+配置加载后应校验比例范围、上下文预算关系、URL scheme、重复模型名、密钥解析失败和模型能力冲突，这些已知配置错误都应在发起请求前报错。为了允许较新配置文件被较旧版本读取，未知字段或未知配置块只显示 warning 并忽略，不阻止启动；warning 应包含字段路径，避免用户误以为该配置已经生效。
 
 ### 5.4 密钥管理
 
@@ -654,7 +668,7 @@ OpenWrt 上可能没有 `sudo`。`elevation = "auto"` 应按 `当前已是 root 
 
 | 等级 | 示例 | 默认策略 |
 |---|---|---|
-| ReadOnly | 列目录、读文件、搜索 | 自动 |
+| ReadOnly | 列目录、读文件、搜索、已识别的本地只读 shell（如 `date`、`pwd`） | 自动 |
 | Reversible | 新建文件、移动到空目标、写新文件 | 显示事件；`on_risk` 可自动 |
 | Mutating | 覆盖文件、批量移动、安装包 | 确认 |
 | Destructive | 永久删除、改系统配置、停止服务 | 强确认 |
@@ -665,6 +679,7 @@ OpenWrt 上可能没有 `sudo`。`elevation = "auto"` 应按 `当前已是 root 
 ### 9.3 文件与 Shell 防护
 
 - 所有路径转为绝对、规范化路径，并在执行前重新检查 symlink。
+- `approval = "on_risk"` 下只读工具和安全白名单内的只读 shell 不弹授权；未知 shell、写入、提权、外部路径访问和破坏性命令仍按风险处理。
 - 禁止把 `/`、用户主目录、工作区根等宽泛目录作为递归删除目标，除非专门的高风险流程。
 - 删除优先移入平台回收站；OpenWrt 没有回收站时要求确认并记录清单。
 - Shell 使用参数化 `Command`，不要默认套一层 `sh -c`；确需 Shell 语法时显式标记。
@@ -1052,7 +1067,7 @@ OpenWrt 包应安装：
 - 配置使用 TOML；OpenWrt 首版不使用 UCI，后续另加 adapter。
 - `qin init` 使用统一路径解析器生成完整模板、显示绝对路径、默认不覆盖已有配置，数据库仍按需创建。
 - `qin fromfile <PATH>` 安全读取受大小限制的 UTF-8 文本，并作为普通用户提示词进入当前会话。
-- 数据库使用 SQLite；Linux/macOS WAL，OpenWrt `auto` 根据数据目录选择。
+- 持久历史数据库使用 SQLite；Linux/macOS WAL，OpenWrt `auto` 根据数据目录选择；`storage.enabled=false` 时可选 Redis 作为单会话后端。
 - 知识库、长期记忆、Embedding 和向量搜索属于首版核心能力，不是可选插件。
 - 当前所有平台使用流式 flat cosine；OpenWrt 额外默认使用 f16 canonical vector，sqlite-vec 保留为后续桌面可选后端。
 - 只对新增或内容哈希变化的 chunk 生成 embedding，并批量事务写入。

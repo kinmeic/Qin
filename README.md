@@ -86,6 +86,40 @@ Configuration and persistent state use platform-appropriate directories by defau
 
 Run `qin config path` and `qin doctor` to see the exact active paths. Use `qin init --system` when you intentionally want a system-wide configuration. An explicitly selected configuration stores its database beside that configuration unless `storage.data_dir` overrides the location.
 
+### Optional Redis session storage
+
+When SQLite is disabled, qin normally keeps the current session in a tmpfs JSON file. If a Redis server is available, qin can store that lightweight session directly in Redis instead:
+
+```toml
+[storage]
+enabled = false
+
+[storage.redis]
+enabled = true
+url = "redis://127.0.0.1:6379/0"
+key_prefix = "qin"
+connect_timeout_ms = 1000
+```
+
+For a password or a remote Redis server, keep the URL out of the config file:
+
+```toml
+[storage.redis]
+enabled = true
+url_env = "QIN_REDIS_URL"
+key_prefix = "qin"
+```
+
+```bash
+export QIN_REDIS_URL='redis://:password@127.0.0.1:6379/0'
+```
+
+qin verifies the URL and sends `PING` during startup. Both `redis://` and certificate-verified `rediss://` connections are supported. When Redis is reachable, no `qin-session.json` is written. If Redis is unavailable, qin falls back to the tmpfs JSON session store and prints the reason in a warning. Redis session storage is intentionally only used when `storage.enabled = false`; enabling SQLite and Redis together is rejected to avoid ambiguous storage semantics. Long-term memory and embeddings still require SQLite storage to be enabled.
+
+The session contains conversation content, so use a private Redis instance with authentication/ACLs and TLS or a protected local network as appropriate. When Redis becomes available, qin compares any outage-time JSON session with the Redis session, migrates the newer state, and removes the obsolete JSON file after Redis accepts it. Invalid or unsupported session data in Redis is reported as an error instead of silently replacing it with a fallback.
+
+Redis locking is local to the machine running qin. If several machines use the same Redis database, configure a unique `key_prefix` for each qin installation; do not use one session key as a concurrent multi-host store.
+
 A generated configuration includes documented defaults. The essential model settings look like this:
 
 ```toml
@@ -194,11 +228,17 @@ Documents are chunked, embedded, and stored with canonical vectors. Search combi
 ```bash
 qin config path
 qin config check
+qin config wizard
 qin doctor
 qin sync
+qin update
 ```
 
 `qin sync` commits pending audit records, checkpoints WAL databases, and asks SQLite to flush cached pages.
+`qin update` checks the latest GitHub release for the current platform, verifies its SHA-256 checksum, and atomically replaces the running executable when a newer version is available. Use `sudo qin update` when qin is installed in a directory that requires administrator permissions; `qin update --dry-run` only checks and reports what would change.
+`qin config wizard` walks through the model connection, optional Redis/SQLite storage, and safety settings. Existing files are backed up before replacement; use `qin config wizard --force` or the global `--yes` flag to skip the final replacement confirmation. `--dry-run` performs the full review and validation without writing the file. API keys and Redis URLs can be supplied through environment variables, and the wizard never asks you to paste an API key into the config file; an existing inline API key is preserved unless you explicitly replace it with an environment-variable reference.
+
+For forward compatibility, unknown fields and configuration sections produce a warning and are ignored instead of preventing qin from starting. Known fields with invalid types or values remain errors. An ignored setting does not take effect; use `qin config check` and review its warnings after moving a configuration file between qin versions.
 
 ## How a task runs
 
@@ -208,7 +248,7 @@ The model can request local tools for directory listing, file inspection, readin
 
 ## Safety model
 
-`qin` reduces accidental damage through path validation, risk classification, approvals, command redaction, timeouts, and conservative defaults. Use `--dry-run` to allow planning and read-only inspection without performing writes or commands. `--yes` can approve ordinary mutations, but it does not bypass confirmation for extremely high-risk actions.
+`qin` reduces accidental damage through path validation, risk classification, approvals, command redaction, timeouts, and conservative defaults. With `permissions.approval = "on_risk"`, read-only tools and recognized read-only shell commands such as `date`, `pwd`, and `find ... -print` run without an approval prompt. Writes, unknown shell commands, external-path access, destructive commands, and privilege elevation remain subject to approval. Use `--dry-run` to allow planning and read-only inspection without performing writes or commands. `--yes` can approve ordinary mutations, but it does not bypass confirmation for extremely high-risk actions.
 
 These controls are guardrails, not a complete operating-system sandbox. Review displayed commands, use normal user privileges by default, protect your configuration and database, and keep backups of important data.
 

@@ -10,6 +10,14 @@ use serde::Deserialize;
 use tempfile::NamedTempFile;
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/config.example.toml");
+const MAX_REPORTED_UNKNOWN_FIELDS: usize = 16;
+
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub unknown_fields: Vec<String>,
+    pub unknown_field_count: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigScope {
@@ -98,7 +106,7 @@ fn system_data_directory(openwrt: bool) -> PathBuf {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     pub version: u32,
     pub default_model: String,
@@ -134,7 +142,7 @@ impl Default for Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ModelConfig {
     pub base_url: String,
     pub api_style: String,
@@ -196,7 +204,7 @@ impl ModelConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct InputConfig {
     pub fromfile_max_bytes: u64,
     pub allow_utf8_bom: bool,
@@ -214,7 +222,7 @@ impl Default for InputConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AgentConfig {
     pub max_iterations: u32,
     pub max_tool_calls: u32,
@@ -242,7 +250,7 @@ impl Default for AgentConfig {
 pub(crate) const COMPACT_TARGET_RATIO: f64 = 0.45;
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ContextConfig {
     pub compact_trigger_ratio: f64,
     pub reserve_output_tokens: u64,
@@ -264,7 +272,7 @@ impl Default for ContextConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct StorageConfig {
     pub enabled: bool,
     pub data_dir: String,
@@ -274,6 +282,7 @@ pub struct StorageConfig {
     pub busy_timeout_ms: u64,
     pub retention_days: u64,
     pub low_write: LowWriteConfig,
+    pub redis: RedisStorageConfig,
 }
 
 impl Default for StorageConfig {
@@ -287,12 +296,65 @@ impl Default for StorageConfig {
             busy_timeout_ms: 5_000,
             retention_days: 0,
             low_write: LowWriteConfig::default(),
+            redis: RedisStorageConfig::default(),
         }
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RedisStorageConfig {
+    /// Prefer Redis for the single-session backend when SQLite is disabled.
+    pub enabled: bool,
+    /// Redis connection URL. `url_env`, when set, takes precedence.
+    pub url: String,
+    /// Optional environment variable containing the complete Redis URL.
+    pub url_env: Option<String>,
+    /// Key namespace used by qin; no credentials are stored in the key.
+    pub key_prefix: String,
+    /// Timeout used while probing Redis during startup.
+    pub connect_timeout_ms: u64,
+}
+
+impl Default for RedisStorageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: "redis://127.0.0.1:6379/0".into(),
+            url_env: None,
+            key_prefix: "qin".into(),
+            connect_timeout_ms: 1_000,
+        }
+    }
+}
+
+impl RedisStorageConfig {
+    pub fn resolve_url(&self) -> Result<String> {
+        if let Some(name) = self.url_env.as_deref() {
+            if !is_env_var_name(name) {
+                bail!("storage.redis.url_env must be a valid environment-variable name");
+            }
+            let value = std::env::var(name).with_context(|| {
+                format!("Environment variable {name} for storage.redis.url_env is not set")
+            })?;
+            if value.trim().is_empty() {
+                bail!("Environment variable {name} for storage.redis.url_env is empty");
+            }
+            return Ok(value);
+        }
+        if self.url.trim().is_empty() {
+            bail!("storage.redis.url cannot be empty when Redis is enabled");
+        }
+        Ok(self.url.trim().to_string())
+    }
+
+    pub fn key(&self) -> String {
+        format!("{}:session", self.key_prefix.trim())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct LowWriteConfig {
     pub tmp_spool_dir: String,
     pub flush_every_turns: u32,
@@ -316,7 +378,7 @@ impl Default for LowWriteConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct EmbeddingConfig {
     pub enabled: bool,
     pub base_url: String,
@@ -354,7 +416,7 @@ impl EmbeddingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct KnowledgeConfig {
     pub enabled: bool,
     pub recall_limit: usize,
@@ -392,7 +454,7 @@ impl Default for KnowledgeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct PermissionsConfig {
     pub approval: String,
     pub workspace_write: bool,
@@ -418,7 +480,7 @@ impl Default for PermissionsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SearchProviderConfig {
     pub enabled: bool,
     pub api_key_env: Option<String>,
@@ -433,7 +495,7 @@ impl SearchProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SearchConfig {
     pub order: Vec<String>,
     pub max_results: usize,
@@ -457,7 +519,7 @@ impl Default for SearchConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct UiConfig {
     pub show_tool_events: bool,
     pub show_commands: bool,
@@ -636,6 +698,11 @@ impl Config {
             );
         }
         if self.storage.enabled {
+            if self.storage.redis.enabled {
+                bail!(
+                    "storage.redis.enabled requires storage.enabled=false; Redis is the lightweight session backend"
+                );
+            }
             if self.storage.database.trim().is_empty()
                 || Path::new(&self.storage.database).components().count() != 1
             {
@@ -661,6 +728,43 @@ impl Config {
             }
             if self.storage.low_write != LowWriteConfig::default() {
                 bail!("Custom [storage.low_write] thresholds are reserved for a future release");
+            }
+        }
+        if self.storage.redis.enabled {
+            if self.storage.redis.key_prefix.trim().is_empty()
+                || self.storage.redis.key_prefix.chars().count() > 128
+                || !self
+                    .storage
+                    .redis
+                    .key_prefix
+                    .chars()
+                    .all(|value| value.is_ascii_alphanumeric() || ".:_-".contains(value))
+            {
+                bail!(
+                    "storage.redis.key_prefix must be 1-128 characters using only letters, numbers, '.', ':', '_' or '-'"
+                );
+            }
+            if !(100..=60_000).contains(&self.storage.redis.connect_timeout_ms) {
+                bail!("storage.redis.connect_timeout_ms must be between 100 and 60000");
+            }
+            if let Some(name) = self.storage.redis.url_env.as_deref() {
+                if !is_env_var_name(name)
+                    || matches!(name, "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME")
+                {
+                    bail!("storage.redis.url_env is not a safe environment-variable name");
+                }
+            }
+            let redis_url = if self.storage.redis.url_env.is_some() {
+                if check_secret {
+                    Some(self.storage.redis.resolve_url()?)
+                } else {
+                    None
+                }
+            } else {
+                Some(self.storage.redis.resolve_url()?)
+            };
+            if let Some(redis_url) = redis_url {
+                validate_redis_url(&redis_url)?;
             }
         }
         if !matches!(
@@ -845,6 +949,11 @@ fn validate_http_url(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_redis_url(value: &str) -> Result<()> {
+    redis::Client::open(value).with_context(|| "storage.redis.url is not a valid Redis URL")?;
+    Ok(())
+}
+
 pub(crate) fn is_env_var_name(value: &str) -> bool {
     let mut chars = value.chars();
     chars
@@ -883,6 +992,12 @@ pub struct InitOutcome {
     pub config_path: PathBuf,
     pub backup_path: Option<PathBuf>,
     pub scope: ConfigScope,
+}
+
+#[derive(Debug)]
+pub struct ConfigWriteOutcome {
+    pub config_path: PathBuf,
+    pub backup_path: Option<PathBuf>,
 }
 
 pub fn initialize(resolver: &ConfigPathResolver, options: &InitOptions) -> Result<InitOutcome> {
@@ -979,6 +1094,78 @@ fn platform_template(openwrt: bool) -> String {
     }
 }
 
+pub(crate) fn template_for_platform() -> String {
+    platform_template(is_openwrt())
+}
+
+pub(crate) fn write_config_content(
+    resolver: &ConfigPathResolver,
+    content: &str,
+) -> Result<ConfigWriteOutcome> {
+    let _: Config = toml::from_str(content).context("The wizard produced invalid TOML")?;
+    let path = resolver.config_path();
+    let parent = path
+        .parent()
+        .context("The configuration path has no parent directory")?;
+    let parent_existed = parent.exists();
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Unable to create configuration directory {}",
+            parent.display()
+        )
+    })?;
+    if !parent_existed || resolver.scope() != ConfigScope::Explicit {
+        set_dir_permissions(parent, resolver.scope())?;
+    }
+
+    let existing = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                bail!(
+                    "Refusing to replace a non-regular configuration path: {}",
+                    path.display()
+                );
+            }
+            set_file_permissions(path)?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("Unable to inspect {}", path.display()));
+        }
+    };
+
+    let mut backup_path = None;
+    if existing {
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
+        let backup = path.with_extension(format!("toml.bak.{stamp}"));
+        fs::rename(path, &backup).with_context(|| {
+            format!(
+                "Unable to back up the existing configuration to {}",
+                backup.display()
+            )
+        })?;
+        backup_path = Some(backup);
+    }
+
+    if let Err(error) = persist_template(path, parent, content) {
+        if let Some(backup) = backup_path.as_ref() {
+            if let Err(restore_error) = fs::rename(backup, path) {
+                bail!(
+                    "{error:#}; restoring the original configuration also failed: {restore_error}. The backup remains at {}",
+                    backup.display()
+                );
+            }
+        }
+        return Err(error);
+    }
+    sync_config_directory(parent)?;
+    Ok(ConfigWriteOutcome {
+        config_path: path.to_path_buf(),
+        backup_path,
+    })
+}
+
 fn persist_template(path: &Path, parent: &Path, template: &str) -> Result<()> {
     let mut temp = NamedTempFile::new_in(parent)
         .with_context(|| format!("Unable to create a temporary file in {}", parent.display()))?;
@@ -997,7 +1184,22 @@ fn persist_template(path: &Path, parent: &Path, template: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn sync_config_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_config_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 pub fn load(resolver: &ConfigPathResolver) -> Result<Config> {
+    Ok(load_with_warnings(resolver)?.config)
+}
+
+pub fn load_with_warnings(resolver: &ConfigPathResolver) -> Result<LoadedConfig> {
     let path = resolver.config_path();
     if !path.exists() {
         bail!(
@@ -1039,12 +1241,29 @@ pub fn load(resolver: &ConfigPathResolver) -> Result<Config> {
         bail!("Configuration file exceeds the 4 MiB size limit");
     }
     let content = String::from_utf8(bytes).context("Configuration file is not valid UTF-8")?;
-    let mut config: Config = toml::from_str(&content)
+    let mut loaded = deserialize_config(&content)
         .with_context(|| format!("Invalid configuration file format: {}", path.display()))?;
-    if is_openwrt() && config.storage.write_profile == "auto" {
-        config.storage.write_profile = "low_write".into();
+    if is_openwrt() && loaded.config.storage.write_profile == "auto" {
+        loaded.config.storage.write_profile = "low_write".into();
     }
-    Ok(config)
+    Ok(loaded)
+}
+
+fn deserialize_config(content: &str) -> Result<LoadedConfig> {
+    let mut unknown_fields = Vec::new();
+    let mut unknown_field_count = 0usize;
+    let deserializer = toml::Deserializer::new(content);
+    let config = serde_ignored::deserialize(deserializer, |field| {
+        unknown_field_count = unknown_field_count.saturating_add(1);
+        if unknown_fields.len() < MAX_REPORTED_UNKNOWN_FIELDS {
+            unknown_fields.push(field.to_string());
+        }
+    })?;
+    Ok(LoadedConfig {
+        config,
+        unknown_fields,
+        unknown_field_count,
+    })
 }
 
 pub(crate) fn absolute(path: PathBuf) -> Result<PathBuf> {
@@ -1182,8 +1401,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_fields_and_malformed_urls() {
-        let unknown = toml::from_str::<Config>(
+    fn ignores_and_reports_unknown_fields_but_rejects_invalid_known_fields() {
+        let loaded = deserialize_config(
             r#"
             version = 1
             default_model = "primary"
@@ -1192,9 +1411,48 @@ mod tests {
             [models.primary]
             model = "test"
             api_key = "key"
+
+            [storage]
+            future_option = 42
+
+            [storage.future_backend]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(loaded.unknown_field_count, 3);
+        assert!(
+            loaded
+                .unknown_fields
+                .iter()
+                .any(|field| field == "unexpected")
+        );
+        assert!(
+            loaded
+                .unknown_fields
+                .iter()
+                .any(|field| field == "storage.future_option")
+        );
+        assert!(
+            loaded
+                .unknown_fields
+                .iter()
+                .any(|field| field == "storage.future_backend")
+        );
+        assert_eq!(loaded.config.models["primary"].model, "test");
+
+        let invalid_known = deserialize_config(
+            r#"
+            version = 1
+            default_model = "primary"
+            [models.primary]
+            model = "test"
+            api_key = "key"
+            [storage]
+            enabled = "yes"
             "#,
         );
-        assert!(unknown.is_err());
+        assert!(invalid_known.is_err());
 
         let mut config = Config::default();
         let model = ModelConfig {
@@ -1376,6 +1634,28 @@ mod tests {
         );
         config.storage.database = "../not-a-file-name.db".into();
         config.validate(false).unwrap();
+        config.storage.enabled = true;
+        assert!(config.validate(false).is_err());
+    }
+
+    #[test]
+    fn validates_optional_redis_session_storage() {
+        let mut config = Config::default();
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                model: "test".into(),
+                api_key: Some("key".into()),
+                ..ModelConfig::default()
+            },
+        );
+        config.storage.redis.enabled = true;
+        config.validate(false).unwrap();
+
+        config.storage.redis.key_prefix = "bad prefix".into();
+        assert!(config.validate(false).is_err());
+
+        config.storage.redis.key_prefix = "qin".into();
         config.storage.enabled = true;
         assert!(config.validate(false).is_err());
     }

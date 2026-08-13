@@ -548,13 +548,16 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     if ctx.dry_run {
         return text_result("Dry run: command not executed".into());
     }
-    let message = if ctx.events.shows_command_details() {
-        // tool_started already displays the full command.
-        "Allow this command? [y/N] ".to_string()
-    } else {
-        format!("Allow command `{}`? [y/N] ", redact(command))
-    };
-    approve(ctx, &message, elevated || dangerous(command))?;
+    let high_risk = elevated || dangerous(command) || invokes_elevation(command);
+    if high_risk || ctx.config.permissions.approval == "always" || !is_read_only_command(command) {
+        let message = if ctx.events.shows_command_details() {
+            // tool_started already displays the full command.
+            "Allow this command? [y/N] ".to_string()
+        } else {
+            format!("Allow command `{}`? [y/N] ", redact(command))
+        };
+        approve(ctx, &message, high_risk)?;
+    }
     ctx.events.command_started(ctx.cwd, elevated, timeout)?;
     let started = Instant::now();
     let shell = "/bin/sh";
@@ -926,7 +929,6 @@ fn dangerous(command: &str) -> bool {
         "halt",
         "chmod -r",
         "chown -r",
-        "find ",
         "-delete",
         "> /etc/",
         ">/etc/",
@@ -940,6 +942,190 @@ fn dangerous(command: &str) -> bool {
         || ((compact.contains("curl") || compact.contains("wget"))
             && (compact.contains("|sh") || compact.contains("|bash")))
         || firewall_mutation(command)
+}
+
+fn invokes_elevation(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        matches!(
+            token.trim_matches(|value: char| !value.is_ascii_alphanumeric()),
+            "sudo" | "doas" | "su"
+        )
+    })
+}
+
+/// Conservative allowlist for shell commands that only inspect state. Shell
+/// commands outside this list still work, but `on_risk` asks before running
+/// them because a shell string cannot be proven safe in the general case.
+fn is_read_only_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|value| matches!(value, '>' | '<' | '`' | '\n' | '\r'))
+        || trimmed.contains("$((")
+        || trimmed.contains("$(")
+        || trimmed.contains('#')
+    {
+        return false;
+    }
+    let segments = trimmed.split([';', '|', '&']);
+    for segment in segments {
+        let tokens: Vec<_> = segment.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let Some(program) = trusted_program_name(tokens[0]) else {
+            return false;
+        };
+        let args = &tokens[1..];
+        let allowed = matches!(
+            program.as_str(),
+            "date"
+                | "pwd"
+                | "whoami"
+                | "id"
+                | "uname"
+                | "hostname"
+                | "uptime"
+                | "ls"
+                | "dir"
+                | "find"
+                | "locate"
+                | "which"
+                | "type"
+                | "file"
+                | "stat"
+                | "readlink"
+                | "realpath"
+                | "cat"
+                | "head"
+                | "tail"
+                | "wc"
+                | "grep"
+                | "rg"
+                | "cut"
+                | "sort"
+                | "uniq"
+                | "tr"
+                | "printf"
+                | "echo"
+                | "test"
+                | "true"
+                | "false"
+                | "df"
+                | "du"
+                | "free"
+                | "ps"
+                | "printenv"
+                | "lsblk"
+                | "blkid"
+                | "ss"
+                | "netstat"
+                | "lsof"
+        );
+        if !allowed || has_mutating_read_command_options(&program, args) {
+            return false;
+        }
+    }
+    true
+}
+
+fn trusted_program_name(token: &str) -> Option<String> {
+    let path = Path::new(token);
+    if token.contains('/')
+        && (!path.is_absolute()
+            || !matches!(
+                path.parent().and_then(Path::to_str),
+                Some("/bin" | "/usr/bin" | "/sbin" | "/usr/sbin")
+            ))
+    {
+        return None;
+    }
+    path.file_name()?.to_str().map(str::to_ascii_lowercase)
+}
+
+fn has_mutating_read_command_options(program: &str, args: &[&str]) -> bool {
+    match program {
+        "date" => args.iter().any(|value| {
+            matches!(*value, "-s" | "--set")
+                || (value.starts_with("-s") && value.len() > 2)
+                || value.starts_with("--set=")
+                || (!value.starts_with('+')
+                    && value.starts_with(|ch: char| ch.is_ascii_digit())
+                    && value.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
+        }),
+        "hostname" => args.iter().any(|value| {
+            !value.starts_with('-')
+                || matches!(*value, "-b" | "--boot" | "-F" | "--file")
+                || short_option_cluster_contains(value, 'b')
+                || short_option_cluster_contains(value, 'F')
+                || value.starts_with("--file=")
+        }),
+        "file" => args.iter().any(|value| {
+            matches!(*value, "-C" | "--compile") || short_option_cluster_contains(value, 'C')
+        }),
+        "find" => args.iter().any(|value| {
+            matches!(*value, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")
+                || value.starts_with("-fprint")
+                || *value == "-fls"
+        }),
+        "rg" => args.iter().any(|value| {
+            matches!(*value, "--pre" | "--pre-glob")
+                || value.starts_with("--pre=")
+                || value.starts_with("--pre-glob=")
+        }),
+        "sort" => args.iter().any(|value| {
+            matches!(*value, "-o" | "--output" | "--compress-program")
+                || (value.starts_with("-o") && value.len() > 2)
+                || value.starts_with("--output=")
+                || value.starts_with("--compress-program=")
+        }),
+        "uniq" => uniq_has_output_path(args),
+        "blkid" => args.iter().any(|value| {
+            matches!(*value, "-w" | "--cache-file")
+                || (value.starts_with("-w") && value.len() > 2)
+                || value.starts_with("--cache-file=")
+        }),
+        "ss" => args.iter().any(|value| {
+            matches!(*value, "-K" | "--kill") || short_option_cluster_contains(value, 'K')
+        }),
+        _ => false,
+    }
+}
+
+fn short_option_cluster_contains(value: &str, option: char) -> bool {
+    value.starts_with('-')
+        && !value.starts_with("--")
+        && value.chars().skip(1).any(|character| character == option)
+}
+
+fn uniq_has_output_path(args: &[&str]) -> bool {
+    let mut positional = 0;
+    let mut index = 0;
+    let mut options = true;
+    while index < args.len() {
+        let value = args[index];
+        if options && value == "--" {
+            options = false;
+        } else if options && value.starts_with('-') && value != "-" {
+            if matches!(
+                value,
+                "-f" | "-s" | "-w" | "--skip-fields" | "--skip-chars" | "--check-chars"
+            ) {
+                index += 1;
+                if index >= args.len() {
+                    return true;
+                }
+            }
+        } else {
+            positional += 1;
+            if positional > 1 {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 /// Firewall commands are high-risk only when they mutate rules: read-only
@@ -1014,6 +1200,9 @@ fn remove_secret_environment(process: &mut Command, config: &Config) {
         }
     }
     if let Some(name) = &config.embeddings.api_key_env {
+        names.push(name.as_str());
+    }
+    if let Some(name) = &config.storage.redis.url_env {
         names.push(name.as_str());
     }
     for provider in [
@@ -1287,13 +1476,19 @@ fn risk(name: &str) -> &'static str {
 }
 
 fn risk_for(name: &str, args: &Value) -> &'static str {
-    if name == "shell"
-        && (args["elevated"].as_bool().unwrap_or(false)
-            || args["command"].as_str().is_some_and(dangerous))
+    if name != "shell" {
+        return risk(name);
+    }
+    let command = args["command"].as_str().unwrap_or_default();
+    if args["elevated"].as_bool().unwrap_or(false)
+        || dangerous(command)
+        || invokes_elevation(command)
     {
         "destructive"
+    } else if is_read_only_command(command) {
+        "read_only"
     } else {
-        risk(name)
+        "mutating"
     }
 }
 
@@ -1412,7 +1607,49 @@ mod tests {
         assert!(dangerous("rm -rf /tmp/x"));
         assert!(dangerous("curl https://example.test/x | bash"));
         assert!(dangerous("unlink important.db"));
+        assert!(dangerous("find . -delete"));
+        assert!(!dangerous("find . -type f -print"));
         assert!(!dangerous("cargo test"));
+    }
+
+    #[test]
+    fn classifies_safe_shell_queries_as_read_only() {
+        assert!(is_read_only_command("date '+%Y-%m-%d %H:%M:%S %Z (%A)'"));
+        assert!(is_read_only_command("pwd && uname -a"));
+        assert!(is_read_only_command("find . -type f -print | head -20"));
+        assert!(is_read_only_command("/usr/bin/date +%s"));
+        assert!(!is_read_only_command("date > now.txt"));
+        assert!(!is_read_only_command("sudo date"));
+        assert!(!is_read_only_command("printf x; touch created"));
+        assert!(!is_read_only_command("date\ntouch created"));
+        assert!(!is_read_only_command("date # harmless\ntouch created"));
+        assert!(!is_read_only_command("./date"));
+        assert!(!is_read_only_command("/tmp/date"));
+        assert!(!is_read_only_command("date --set=tomorrow"));
+        assert!(!is_read_only_command("date -stomorrow"));
+        assert!(!is_read_only_command("hostname new-name"));
+        assert!(!is_read_only_command("hostname --boot"));
+        assert!(!is_read_only_command("find . -fprint output.txt"));
+        assert!(!is_read_only_command("rg --pre 'touch created' pattern"));
+        assert!(!is_read_only_command("sort -o output.txt input.txt"));
+        assert!(!is_read_only_command("sort -ooutput.txt input.txt"));
+        assert!(!is_read_only_command("uniq input.txt output.txt"));
+        assert!(!is_read_only_command("ss --kill dst 192.0.2.1"));
+        assert!(!is_read_only_command("ss -Knt dst 192.0.2.1"));
+        assert!(!is_read_only_command("git status"));
+    }
+
+    #[test]
+    fn read_only_shell_is_a_read_only_audit() {
+        assert_eq!(risk_for("shell", &json!({"command": "date"})), "read_only");
+        assert_eq!(
+            risk_for("shell", &json!({"command": "touch file"})),
+            "mutating"
+        );
+        assert_eq!(
+            risk_for("shell", &json!({"command": "date", "elevated": true})),
+            "destructive"
+        );
     }
 
     #[test]
@@ -1496,6 +1733,41 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(result.content.contains("qin-shell"));
         assert!(result.content.contains("你好"));
+        assert!(result.content.contains("exit_code=0"));
+    }
+
+    #[tokio::test]
+    async fn on_risk_runs_read_only_shell_without_interactive_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.storage.database = "readonly-shell.db".into();
+        config.ui.command_heartbeat_seconds = 60;
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store
+            .new_session(dir.path(), Some("readonly-shell"))
+            .unwrap();
+        let events = EventSink::new(true, false, false);
+        let mut context = ToolContext {
+            config: &config,
+            events: &events,
+            store: &mut store,
+            session_id: &session,
+            cwd: dir.path(),
+            assume_yes: false,
+            dry_run: false,
+        };
+        let result = execute(
+            "call-readonly-shell",
+            "shell",
+            r#"{"command":"date '+%Y-%m-%d %H:%M:%S %Z (%A)'"}"#,
+            &mut context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code, Some(0));
         assert!(result.content.contains("exit_code=0"));
     }
 
