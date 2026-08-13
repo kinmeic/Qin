@@ -63,10 +63,7 @@ pub enum Command {
     },
 
     /// Create and switch to a new session, optionally with an initial prompt
-    New {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        prompt: Vec<String>,
-    },
+    New { prompt: Vec<String> },
 
     /// List recent sessions
     Sessions,
@@ -106,7 +103,10 @@ pub enum Command {
 
     #[command(hide = true)]
     Run {
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        // No trailing_var_arg/allow_hyphen_values: global flags such as --yes
+        // placed after the prompt must still parse as flags. Prompts that
+        // start with a hyphen can be passed after `--`.
+        #[arg(required = true)]
         prompt: Vec<String>,
     },
 }
@@ -255,5 +255,27 @@ mod tests {
             normalize_args(strings(&["qin", "--", "- inspect this directory"])),
             strings(&["qin", "run", "- inspect this directory"])
         );
+    }
+
+    #[test]
+    fn global_flags_after_prompt_are_not_swallowed() {
+        let args = normalize_args(strings(&["qin", "list services", "--yes"]));
+        let cli = Cli::try_parse_from(args).expect("should parse");
+        assert!(cli.yes);
+        match cli.command {
+            Command::Run { prompt } => assert_eq!(prompt, vec!["list services".to_string()]),
+            _ => panic!("expected the run command"),
+        }
+    }
+
+    #[test]
+    fn new_prompt_stops_at_flags() {
+        let cli = Cli::try_parse_from(strings(&["qin", "new", "hello world", "--quiet"]))
+            .expect("should parse");
+        assert!(cli.quiet);
+        match cli.command {
+            Command::New { prompt } => assert_eq!(prompt, vec!["hello world".to_string()]),
+            _ => panic!("expected the new command"),
+        }
     }
 }

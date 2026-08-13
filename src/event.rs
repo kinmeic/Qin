@@ -166,19 +166,23 @@ impl EventSink {
         if self.quiet || (ok && !self.show_commands.get()) {
             return Ok(());
         }
+        // Success stays minimal: exit=0 is implied. Failures show the code.
+        let message = if ok {
+            format!("✓ Command succeeded  {:.2}s", elapsed_ms as f64 / 1000.0)
+        } else {
+            format!(
+                "✗ Command failed  exit={}  {:.2}s",
+                code.map_or_else(|| "signal".into(), |v| v.to_string()),
+                elapsed_ms as f64 / 1000.0
+            )
+        };
         self.stderr(
             if ok {
                 "command_finished"
             } else {
                 "command_failed"
             },
-            &format!(
-                "{} Command {}  exit={}  {:.2}s",
-                if ok { "✓" } else { "✗" },
-                if ok { "succeeded" } else { "failed" },
-                code.map_or_else(|| "signal".into(), |v| v.to_string()),
-                elapsed_ms as f64 / 1000.0
-            ),
+            &message,
         )
     }
 

@@ -146,11 +146,18 @@ pub async fn execute(
         );
     }
     match &result {
-        Ok(value) => ctx.events.tool_finished(
-            name,
-            &one_line(&value.content),
-            started.elapsed().as_millis(),
-        )?,
+        Ok(value) => {
+            // run_shell already reports completion via command_finished;
+            // emitting tool_finished as well would duplicate the line.
+            // Dry runs never reach command_finished, so keep the generic line.
+            if name != "shell" || ctx.dry_run {
+                ctx.events.tool_finished(
+                    name,
+                    &one_line(&value.content),
+                    started.elapsed().as_millis(),
+                )?;
+            }
+        }
         Err(error) => {
             ctx.events
                 .tool_failed(name, &error.to_string(), started.elapsed().as_millis())?
