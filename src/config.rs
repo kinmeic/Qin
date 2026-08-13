@@ -1047,7 +1047,7 @@ pub fn load(resolver: &ConfigPathResolver) -> Result<Config> {
     Ok(config)
 }
 
-fn absolute(path: PathBuf) -> Result<PathBuf> {
+pub(crate) fn absolute(path: PathBuf) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path);
     }

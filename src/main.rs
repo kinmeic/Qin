@@ -7,7 +7,7 @@ mod prompt_file;
 mod state;
 mod tools;
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -61,7 +61,14 @@ async fn run() -> Result<()> {
                                 terminal(&resolver.database_path(&config)?.display().to_string())
                             );
                         } else {
-                            println!("Database: disabled (in-memory sessions)");
+                            println!(
+                                "Session store: {} (tmpfs, cleared on reboot)",
+                                terminal(
+                                    &crate::state::memory_state_path(&config)?
+                                        .display()
+                                        .to_string()
+                                )
+                            );
                         }
                     } else {
                         events.config_path(&resolver)?;
@@ -180,7 +187,9 @@ async fn run() -> Result<()> {
         Command::Sync => {
             let (config, _, mut store) = open(&explicit_config, &events)?;
             if !config.persistence_enabled() {
-                events.success("Persistence is disabled; sessions live in memory only")?;
+                events.success(
+                    "Session state lives in a tmpfs file and is written immediately; nothing to synchronize",
+                )?;
             } else {
                 store.checkpoint()?;
                 events.success(&format!(
@@ -376,7 +385,7 @@ fn doctor(explicit: &Option<PathBuf>, events: &EventSink) -> Result<()> {
         if config.persistence_enabled() {
             terminal(&store.path().display().to_string())
         } else {
-            terminal("disabled (in-memory sessions)")
+            terminal(&format!("{} (tmpfs session file)", store.path().display()))
         }
     );
     println!("Model: {}", terminal(&config.primary_model()?.model));
@@ -421,9 +430,7 @@ fn confirm_session_delete(events: &EventSink, id: &str, assume_yes: bool) -> Res
         bail!("Session deletion requires an interactive confirmation or --yes");
     }
     let message = format!("Permanently delete session {id} and all of its history? [y/N] ");
-    events.approval(&message)?;
-    eprint!("{}", terminal(&message));
-    io::stderr().flush()?;
+    events.approval_prompt(&message)?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {

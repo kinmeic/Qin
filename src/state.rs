@@ -49,7 +49,7 @@ pub struct VectorRow {
     pub embedding: Vec<f32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequencedMessage {
     pub seq: i64,
     pub message: StoredMessage,
@@ -79,13 +79,16 @@ enum Backend {
     Memory(MemoryState),
 }
 
-/// In-memory state used when `storage.enabled = false`: a single session is
-/// kept at a time and starting a new session drops the previous one entirely.
+/// Memory-backed state used when `storage.enabled = false`: a single session
+/// is kept in a JSON file on a tmpfs (RAM-backed) location, so it survives
+/// process restarts but never touches the disk database and disappears on
+/// reboot. Starting a new session replaces the previous one entirely.
 #[derive(Default)]
 struct MemoryState {
     session: Option<MemorySession>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct MemorySession {
     id: String,
     title: String,
@@ -95,6 +98,53 @@ struct MemorySession {
     messages: Vec<SequencedMessage>,
     summary: Option<String>,
     summary_through_seq: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MemoryFile {
+    version: u32,
+    session: Option<MemorySession>,
+}
+
+const MEMORY_FILE_VERSION: u32 = 1;
+const MEMORY_FILE_NAME: &str = "qin-session.json";
+
+/// Path of the tmpfs session file. `storage.data_dir` overrides the directory;
+/// otherwise a RAM-backed location is preferred: $XDG_RUNTIME_DIR or /dev/shm
+/// on Linux, falling back to the system temp directory.
+pub(crate) fn memory_state_path(config: &Config) -> Result<PathBuf> {
+    if !config.storage.data_dir.trim().is_empty() {
+        return Ok(
+            crate::config::absolute(PathBuf::from(&config.storage.data_dir))?
+                .join(MEMORY_FILE_NAME),
+        );
+    }
+    let directory = memory_state_directory();
+    Ok(directory.join(MEMORY_FILE_NAME))
+}
+
+fn memory_state_directory() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            if !dir.is_empty() && Path::new(&dir).is_dir() {
+                return PathBuf::from(dir).join(format!("qin-{}", effective_uid()));
+            }
+        }
+        if Path::new("/dev/shm").is_dir() {
+            return PathBuf::from("/dev/shm").join(format!("qin-{}", effective_uid()));
+        }
+    }
+    std::env::temp_dir().join(format!("qin-{}", effective_uid()))
+}
+
+fn load_memory_session(path: &Path) -> Option<MemorySession> {
+    let bytes = fs::read(path).ok()?;
+    let file: MemoryFile = serde_json::from_slice(&bytes).ok()?;
+    if file.version != MEMORY_FILE_VERSION {
+        return None;
+    }
+    file.session
 }
 
 impl MemorySession {
@@ -155,9 +205,11 @@ struct PendingAudit {
 impl StateStore {
     pub fn open(config: &Config, resolver: &ConfigPathResolver) -> Result<Self> {
         if !config.persistence_enabled() {
+            let path = memory_state_path(config)?;
+            let session = load_memory_session(&path);
             return Ok(Self {
-                backend: Backend::Memory(MemoryState::default()),
-                path: PathBuf::from(":memory:"),
+                backend: Backend::Memory(MemoryState { session }),
+                path,
                 pending_audits: Vec::new(),
             });
         }
@@ -233,10 +285,38 @@ impl StateStore {
         }
     }
 
-    pub fn lock_session(&self, session_id: &str) -> Result<SessionLock> {
-        if matches!(self.backend, Backend::Memory(_)) {
-            return Ok(SessionLock { _file: None });
+    /// Atomically persists the tmpfs session file (memory backend only).
+    fn save_memory_state(&self) -> Result<()> {
+        let Backend::Memory(memory) = &self.backend else {
+            return Ok(());
+        };
+        let file = MemoryFile {
+            version: MEMORY_FILE_VERSION,
+            session: memory.session.clone(),
+        };
+        let bytes = serde_json::to_vec(&file)?;
+        let parent = self
+            .path
+            .parent()
+            .context("The memory state path has no parent directory")?;
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
+        let temporary = self.path.with_extension("json.tmp");
+        fs::write(&temporary, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::rename(&temporary, &self.path)?;
+        Ok(())
+    }
+
+    pub fn lock_session(&self, session_id: &str) -> Result<SessionLock> {
         let identity = sha256(&format!("{}\0{session_id}", self.path.display()));
         let directory = std::env::temp_dir().join(format!("qin-locks-{}", effective_uid()));
         ensure_private_lock_directory(&directory)?;
@@ -367,11 +447,15 @@ impl StateStore {
     }
 
     pub fn new_session(&mut self, cwd: &Path, title: Option<&str>) -> Result<String> {
-        if let Backend::Memory(memory) = &mut self.backend {
-            // A new session fully replaces the previous in-memory session.
+        if matches!(self.backend, Backend::Memory(_)) {
+            // A new session fully replaces the previous one.
             let session = MemorySession::new(cwd, title);
             let id = session.id.clone();
+            let Backend::Memory(memory) = &mut self.backend else {
+                unreachable!()
+            };
             memory.session = Some(session);
+            self.save_memory_state()?;
             return Ok(id);
         }
         let id = Uuid::new_v4().to_string();
@@ -448,11 +532,15 @@ impl StateStore {
     ) -> Result<(String, Option<String>)> {
         let id = self.resolve_session_id(id_or_prefix)?;
         let was_current = self.current_session()?.as_deref() == Some(id.as_str());
-        if let Backend::Memory(memory) = &mut self.backend {
+        if matches!(self.backend, Backend::Memory(_)) {
             // Dropping the only in-memory session always activates a fresh one.
             let replacement = MemorySession::new(cwd, None);
             let new_current = was_current.then(|| replacement.id.clone());
+            let Backend::Memory(memory) = &mut self.backend else {
+                unreachable!()
+            };
             memory.session = Some(replacement);
+            self.save_memory_state()?;
             return Ok((id, new_current));
         }
         let transaction = self.connection_mut().transaction()?;
@@ -584,29 +672,33 @@ impl StateStore {
         }
         if matches!(self.backend, Backend::Memory(_)) {
             self.pending_audits.clear();
-            let Backend::Memory(memory) = &mut self.backend else {
-                unreachable!()
-            };
-            let Some(session) = memory
-                .session
-                .as_mut()
-                .filter(|session| session.id == session_id)
-            else {
-                bail!("Session does not exist: {session_id}");
-            };
-            let start = session.messages.last().map_or(0, |entry| entry.seq) + 1;
-            for (index, message) in messages.iter().enumerate() {
-                session.messages.push(SequencedMessage {
-                    seq: start + index as i64,
-                    message: message.clone(),
-                });
+            {
+                let Backend::Memory(memory) = &mut self.backend else {
+                    unreachable!()
+                };
+                let Some(session) = memory
+                    .session
+                    .as_mut()
+                    .filter(|session| session.id == session_id)
+                else {
+                    bail!("Session does not exist: {session_id}");
+                };
+                let start = session.messages.last().map_or(0, |entry| entry.seq) + 1;
+                for (index, message) in messages.iter().enumerate() {
+                    session.messages.push(SequencedMessage {
+                        seq: start + index as i64,
+                        message: message.clone(),
+                    });
+                }
+                if let Some(update) = summary {
+                    session.summary = Some(update.content.clone());
+                    session.summary_through_seq =
+                        session.summary_through_seq.max(update.through_seq);
+                }
+                session.last_cwd = cwd.to_string_lossy().into_owned();
+                session.updated_at = now_timestamp();
             }
-            if let Some(update) = summary {
-                session.summary = Some(update.content.clone());
-                session.summary_through_seq = session.summary_through_seq.max(update.through_seq);
-            }
-            session.last_cwd = cwd.to_string_lossy().into_owned();
-            session.updated_at = now_timestamp();
+            self.save_memory_state()?;
             return Ok(());
         }
         let audits = self.pending_audits.clone();
@@ -1080,10 +1172,16 @@ mod tests {
 
     fn memory_store() -> (tempfile::TempDir, StateStore) {
         let dir = tempfile::tempdir().unwrap();
+        reopen_memory_store(dir)
+    }
+
+    /// storage.enabled defaults to false: a tmpfs session file replaces
+    /// SQLite; data_dir redirects it into the test tempdir for isolation.
+    fn reopen_memory_store(dir: tempfile::TempDir) -> (tempfile::TempDir, StateStore) {
         let resolver =
             ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
-        // storage.enabled defaults to false: no database is created.
-        let config = Config::default();
+        let mut config = Config::default();
+        config.storage.data_dir = dir.path().to_string_lossy().into_owned();
         let store = StateStore::open(&config, &resolver).unwrap();
         (dir, store)
     }
@@ -1098,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_mode_keeps_a_single_session_without_writing_files() {
+    fn memory_mode_persists_one_session_across_processes() {
         let (dir, mut store) = memory_store();
         let first = store.new_session(Path::new("/tmp"), Some("first")).unwrap();
         store
@@ -1106,7 +1204,18 @@ mod tests {
             .unwrap();
         assert_eq!(store.load_messages(&first).unwrap().len(), 1);
         store.lock_session(&first).unwrap();
+        drop(store);
 
+        // A new process (a fresh StateStore) restores the previous session.
+        let (dir, mut store) = reopen_memory_store(dir);
+        assert_eq!(
+            store.current_session().unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(store.load_messages(&first).unwrap().len(), 1);
+        assert!(dir.path().join("qin-session.json").is_file());
+
+        // Starting a new session wipes the previous one completely.
         let second = store
             .new_session(Path::new("/tmp"), Some("second"))
             .unwrap();
@@ -1118,14 +1227,11 @@ mod tests {
         assert!(store.load_messages(&first).unwrap().is_empty());
         assert!(store.resolve_session_id(&first).is_err());
         assert_eq!(store.list_sessions(10).unwrap().len(), 1);
-
-        // No database file is created on disk.
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
     fn memory_mode_applies_summaries_and_disables_knowledge() {
-        let (_dir, mut store) = memory_store();
+        let (dir, mut store) = memory_store();
         let id = store.ensure_current_session(Path::new("/tmp")).unwrap();
         store
             .append_messages(
@@ -1150,6 +1256,12 @@ mod tests {
         assert_eq!(context.len(), 2);
         assert_eq!(context[0].seq, 3);
         assert_eq!(store.user_turn_count(&id).unwrap(), 4);
+
+        // Summaries survive a process restart as well.
+        drop(store);
+        let (_dir, mut store) = reopen_memory_store(dir);
+        assert_eq!(store.summary(&id).unwrap().as_deref(), Some("summary text"));
+        assert_eq!(store.load_context_messages(&id).unwrap().len(), 2);
 
         // Knowledge APIs are inert in memory mode.
         assert!(!store.has_knowledge().unwrap());

@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::config::Config;
-use crate::event::{EventSink, redact, sanitize_terminal};
+use crate::event::{EventSink, redact};
 use crate::knowledge;
 use crate::state::StateStore;
 
@@ -885,9 +885,7 @@ fn approve(ctx: &ToolContext<'_>, message: &str, high_risk: bool) -> Result<()> 
             "Approval is required in a non-interactive environment; review the action and use --yes (extremely high-risk actions are never bypassed)"
         )
     }
-    ctx.events.approval(message)?;
-    eprint!("{}", sanitize_terminal(message));
-    io::stderr().flush()?;
+    ctx.events.approval_prompt(message)?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     if matches!(

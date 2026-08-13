@@ -171,8 +171,25 @@ impl EventSink {
         )
     }
 
-    pub fn approval(&self, message: &str) -> Result<()> {
-        self.stderr("approval_required", &format!("? {message}"))
+    /// Prints the approval prompt exactly once, without a trailing newline so
+    /// the user's answer stays on the same line. JSON mode additionally emits
+    /// the machine-readable event.
+    pub fn approval_prompt(&self, message: &str) -> Result<()> {
+        let message = format!("? {message}");
+        if self.json {
+            self.stderr("approval_required", &message)?;
+        }
+        if self.heartbeat_open.replace(false) {
+            eprint!("\r\x1b[2K");
+        }
+        let message = sanitize_terminal(&redact(&message));
+        if self.color {
+            eprint!("\x1b[33m{message}\x1b[0m");
+        } else {
+            eprint!("{message}");
+        }
+        std::io::Write::flush(&mut std::io::stderr())?;
+        Ok(())
     }
 
     pub fn prompt_file_loaded(&self, loaded: &LoadedPrompt) -> Result<()> {

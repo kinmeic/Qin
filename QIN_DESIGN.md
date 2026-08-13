@@ -437,7 +437,7 @@ allow_utf8_bom = true
 reject_nul = true
 
 [storage]
-enabled = false                # 默认关闭：不写 SQLite，内存中只保留一个会话，新会话完全清除旧会话，同时禁用 embedding 与跨会话记忆召回
+enabled = false                # 默认关闭：不用 SQLite；单个会话保存在 tmpfs（内存文件系统）的 JSON 文件中，跨调用保留并作为上下文传给下次调用，new 完全清空，重启消失；同时禁用 embedding 与跨会话记忆召回
 data_dir = ""                    # 空值表示平台默认目录
 database = "qin.db"
 journal_mode = "auto"            # auto | wal | persist | delete

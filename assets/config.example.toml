@@ -48,9 +48,12 @@ allow_utf8_bom = true
 reject_nul = true
 
 [storage]
-# When disabled, no SQLite database is written: a single session is kept in
-# memory, starting a new session wipes the previous one, and embeddings,
-# long-term memory, and cross-session recall are all disabled.
+# When disabled, no SQLite database is used: a single session is kept in a
+# JSON file on tmpfs (RAM-backed; /dev/shm or $XDG_RUNTIME_DIR on Linux,
+# /tmp on OpenWrt). The session survives process restarts and is passed to
+# the next run as context, "qin new" wipes it, and it disappears on reboot.
+# Embeddings, long-term memory, and cross-session recall stay disabled.
+# data_dir overrides the session-file directory when set.
 enabled = false
 data_dir = ""
 database = "qin.db"
