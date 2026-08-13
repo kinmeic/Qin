@@ -113,6 +113,11 @@ async fn add_entries(
     config: &Config,
     entries: Vec<TextEntry>,
 ) -> Result<usize> {
+    if !config.embeddings_active() {
+        bail!(
+            "Knowledge features are disabled; set storage.enabled=true and embeddings.enabled=true in the configuration"
+        );
+    }
     let mut seen = HashSet::new();
     let mut prepared = Vec::new();
     let mut all_chunks = Vec::new();
@@ -201,6 +206,11 @@ pub async fn search(
     if query.trim().is_empty() {
         bail!("The knowledge search query cannot be empty");
     }
+    if !config.embeddings_active() {
+        bail!(
+            "Knowledge features are disabled; set storage.enabled=true and embeddings.enabled=true in the configuration"
+        );
+    }
     let limit = limit.min(100);
     if limit == 0 {
         return Ok(Vec::new());
@@ -260,7 +270,7 @@ pub async fn search(
 }
 
 pub async fn recall_context(store: &StateStore, config: &Config, query: &str) -> String {
-    if !config.knowledge.enabled {
+    if !config.knowledge_active() {
         return String::new();
     }
     if !store.has_knowledge().unwrap_or(false) {
@@ -290,7 +300,10 @@ pub async fn auto_extract(
     user: &str,
     assistant: &str,
 ) -> Result<usize> {
-    if !config.knowledge.auto_extract || config.knowledge.max_auto_memories_per_run == 0 {
+    if !config.knowledge_active()
+        || !config.knowledge.auto_extract
+        || config.knowledge.max_auto_memories_per_run == 0
+    {
         return Ok(0);
     }
     let model = config.primary_model()?;
@@ -613,6 +626,8 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
+        config.storage.enabled = true;
+        config.embeddings.enabled = true;
         config.storage.database = "knowledge.db".into();
         config.embeddings.base_url = format!("http://{address}/v1");
         config.embeddings.api_key_env = None;

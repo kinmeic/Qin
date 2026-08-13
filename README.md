@@ -101,8 +101,7 @@ max_output_tokens = 4096
 supports_native_search = false
 
 [context]
-compact_trigger_ratio = 0.72
-compact_target_ratio = 0.45
+compact_trigger_ratio = 0.9
 ```
 
 Keep API keys in environment variables whenever possible instead of storing secrets directly in the configuration file.

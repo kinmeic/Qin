@@ -227,8 +227,8 @@ fn tool_enabled(name: &str, config: &Config) -> bool {
         "create_directory" | "write_file" | "move_path" | "copy_path" | "remove_path"
         | "apply_patch" => config.permissions.workspace_write,
         "shell" => config.permissions.allow_shell,
-        "search_memory" => config.knowledge.enabled,
-        "save_memory" => config.knowledge.enabled && config.permissions.workspace_write,
+        "search_memory" => config.knowledge_active(),
+        "save_memory" => config.knowledge_active() && config.permissions.workspace_write,
         "web_search" => {
             config.search.exa.enabled || config.search.brave.enabled || config.search.native.enabled
         }
@@ -680,7 +680,7 @@ async fn search_memory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolRe
     text_result(serde_json::to_string_pretty(&hits)?)
 }
 async fn save_memory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
-    if !ctx.config.permissions.workspace_write || !ctx.config.knowledge.enabled {
+    if !ctx.config.permissions.workspace_write || !ctx.config.knowledge_active() {
         bail!("Long-term memory writes are disabled by the current configuration");
     }
     if ctx.dry_run {
@@ -961,7 +961,11 @@ fn remove_secret_environment(process: &mut Command, config: &Config) {
     names.sort_unstable();
     names.dedup();
     for name in names {
-        process.env_remove(name);
+        // api_key_env may hold an inline key instead of a variable name;
+        // only real variable names can be scrubbed from the environment.
+        if crate::config::is_env_var_name(name) {
+            process.env_remove(name);
+        }
     }
 }
 fn elevation_program(configured: &str) -> Result<&str> {
@@ -1345,6 +1349,7 @@ mod tests {
     async fn executes_shell_and_captures_exit_code() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
+        config.storage.enabled = true;
         config.storage.database = "tools.db".into();
         config.ui.command_heartbeat_seconds = 60;
         let resolver =
@@ -1379,6 +1384,7 @@ mod tests {
     async fn rejects_model_calls_to_disabled_tools() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
+        config.storage.enabled = true;
         config.storage.database = "disabled-tools.db".into();
         config.permissions.allow_shell = false;
         let resolver =

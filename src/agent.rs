@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Config, ModelConfig};
+use crate::config::{COMPACT_TARGET_RATIO, Config, ModelConfig};
 use crate::event::EventSink;
 use crate::knowledge;
 use crate::state::{StateStore, StoredMessage, SummaryUpdate};
@@ -157,7 +157,7 @@ pub async fn execute(
 
     let answer = result?;
     let turn_count = store.user_turn_count(session_id)?;
-    if config.knowledge.enabled
+    if config.knowledge_active()
         && config.knowledge.auto_extract
         && turn_count % config.knowledge.auto_extract_every_turns.max(1) == 0
     {
@@ -590,14 +590,10 @@ async fn compact_persisted_history(
         return Ok(None);
     }
 
-    let model = config.primary_model()?;
-    let summary_model = config
-        .models
-        .get(&config.agent.summary_model)
-        .unwrap_or(model);
+    let summary_model = config.summary_model()?;
     let fixed = estimate_messages(&compose_messages("", &[], runtime, recalled, prompt))
         + estimate_schemas(schemas);
-    let target = (budget as f64 * config.context.compact_target_ratio) as u64;
+    let target = (budget as f64 * COMPACT_TARGET_RATIO) as u64;
     let summary_allowance = summary_model.max_output_tokens.min(target / 4).max(256);
     let available = target.saturating_sub(fixed + summary_allowance);
     let protected = config
@@ -632,7 +628,7 @@ async fn compact_persisted_history(
         .saturating_sub(summary_model.max_output_tokens + 2_048)
         .saturating_mul(3) as usize;
     let source = summary_source(summary, &old_messages, source_limit);
-    let compacted = generate_summary(client, summary_model, &source)
+    let compacted = generate_summary(client, &summary_model, &source)
         .await
         .unwrap_or_else(|| fallback_summary(&source, summary_allowance as usize));
     history.drain(..keep_start);
@@ -664,12 +660,8 @@ async fn compact_in_memory(
         return Ok(());
     }
     let source = summary_source("", &messages[1..keep], 192_000);
-    let model = config.primary_model()?;
-    let summary_model = config
-        .models
-        .get(&config.agent.summary_model)
-        .unwrap_or(model);
-    let compacted = generate_summary(client, summary_model, &source)
+    let summary_model = config.summary_model()?;
+    let compacted = generate_summary(client, &summary_model, &source)
         .await
         .unwrap_or_else(|| fallback_summary(&source, summary_model.max_output_tokens as usize));
     messages.drain(1..keep);
@@ -959,6 +951,7 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
+        config.storage.enabled = true;
         config.knowledge.enabled = false;
         config.storage.database = "agent.db".into();
         let mut models = BTreeMap::new();
@@ -968,6 +961,7 @@ mod tests {
                 base_url: format!("http://{address}/v1"),
                 api_style: "chat_completions".into(),
                 model: "test".into(),
+                summary_model: String::new(),
                 api_key_env: None,
                 api_key: Some("key".into()),
                 context_window: 16384,
@@ -1018,6 +1012,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_style: "chat_completions".into(),
             model: "test".into(),
+            summary_model: String::new(),
             api_key_env: None,
             api_key: Some("key".into()),
             context_window: 16384,

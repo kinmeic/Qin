@@ -397,6 +397,8 @@ default_model = "primary"
 base_url = "https://api.example.com/v1"
 api_style = "chat_completions"     # chat_completions | responses
 model = "qwen3-coder"
+# 上下文压缩摘要使用的模型名，复用本块的连接配置；为空则使用上面的 model
+summary_model = "qwen3-8b"
 api_key_env = "QIN_API_KEY"
 # 兼容但不推荐：api_key = "sk-..."
 context_window = 131072
@@ -406,16 +408,8 @@ supports_parallel_tools = false
 supports_native_search = false
 stream = true
 
-[models.summary]
-base_url = "https://api.example.com/v1"
-api_style = "chat_completions"
-model = "qwen3-8b"
-api_key_env = "QIN_API_KEY"
-context_window = 32768
-max_output_tokens = 2048
-supports_tools = false
-
 [embeddings]
+enabled = false                # 默认关闭；需与 storage.enabled=true 同时开启才生效
 base_url = "https://api.example.com/v1"
 model = "text-embedding-v3"
 api_key_env = "QIN_API_KEY"
@@ -428,12 +422,10 @@ max_iterations = 24
 max_tool_calls = 80
 wall_time_seconds = 900
 model = "primary"
-summary_model = "summary"
 live_reasoning = false
 
 [context]
-compact_trigger_ratio = 0.72
-compact_target_ratio = 0.45
+compact_trigger_ratio = 0.9
 reserve_output_tokens = 8192
 reserve_safety_tokens = 2048
 protect_recent_tokens = 16000
@@ -445,6 +437,7 @@ allow_utf8_bom = true
 reject_nul = true
 
 [storage]
+enabled = false                # 默认关闭：不写 SQLite，内存中只保留一个会话，新会话完全清除旧会话，同时禁用 embedding 与跨会话记忆召回
 data_dir = ""                    # 空值表示平台默认目录
 database = "qin.db"
 journal_mode = "auto"            # auto | wal | persist | delete
@@ -461,7 +454,7 @@ cross_invocation_buffer = false
 explicit_memory_durable = true
 
 [knowledge]
-enabled = true
+enabled = true                 # 需 storage.enabled=true 且 embeddings.enabled=true 才会实际生效
 recall_limit = 8
 max_context_tokens = 2500
 retrieval = "hybrid"               # vector | keyword | hybrid
@@ -515,7 +508,7 @@ final_answer_to_stdout = true
 
 ### 5.4 密钥管理
 
-优先级建议为：`api_key_env`、`api_key_file`、配置内 `api_key`。允许直接配置 `api_key` 是为了路由器等受限环境可用，但应提示风险。
+优先级建议为：`api_key_env`、`api_key_file`、配置内 `api_key`。允许直接配置 `api_key` 是为了路由器等受限环境可用，但应提示风险。`api_key_env` 的值若符合环境变量名规则则按环境变量解析，否则视为内联密钥（与 `api_key` 等价），但 `PATH`、`HOME` 等保留变量名始终被拒绝。
 
 - 配置目录权限 `0700`，包含明文密钥的文件权限 `0600`。
 - 数据库权限 `0600`。
@@ -748,8 +741,8 @@ knowledge_index_state(item_id, indexed_hash, indexed_at)
 
 不要只配置一个含义模糊的“压缩比”，建议拆成：
 
-- `compact_trigger_ratio`：达到可用输入窗口的比例后开始压缩，建议 `0.70~0.75`。
-- `compact_target_ratio`：压缩后目标占用，建议 `0.40~0.50`。
+- `compact_trigger_ratio`：达到可用输入窗口的比例后开始压缩，默认 `0.9`。注意余量约束：`(1 - trigger) × (context_window - 保留项)` 必须大于 `tool_result_max_tokens`，否则单次大工具输出可能在压缩运行前直接撞硬上限。
+- 压缩后目标占用固定为 `0.45`（内部常量，不暴露为配置项；调节它需要理解压缩算法细节，且主流 harness 均不暴露）。
 - `protect_recent_tokens`：必须保留的最近上下文 token 数。
 - `tool_result_max_tokens`：单个工具结果进入模型上下文的上限。
 

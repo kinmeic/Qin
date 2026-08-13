@@ -55,10 +55,14 @@ async fn run() -> Result<()> {
                             "Configuration: {}",
                             terminal(&resolver.config_path().display().to_string())
                         );
-                        println!(
-                            "Database: {}",
-                            terminal(&resolver.database_path(&config)?.display().to_string())
-                        );
+                        if config.persistence_enabled() {
+                            println!(
+                                "Database: {}",
+                                terminal(&resolver.database_path(&config)?.display().to_string())
+                            );
+                        } else {
+                            println!("Database: disabled (in-memory sessions)");
+                        }
                     } else {
                         events.config_path(&resolver)?;
                     }
@@ -174,12 +178,16 @@ async fn run() -> Result<()> {
             handle_knowledge(command, &explicit_config, &events).await?
         }
         Command::Sync => {
-            let (_, _, mut store) = open(&explicit_config, &events)?;
-            store.checkpoint()?;
-            events.success(&format!(
-                "Database synchronized: {}",
-                store.path().display()
-            ))?;
+            let (config, _, mut store) = open(&explicit_config, &events)?;
+            if !config.persistence_enabled() {
+                events.success("Persistence is disabled; sessions live in memory only")?;
+            } else {
+                store.checkpoint()?;
+                events.success(&format!(
+                    "Database synchronized: {}",
+                    store.path().display()
+                ))?;
+            }
         }
         Command::Doctor => doctor(&explicit_config, &events)?,
     }
@@ -365,15 +373,23 @@ fn doctor(explicit: &Option<PathBuf>, events: &EventSink) -> Result<()> {
     );
     println!(
         "Database: {}",
-        terminal(&store.path().display().to_string())
+        if config.persistence_enabled() {
+            terminal(&store.path().display().to_string())
+        } else {
+            terminal("disabled (in-memory sessions)")
+        }
     );
     println!("Model: {}", terminal(&config.primary_model()?.model));
-    println!(
-        "Embedding: {} ({} dimensions, {})",
-        terminal(&config.embeddings.model),
-        config.embeddings.dimensions,
-        terminal(&config.embeddings.vector_encoding)
-    );
+    if config.embeddings_active() {
+        println!(
+            "Embedding: {} ({} dimensions, {})",
+            terminal(&config.embeddings.model),
+            config.embeddings.dimensions,
+            terminal(&config.embeddings.vector_encoding)
+        );
+    } else {
+        println!("Embedding: disabled");
+    }
     println!(
         "Platform: {}/{}",
         std::env::consts::OS,

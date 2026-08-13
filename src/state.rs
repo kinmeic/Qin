@@ -69,18 +69,73 @@ pub struct KnowledgeInsert {
 }
 
 pub struct StateStore {
-    connection: Connection,
+    backend: Backend,
     path: PathBuf,
     pending_audits: Vec<PendingAudit>,
 }
 
+enum Backend {
+    Sqlite(Connection),
+    Memory(MemoryState),
+}
+
+/// In-memory state used when `storage.enabled = false`: a single session is
+/// kept at a time and starting a new session drops the previous one entirely.
+#[derive(Default)]
+struct MemoryState {
+    session: Option<MemorySession>,
+}
+
+struct MemorySession {
+    id: String,
+    title: String,
+    created_at: String,
+    updated_at: String,
+    last_cwd: String,
+    messages: Vec<SequencedMessage>,
+    summary: Option<String>,
+    summary_through_seq: i64,
+}
+
+impl MemorySession {
+    fn new(cwd: &Path, title: Option<&str>) -> Self {
+        let now = now_timestamp();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            title: title.unwrap_or("New session").to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            last_cwd: cwd.to_string_lossy().into_owned(),
+            messages: Vec::new(),
+            summary: None,
+            summary_through_seq: 0,
+        }
+    }
+
+    fn info(&self) -> SessionInfo {
+        SessionInfo {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+            last_cwd: self.last_cwd.clone(),
+        }
+    }
+}
+
+fn now_timestamp() -> String {
+    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 pub struct SessionLock {
-    _file: fs::File,
+    _file: Option<fs::File>,
 }
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self._file);
+        if let Some(file) = &self._file {
+            let _ = FileExt::unlock(file);
+        }
     }
 }
 
@@ -99,6 +154,17 @@ struct PendingAudit {
 
 impl StateStore {
     pub fn open(config: &Config, resolver: &ConfigPathResolver) -> Result<Self> {
+        if !config.persistence_enabled() {
+            return Ok(Self {
+                backend: Backend::Memory(MemoryState::default()),
+                path: PathBuf::from(":memory:"),
+                pending_audits: Vec::new(),
+            });
+        }
+        Self::open_sqlite(config, resolver)
+    }
+
+    fn open_sqlite(config: &Config, resolver: &ConfigPathResolver) -> Result<Self> {
         let requested_path = resolver.database_path(config)?;
         let parent = requested_path
             .parent()
@@ -140,7 +206,7 @@ impl StateStore {
             },
         )?;
         let mut store = Self {
-            connection,
+            backend: Backend::Sqlite(connection),
             path,
             pending_audits: Vec::new(),
         };
@@ -153,7 +219,24 @@ impl StateStore {
         &self.path
     }
 
+    fn connection(&self) -> &Connection {
+        match &self.backend {
+            Backend::Sqlite(connection) => connection,
+            Backend::Memory(_) => unreachable!("sqlite backend expected"),
+        }
+    }
+
+    fn connection_mut(&mut self) -> &mut Connection {
+        match &mut self.backend {
+            Backend::Sqlite(connection) => connection,
+            Backend::Memory(_) => unreachable!("sqlite backend expected"),
+        }
+    }
+
     pub fn lock_session(&self, session_id: &str) -> Result<SessionLock> {
+        if matches!(self.backend, Backend::Memory(_)) {
+            return Ok(SessionLock { _file: None });
+        }
         let identity = sha256(&format!("{}\0{session_id}", self.path.display()));
         let directory = std::env::temp_dir().join(format!("qin-locks-{}", effective_uid()));
         ensure_private_lock_directory(&directory)?;
@@ -165,11 +248,13 @@ impl StateStore {
                 path.display()
             )
         })?;
-        Ok(SessionLock { _file: file })
+        Ok(SessionLock {
+            _file: Some(file),
+        })
     }
 
     fn migrate(&mut self) -> Result<()> {
-        self.connection.execute_batch(
+        self.connection().execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -243,13 +328,13 @@ impl StateStore {
             INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
             "#,
         )?;
-        let version: i64 = self.connection.query_row(
+        let version: i64 = self.connection().query_row(
             "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
             [],
             |row| row.get(0),
         )?;
         if version < 2 {
-            let transaction = self.connection.transaction()?;
+            let transaction = self.connection_mut().transaction()?;
             transaction.execute(
                 "ALTER TABLE sessions ADD COLUMN compacted_through_seq INTEGER NOT NULL DEFAULT 0",
                 [],
@@ -261,8 +346,11 @@ impl StateStore {
     }
 
     pub fn current_session(&self) -> Result<Option<String>> {
+        if let Backend::Memory(memory) = &self.backend {
+            return Ok(memory.session.as_ref().map(|session| session.id.clone()));
+        }
         Ok(self
-            .connection
+            .connection()
             .query_row(
                 "SELECT value FROM app_state WHERE key='current_session'",
                 [],
@@ -281,10 +369,17 @@ impl StateStore {
     }
 
     pub fn new_session(&mut self, cwd: &Path, title: Option<&str>) -> Result<String> {
+        if let Backend::Memory(memory) = &mut self.backend {
+            // A new session fully replaces the previous in-memory session.
+            let session = MemorySession::new(cwd, title);
+            let id = session.id.clone();
+            memory.session = Some(session);
+            return Ok(id);
+        }
         let id = Uuid::new_v4().to_string();
         let title = title.unwrap_or("New session");
         let cwd = cwd.to_string_lossy();
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection_mut().transaction()?;
         transaction.execute(
             "INSERT INTO sessions(id,title,initial_cwd,last_cwd) VALUES (?1,?2,?3,?3)",
             params![id, title, cwd],
@@ -300,7 +395,11 @@ impl StateStore {
 
     pub fn use_session(&mut self, id_or_prefix: &str) -> Result<String> {
         let id = self.resolve_session_id(id_or_prefix)?;
-        self.connection.execute(
+        if matches!(self.backend, Backend::Memory(_)) {
+            // The single in-memory session is always the current one.
+            return Ok(id);
+        }
+        self.connection().execute(
             "INSERT INTO app_state(key,value) VALUES ('current_session',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [&id],
         )?;
@@ -308,7 +407,10 @@ impl StateStore {
     }
 
     fn session_exists(&self, id: &str) -> Result<bool> {
-        Ok(self.connection.query_row(
+        if let Backend::Memory(memory) = &self.backend {
+            return Ok(memory.session.as_ref().is_some_and(|s| s.id == id));
+        }
+        Ok(self.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
             [id],
             |row| row.get(0),
@@ -320,7 +422,15 @@ impl StateStore {
         if value.is_empty() {
             bail!("The session identifier cannot be empty");
         }
-        let mut statement = self.connection.prepare(
+        if let Backend::Memory(memory) = &self.backend {
+            return match memory.session.as_ref() {
+                Some(session) if session.id == value || session.id.starts_with(value) => {
+                    Ok(session.id.clone())
+                }
+                _ => bail!("Session does not exist: {value}"),
+            };
+        }
+        let mut statement = self.connection().prepare(
             "SELECT id FROM sessions WHERE id=?1 OR substr(id,1,length(?1))=?1 ORDER BY id LIMIT 2",
         )?;
         let matches = statement
@@ -340,7 +450,14 @@ impl StateStore {
     ) -> Result<(String, Option<String>)> {
         let id = self.resolve_session_id(id_or_prefix)?;
         let was_current = self.current_session()?.as_deref() == Some(id.as_str());
-        let transaction = self.connection.transaction()?;
+        if let Backend::Memory(memory) = &mut self.backend {
+            // Dropping the only in-memory session always activates a fresh one.
+            let replacement = MemorySession::new(cwd, None);
+            let new_current = was_current.then(|| replacement.id.clone());
+            memory.session = Some(replacement);
+            return Ok((id, new_current));
+        }
+        let transaction = self.connection_mut().transaction()?;
         transaction.execute("DELETE FROM tool_executions WHERE session_id=?1", [&id])?;
         transaction.execute("DELETE FROM sessions WHERE id=?1", [&id])?;
         let mut new_current = None;
@@ -363,7 +480,14 @@ impl StateStore {
     }
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionInfo>> {
-        let mut statement = self.connection.prepare(
+        if let Backend::Memory(memory) = &self.backend {
+            return Ok(memory
+                .session
+                .as_ref()
+                .map(|session| vec![session.info()])
+                .unwrap_or_default());
+        }
+        let mut statement = self.connection().prepare(
             "SELECT id,title,created_at,updated_at,last_cwd FROM sessions ORDER BY updated_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit as i64], |row| {
@@ -379,7 +503,21 @@ impl StateStore {
     }
 
     pub fn load_messages(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
-        let mut statement = self.connection.prepare(
+        if let Backend::Memory(memory) = &self.backend {
+            return Ok(memory
+                .session
+                .as_ref()
+                .filter(|session| session.id == session_id)
+                .map(|session| {
+                    session
+                        .messages
+                        .iter()
+                        .map(|entry| entry.message.clone())
+                        .collect()
+                })
+                .unwrap_or_default());
+        }
+        let mut statement = self.connection().prepare(
             "SELECT role,content,tool_calls,tool_call_id FROM messages WHERE session_id=?1 ORDER BY seq",
         )?;
         let rows = statement.query_map([session_id], |row| {
@@ -394,7 +532,22 @@ impl StateStore {
     }
 
     pub fn load_context_messages(&self, session_id: &str) -> Result<Vec<SequencedMessage>> {
-        let mut statement = self.connection.prepare(
+        if let Backend::Memory(memory) = &self.backend {
+            return Ok(memory
+                .session
+                .as_ref()
+                .filter(|session| session.id == session_id)
+                .map(|session| {
+                    session
+                        .messages
+                        .iter()
+                        .filter(|entry| entry.seq > session.summary_through_seq)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default());
+        }
+        let mut statement = self.connection().prepare(
             "SELECT seq,role,content,tool_calls,tool_call_id FROM messages WHERE session_id=?1 AND seq > COALESCE((SELECT compacted_through_seq FROM sessions WHERE id=?1),0) ORDER BY seq",
         )?;
         let rows = statement.query_map([session_id], |row| {
@@ -431,7 +584,35 @@ impl StateStore {
         if messages.is_empty() && self.pending_audits.is_empty() && summary.is_none() {
             return Ok(());
         }
-        let transaction = self.connection.transaction()?;
+        if matches!(self.backend, Backend::Memory(_)) {
+            self.pending_audits.clear();
+            let Backend::Memory(memory) = &mut self.backend else {
+                unreachable!()
+            };
+            let Some(session) = memory
+                .session
+                .as_mut()
+                .filter(|session| session.id == session_id)
+            else {
+                bail!("Session does not exist: {session_id}");
+            };
+            let start = session.messages.last().map_or(0, |entry| entry.seq) + 1;
+            for (index, message) in messages.iter().enumerate() {
+                session.messages.push(SequencedMessage {
+                    seq: start + index as i64,
+                    message: message.clone(),
+                });
+            }
+            if let Some(update) = summary {
+                session.summary = Some(update.content.clone());
+                session.summary_through_seq = session.summary_through_seq.max(update.through_seq);
+            }
+            session.last_cwd = cwd.to_string_lossy().into_owned();
+            session.updated_at = now_timestamp();
+            return Ok(());
+        }
+        let audits = self.pending_audits.clone();
+        let transaction = self.connection_mut().transaction()?;
         let next: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?1",
             [session_id],
@@ -443,7 +624,6 @@ impl StateStore {
                 params![session_id, next + index as i64, message.role, message.content, message.tool_calls, message.tool_call_id],
             )?;
         }
-        let audits = self.pending_audits.clone();
         for audit in &audits {
             transaction.execute(
                 "INSERT INTO tool_executions(session_id,tool_call_id,name,args_redacted_json,result_text,status,risk,exit_code,duration_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -467,8 +647,15 @@ impl StateStore {
     }
 
     pub fn summary(&self, session_id: &str) -> Result<Option<String>> {
+        if let Backend::Memory(memory) = &self.backend {
+            return Ok(memory
+                .session
+                .as_ref()
+                .filter(|session| session.id == session_id)
+                .and_then(|session| session.summary.clone()));
+        }
         Ok(self
-            .connection
+            .connection()
             .query_row(
                 "SELECT compacted_summary FROM sessions WHERE id=?1",
                 [session_id],
@@ -479,7 +666,20 @@ impl StateStore {
     }
 
     pub fn user_turn_count(&self, session_id: &str) -> Result<u32> {
-        Ok(self.connection.query_row(
+        if let Backend::Memory(memory) = &self.backend {
+            return Ok(memory
+                .session
+                .as_ref()
+                .filter(|session| session.id == session_id)
+                .map_or(0, |session| {
+                    session
+                        .messages
+                        .iter()
+                        .filter(|entry| entry.message.role == "user")
+                        .count() as u32
+                }));
+        }
+        Ok(self.connection().query_row(
             "SELECT COUNT(*) FROM messages WHERE session_id=?1 AND role='user'",
             [session_id],
             |row| row.get::<_, i64>(0),
@@ -499,6 +699,10 @@ impl StateStore {
         exit_code: Option<i32>,
         duration_ms: u64,
     ) -> Result<()> {
+        if matches!(self.backend, Backend::Memory(_)) {
+            // Tool audit records are a persistence-only feature.
+            return Ok(());
+        }
         self.pending_audits.push(PendingAudit {
             session_id: session_id.into(),
             call_id: call_id.into(),
@@ -514,10 +718,10 @@ impl StateStore {
     }
 
     pub fn upsert_knowledge_batch(&mut self, inserts: &[KnowledgeInsert]) -> Result<usize> {
-        if inserts.is_empty() {
+        if inserts.is_empty() || matches!(self.backend, Backend::Memory(_)) {
             return Ok(0);
         }
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection_mut().transaction()?;
         let mut added = 0;
         for insert in inserts {
             let existing: bool = transaction.query_row(
@@ -548,7 +752,10 @@ impl StateStore {
     }
 
     pub fn has_knowledge_hash(&self, kind: &str, hash: &str) -> Result<bool> {
-        Ok(self.connection.query_row(
+        if matches!(self.backend, Backend::Memory(_)) {
+            return Ok(false);
+        }
+        Ok(self.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM knowledge_items WHERE kind=?1 AND content_hash=?2)",
             params![kind, hash],
             |row| row.get(0),
@@ -556,19 +763,25 @@ impl StateStore {
     }
 
     pub fn delete_knowledge(&self, id: &str) -> Result<bool> {
+        if matches!(self.backend, Backend::Memory(_)) {
+            return Ok(false);
+        }
         Ok(self
-            .connection
+            .connection()
             .execute("DELETE FROM knowledge_items WHERE id=?1", [id])?
             > 0)
     }
 
     pub fn list_knowledge(&self, kind: Option<&str>) -> Result<Vec<KnowledgeRow>> {
+        if matches!(self.backend, Backend::Memory(_)) {
+            return Ok(Vec::new());
+        }
         let sql = if kind.is_some() {
             "SELECT id,kind,title,source_uri,content,importance FROM knowledge_items WHERE enabled=1 AND kind=?1 ORDER BY updated_at DESC"
         } else {
             "SELECT id,kind,title,source_uri,'' AS content,importance FROM knowledge_items WHERE enabled=1 ORDER BY updated_at DESC"
         };
-        let mut statement = self.connection.prepare(sql)?;
+        let mut statement = self.connection().prepare(sql)?;
         let mapper = |row: &rusqlite::Row<'_>| {
             Ok(KnowledgeRow {
                 id: row.get(0)?,
@@ -591,7 +804,10 @@ impl StateStore {
     }
 
     pub fn has_knowledge(&self) -> Result<bool> {
-        Ok(self.connection.query_row(
+        if matches!(self.backend, Backend::Memory(_)) {
+            return Ok(false);
+        }
+        Ok(self.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM knowledge_items WHERE enabled=1)",
             [],
             |row| row.get(0),
@@ -603,7 +819,10 @@ impl StateStore {
         kind: Option<&str>,
         mut visitor: impl FnMut(VectorRow),
     ) -> Result<()> {
-        let mut statement = self.connection.prepare(
+        if matches!(self.backend, Backend::Memory(_)) {
+            return Ok(());
+        }
+        let mut statement = self.connection().prepare(
             "SELECT i.id,i.kind,i.title,i.source_uri,i.importance,c.content,c.embedding_blob,c.vector_encoding,c.dimensions FROM knowledge_items i JOIN knowledge_chunks c ON c.item_id=i.id WHERE i.enabled=1 AND (?1 IS NULL OR i.kind=?1)"
         )?;
         let rows = statement.query_map([kind], |row| {
@@ -627,9 +846,12 @@ impl StateStore {
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
+        if matches!(self.backend, Backend::Memory(_)) {
+            return Ok(());
+        }
         if !self.pending_audits.is_empty() {
-            let transaction = self.connection.transaction()?;
             let audits = self.pending_audits.clone();
+            let transaction = self.connection_mut().transaction()?;
             for audit in &audits {
                 transaction.execute(
                     "INSERT INTO tool_executions(session_id,tool_call_id,name,args_redacted_json,result_text,status,risk,exit_code,duration_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -640,13 +862,13 @@ impl StateStore {
             self.pending_audits.clear();
         }
         let journal: String = self
-            .connection
+            .connection()
             .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         if journal.eq_ignore_ascii_case("wal") {
-            self.connection
+            self.connection()
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         }
-        self.connection.cache_flush()?;
+        self.connection().cache_flush()?;
         self.secure_database_files()?;
         Ok(())
     }
@@ -686,9 +908,13 @@ impl StateStore {
 
 impl Drop for StateStore {
     fn drop(&mut self) {
-        if !self.pending_audits.is_empty() {
-            if let Ok(transaction) = self.connection.transaction() {
-                for audit in std::mem::take(&mut self.pending_audits) {
+        if matches!(self.backend, Backend::Memory(_)) {
+            return;
+        }
+        let audits = std::mem::take(&mut self.pending_audits);
+        if !audits.is_empty() {
+            if let Ok(transaction) = self.connection_mut().transaction() {
+                for audit in audits {
                     let _ = transaction.execute("INSERT INTO tool_executions(session_id,tool_call_id,name,args_redacted_json,result_text,status,risk,exit_code,duration_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![audit.session_id,audit.call_id,audit.name,audit.args,audit.result,audit.status,audit.risk,audit.exit_code,audit.duration_ms as i64]);
                 }
                 let _ = transaction.commit();
@@ -848,9 +1074,88 @@ mod tests {
         let resolver =
             ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
         let mut config = Config::default();
+        config.storage.enabled = true;
         config.storage.database = "test.db".into();
         let store = StateStore::open(&config, &resolver).unwrap();
         (dir, store)
+    }
+
+    fn memory_store() -> (tempfile::TempDir, StateStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        // storage.enabled defaults to false: no database is created.
+        let config = Config::default();
+        let store = StateStore::open(&config, &resolver).unwrap();
+        (dir, store)
+    }
+
+    fn user_message(content: &str) -> StoredMessage {
+        StoredMessage {
+            role: "user".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn memory_mode_keeps_a_single_session_without_writing_files() {
+        let (dir, mut store) = memory_store();
+        let first = store.new_session(Path::new("/tmp"), Some("first")).unwrap();
+        store
+            .append_messages(&first, &[user_message("hello")], Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(store.load_messages(&first).unwrap().len(), 1);
+        store.lock_session(&first).unwrap();
+
+        let second = store.new_session(Path::new("/tmp"), Some("second")).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            store.current_session().unwrap().as_deref(),
+            Some(second.as_str())
+        );
+        assert!(store.load_messages(&first).unwrap().is_empty());
+        assert!(store.resolve_session_id(&first).is_err());
+        assert_eq!(store.list_sessions(10).unwrap().len(), 1);
+
+        // No database file is created on disk.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn memory_mode_applies_summaries_and_disables_knowledge() {
+        let (_dir, mut store) = memory_store();
+        let id = store.ensure_current_session(Path::new("/tmp")).unwrap();
+        store
+            .append_messages(
+                &id,
+                &[user_message("m1"), user_message("m2"), user_message("m3")],
+                Path::new("/tmp"),
+            )
+            .unwrap();
+        store
+            .append_messages_with_summary(
+                &id,
+                &[user_message("m4")],
+                Path::new("/tmp"),
+                Some(&SummaryUpdate {
+                    content: "summary text".into(),
+                    through_seq: 2,
+                }),
+            )
+            .unwrap();
+        assert_eq!(store.summary(&id).unwrap().as_deref(), Some("summary text"));
+        let context = store.load_context_messages(&id).unwrap();
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].seq, 3);
+        assert_eq!(store.user_turn_count(&id).unwrap(), 4);
+
+        // Knowledge APIs are inert in memory mode.
+        assert!(!store.has_knowledge().unwrap());
+        assert!(store.list_knowledge(None).unwrap().is_empty());
+        assert!(!store.delete_knowledge("anything").unwrap());
+        store.checkpoint().unwrap();
     }
 
     #[test]
@@ -970,6 +1275,7 @@ mod tests {
             let resolver =
                 ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
             let mut config = Config::default();
+            config.storage.enabled = true;
             config.storage.database = "link.db".into();
             assert!(StateStore::open(&config, &resolver).is_err());
         }

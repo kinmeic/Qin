@@ -139,6 +139,7 @@ pub struct ModelConfig {
     pub base_url: String,
     pub api_style: String,
     pub model: String,
+    pub summary_model: String,
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
     pub context_window: u64,
@@ -155,6 +156,7 @@ impl Default for ModelConfig {
             base_url: "https://api.openai.com/v1".to_string(),
             api_style: "chat_completions".to_string(),
             model: String::new(),
+            summary_model: String::new(),
             api_key_env: None,
             api_key: None,
             context_window: 128_000,
@@ -169,13 +171,18 @@ impl Default for ModelConfig {
 
 impl ModelConfig {
     pub fn resolve_api_key(&self) -> Result<String> {
-        if let Some(name) = self.api_key_env.as_deref() {
-            let value = std::env::var(name)
-                .with_context(|| format!("Environment variable {name} is not set"))?;
-            if value.trim().is_empty() {
-                bail!("Environment variable {name} is empty");
+        if let Some(value) = self.api_key_env.as_deref() {
+            // A valid environment-variable name is looked up in the process
+            // environment; anything else is treated as an inline API key.
+            if !is_env_var_name(value) {
+                return Ok(value.trim().to_string());
             }
-            return Ok(value);
+            let key = std::env::var(value)
+                .with_context(|| format!("Environment variable {value} is not set"))?;
+            if key.trim().is_empty() {
+                bail!("Environment variable {value} is empty");
+            }
+            return Ok(key);
         }
         if let Some(value) = self
             .api_key
@@ -213,7 +220,6 @@ pub struct AgentConfig {
     pub max_tool_calls: u32,
     pub wall_time_seconds: u64,
     pub model: String,
-    pub summary_model: String,
     pub live_reasoning: bool,
 }
 
@@ -224,17 +230,21 @@ impl Default for AgentConfig {
             max_tool_calls: 80,
             wall_time_seconds: 900,
             model: String::new(),
-            summary_model: "summary".to_string(),
             live_reasoning: false,
         }
     }
 }
 
+/// Fraction of the context budget that compaction aims to retain: the fixed
+/// overhead, the new summary, and the protected recent history together should
+/// fit within this share of the budget. Kept internal because tuning it
+/// requires understanding the compaction algorithm.
+pub(crate) const COMPACT_TARGET_RATIO: f64 = 0.45;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContextConfig {
     pub compact_trigger_ratio: f64,
-    pub compact_target_ratio: f64,
     pub reserve_output_tokens: u64,
     pub reserve_safety_tokens: u64,
     pub protect_recent_tokens: u64,
@@ -244,8 +254,7 @@ pub struct ContextConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            compact_trigger_ratio: 0.72,
-            compact_target_ratio: 0.45,
+            compact_trigger_ratio: 0.9,
             reserve_output_tokens: 8_192,
             reserve_safety_tokens: 2_048,
             protect_recent_tokens: 16_000,
@@ -257,6 +266,7 @@ impl Default for ContextConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
+    pub enabled: bool,
     pub data_dir: String,
     pub database: String,
     pub journal_mode: String,
@@ -269,6 +279,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             data_dir: String::new(),
             database: "qin.db".to_string(),
             journal_mode: "auto".to_string(),
@@ -307,6 +318,7 @@ impl Default for LowWriteConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
+    pub enabled: bool,
     pub base_url: String,
     pub model: String,
     pub api_key_env: Option<String>,
@@ -319,6 +331,7 @@ pub struct EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             base_url: "https://api.openai.com/v1".to_string(),
             model: "text-embedding-3-small".to_string(),
             api_key_env: None,
@@ -470,9 +483,14 @@ impl Default for UiConfig {
 }
 
 fn resolve_secret(env_name: Option<&str>, inline: Option<&str>, label: &str) -> Result<String> {
-    if let Some(name) = env_name {
-        return std::env::var(name)
-            .with_context(|| format!("{label} environment variable {name} is not set"));
+    if let Some(value) = env_name {
+        // A valid environment-variable name is looked up in the process
+        // environment; anything else is treated as an inline API key.
+        if !is_env_var_name(value) {
+            return Ok(value.trim().to_string());
+        }
+        return std::env::var(value)
+            .with_context(|| format!("{label} environment variable {value} is not set"));
     }
     inline
         .filter(|value| !value.trim().is_empty())
@@ -490,6 +508,41 @@ impl Config {
         self.models
             .get(name)
             .with_context(|| format!("active model={} does not exist in [models]", name))
+    }
+
+    /// Model configuration used for context-compression summaries. It reuses
+    /// the connection settings of the `default_model` entry; when that entry's
+    /// `summary_model` is empty, its own `model` is used.
+    pub fn summary_model(&self) -> Result<ModelConfig> {
+        let base = self.models.get(&self.default_model).with_context(|| {
+            format!(
+                "default_model={} does not exist in [models]",
+                self.default_model
+            )
+        })?;
+        let mut summary = base.clone();
+        let override_name = base.summary_model.trim();
+        if !override_name.is_empty() {
+            summary.model = override_name.to_string();
+        }
+        Ok(summary)
+    }
+
+    /// Whether sessions and history are persisted to SQLite. When disabled,
+    /// the agent runs fully in memory and keeps only one session at a time.
+    pub fn persistence_enabled(&self) -> bool {
+        self.storage.enabled
+    }
+
+    /// Whether embedding calls can actually be made: embeddings are stored
+    /// alongside knowledge chunks, so they require persistent storage.
+    pub fn embeddings_active(&self) -> bool {
+        self.storage.enabled && self.embeddings.enabled
+    }
+
+    /// Whether knowledge recall and extraction are active.
+    pub fn knowledge_active(&self) -> bool {
+        self.embeddings_active() && self.knowledge.enabled
     }
 
     pub fn validate(&self, check_secret: bool) -> Result<()> {
@@ -546,11 +599,22 @@ impl Config {
         if self.input.fromfile_max_bytes == 0 || self.input.fromfile_max_bytes > 64 * 1024 * 1024 {
             bail!("input.fromfile_max_bytes must be between 1 byte and 64 MiB");
         }
-        if !(0.1..1.0).contains(&self.context.compact_trigger_ratio)
-            || !(0.1..self.context.compact_trigger_ratio)
-                .contains(&self.context.compact_target_ratio)
+        if !(COMPACT_TARGET_RATIO..1.0).contains(&self.context.compact_trigger_ratio) {
+            bail!(
+                "context.compact_trigger_ratio must be greater than {COMPACT_TARGET_RATIO} and below 1.0"
+            );
+        }
+        // Compaction is only checked once per tool-loop iteration, so the
+        // headroom above the trigger must absorb the largest single-iteration
+        // growth; otherwise a big tool result can jump straight past the hard
+        // input budget before compaction runs.
+        let budget = model.context_window - reserved;
+        if (1.0 - self.context.compact_trigger_ratio) * budget as f64
+            <= self.context.tool_result_max_tokens as f64
         {
-            bail!("Context compression ratios must satisfy 0.1 <= target < trigger < 1.0");
+            bail!(
+                "context.compact_trigger_ratio leaves insufficient headroom: (1 - trigger) * (context_window - reserves) must exceed context.tool_result_max_tokens; lower the trigger or tool_result_max_tokens"
+            );
         }
         if !(1..=1_024).contains(&self.agent.max_iterations)
             || !(1..=4_096).contains(&self.agent.max_tool_calls)
@@ -571,31 +635,35 @@ impl Config {
                 "Context tool and recent-history limits are invalid for the model context window"
             );
         }
-        if self.storage.database.trim().is_empty()
-            || Path::new(&self.storage.database).components().count() != 1
-        {
-            bail!("storage.database must be a file name, not a path");
-        }
-        if !matches!(
-            self.storage.journal_mode.to_ascii_lowercase().as_str(),
-            "auto" | "wal" | "persist" | "delete"
-        ) {
-            bail!("storage.journal_mode must be auto, wal, persist, or delete");
-        }
-        if !matches!(
-            self.storage.write_profile.to_ascii_lowercase().as_str(),
-            "auto" | "durable" | "low_write"
-        ) {
-            bail!("storage.write_profile must be auto, durable, or low_write");
-        }
-        if self.storage.busy_timeout_ms > 300_000 {
-            bail!("storage.busy_timeout_ms cannot exceed 300000");
-        }
-        if self.storage.retention_days != 0 {
-            bail!("storage.retention_days is reserved for a future release and must remain 0");
-        }
-        if self.storage.low_write != LowWriteConfig::default() {
-            bail!("Custom [storage.low_write] thresholds are reserved for a future release");
+        if self.storage.enabled {
+            if self.storage.database.trim().is_empty()
+                || Path::new(&self.storage.database).components().count() != 1
+            {
+                bail!("storage.database must be a file name, not a path");
+            }
+            if !matches!(
+                self.storage.journal_mode.to_ascii_lowercase().as_str(),
+                "auto" | "wal" | "persist" | "delete"
+            ) {
+                bail!("storage.journal_mode must be auto, wal, persist, or delete");
+            }
+            if !matches!(
+                self.storage.write_profile.to_ascii_lowercase().as_str(),
+                "auto" | "durable" | "low_write"
+            ) {
+                bail!("storage.write_profile must be auto, durable, or low_write");
+            }
+            if self.storage.busy_timeout_ms > 300_000 {
+                bail!("storage.busy_timeout_ms cannot exceed 300000");
+            }
+            if self.storage.retention_days != 0 {
+                bail!(
+                    "storage.retention_days is reserved for a future release and must remain 0"
+                );
+            }
+            if self.storage.low_write != LowWriteConfig::default() {
+                bail!("Custom [storage.low_write] thresholds are reserved for a future release");
+            }
         }
         if !matches!(
             self.permissions.approval.as_str(),
@@ -690,7 +758,7 @@ impl Config {
                 );
             }
         }
-        if self.knowledge.enabled {
+        if self.knowledge_active() {
             validate_http_url(&self.embeddings.base_url, "embeddings.base_url")?;
             validate_secret_source(
                 self.embeddings.api_key_env.as_deref(),
@@ -750,7 +818,7 @@ impl Config {
             for candidate in self.models.values() {
                 candidate.resolve_api_key()?;
             }
-            if self.knowledge.enabled {
+            if self.knowledge_active() {
                 self.embeddings.resolve_api_key()?;
             }
             if self.search.exa.enabled {
@@ -779,18 +847,26 @@ fn validate_http_url(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn is_env_var_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn validate_secret_source(env_name: Option<&str>, inline: Option<&str>, label: &str) -> Result<()> {
     if env_name.is_some() && inline.is_some_and(|value| !value.trim().is_empty()) {
         bail!("{label} cannot configure both api_key_env and api_key");
     }
-    if let Some(name) = env_name {
-        let mut chars = name.chars();
-        if name.trim() != name
-            || !chars
-                .next()
-                .is_some_and(|value| value == '_' || value.is_ascii_alphabetic())
-            || !chars.all(|value| value == '_' || value.is_ascii_alphanumeric())
-            || matches!(name, "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME")
+    if let Some(value) = env_name {
+        if value.trim().is_empty() {
+            bail!("{label}.api_key_env cannot be empty");
+        }
+        // Values that are valid environment-variable names are looked up in the
+        // process environment; anything else is treated as an inline API key.
+        if is_env_var_name(value)
+            && matches!(value, "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME")
         {
             bail!("{label}.api_key_env is not a safe environment-variable name");
         }
@@ -1145,12 +1221,12 @@ mod tests {
 
             [models.primary]
             model = "test"
+            summary_model = "test-small"
             api_key = "test-key"
             supports_parallel_tools = false
 
             [agent]
             model = "primary"
-            summary_model = "primary"
             live_reasoning = false
 
             [storage]
@@ -1183,6 +1259,128 @@ mod tests {
         )
         .unwrap();
         config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn summary_model_falls_back_to_the_default_model_name() {
+        let mut config = Config::default();
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                model: "big-model".into(),
+                ..ModelConfig::default()
+            },
+        );
+        let summary = config.summary_model().unwrap();
+        assert_eq!(summary.model, "big-model");
+    }
+
+    #[test]
+    fn summary_model_honors_the_model_level_override() {
+        let mut config = Config::default();
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                model: "big-model".into(),
+                summary_model: " small-model ".into(),
+                ..ModelConfig::default()
+            },
+        );
+        let summary = config.summary_model().unwrap();
+        assert_eq!(summary.model, "small-model");
+        assert_eq!(summary.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn rejects_trigger_ratio_without_tool_result_headroom() {
+        let mut config = Config::default();
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                model: "test".into(),
+                api_key: Some("key".into()),
+                context_window: 32_768,
+                max_output_tokens: 4_096,
+                ..ModelConfig::default()
+            },
+        );
+        // budget = 32768 - 10240 = 22528; 10% headroom = 2252 < 6000 default cap.
+        assert!(config.validate(false).is_err());
+        config.context.tool_result_max_tokens = 2_000;
+        config.validate(false).unwrap();
+
+        config.context.compact_trigger_ratio = 0.4;
+        assert!(config.validate(false).is_err());
+    }
+
+    #[test]
+    fn api_key_env_accepts_an_inline_key() {
+        let model = ModelConfig {
+            model: "test".into(),
+            api_key_env: Some("sk-test-123".into()),
+            ..ModelConfig::default()
+        };
+        assert_eq!(model.resolve_api_key().unwrap(), "sk-test-123");
+
+        let mut config = Config::default();
+        config.models.insert("primary".into(), model);
+        config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn api_key_env_still_rejects_reserved_names_and_empty_values() {
+        for value in ["PATH", "  ", ""] {
+            let mut config = Config::default();
+            config.models.insert(
+                "primary".into(),
+                ModelConfig {
+                    model: "test".into(),
+                    api_key_env: Some(value.into()),
+                    ..ModelConfig::default()
+                },
+            );
+            assert!(
+                config.validate(false).is_err(),
+                "api_key_env={value:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn knowledge_requires_storage_and_embeddings() {
+        let mut config = Config::default();
+        assert!(!config.persistence_enabled());
+        assert!(!config.embeddings_active());
+        assert!(!config.knowledge_active());
+
+        config.storage.enabled = true;
+        assert!(config.persistence_enabled());
+        assert!(!config.embeddings_active());
+        assert!(!config.knowledge_active());
+
+        config.embeddings.enabled = true;
+        assert!(config.embeddings_active());
+        assert!(config.knowledge_active());
+
+        config.knowledge.enabled = false;
+        assert!(!config.knowledge_active());
+    }
+
+    #[test]
+    fn disabled_storage_skips_sqlite_specific_validation() {
+        let mut config = Config::default();
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                model: "test".into(),
+                api_key: Some("key".into()),
+                ..ModelConfig::default()
+            },
+        );
+        config.storage.database = "../not-a-file-name.db".into();
+        config.validate(false).unwrap();
+        config.storage.enabled = true;
+        assert!(config.validate(false).is_err());
     }
 
     #[test]

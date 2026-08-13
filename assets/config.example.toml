@@ -9,6 +9,10 @@ default_model = "primary"
 base_url = "https://api.openai.com/v1"
 api_style = "chat_completions"
 model = "gpt-4o-mini"
+# Model name used for context-compression summaries; reuses this entry's
+# connection settings. Empty means the summary uses `model` above.
+summary_model = ""
+# Environment-variable name holding the API key, or the API key itself.
 api_key_env = "QIN_API_KEY"
 context_window = 128000
 max_output_tokens = 8192
@@ -16,16 +20,9 @@ supports_tools = true
 supports_native_search = false
 stream = true
 
-[models.summary]
-base_url = "https://api.openai.com/v1"
-api_style = "chat_completions"
-model = "gpt-4o-mini"
-api_key_env = "QIN_API_KEY"
-context_window = 128000
-max_output_tokens = 2048
-supports_tools = false
-
 [embeddings]
+# Embedding calls are only made when this is enabled AND storage.enabled=true.
+enabled = false
 base_url = "https://api.openai.com/v1"
 model = "text-embedding-3-small"
 api_key_env = "QIN_API_KEY"
@@ -37,11 +34,9 @@ vector_encoding = "f32"
 max_iterations = 24
 max_tool_calls = 80
 wall_time_seconds = 900
-summary_model = "summary"
 
 [context]
-compact_trigger_ratio = 0.72
-compact_target_ratio = 0.45
+compact_trigger_ratio = 0.9
 reserve_output_tokens = 8192
 reserve_safety_tokens = 2048
 protect_recent_tokens = 16000
@@ -53,6 +48,10 @@ allow_utf8_bom = true
 reject_nul = true
 
 [storage]
+# When disabled, no SQLite database is written: a single session is kept in
+# memory, starting a new session wipes the previous one, and embeddings,
+# long-term memory, and cross-session recall are all disabled.
+enabled = false
 data_dir = ""
 database = "qin.db"
 journal_mode = "auto"
@@ -60,6 +59,7 @@ write_profile = "auto"
 busy_timeout_ms = 5000
 
 [knowledge]
+# Requires storage.enabled=true and embeddings.enabled=true to take effect.
 enabled = true
 recall_limit = 8
 max_context_tokens = 2500
