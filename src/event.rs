@@ -10,6 +10,11 @@ pub struct EventSink {
     json: bool,
     show_tool_events: Cell<bool>,
     show_commands: Cell<bool>,
+    /// stderr is an interactive terminal: heartbeats rewrite one line in place.
+    terminal: bool,
+    /// ANSI colors for system event lines (disabled by NO_COLOR).
+    color: bool,
+    heartbeat_open: Cell<bool>,
 }
 
 #[derive(Serialize)]
@@ -20,11 +25,17 @@ struct JsonEvent<'a> {
 
 impl EventSink {
     pub fn new(quiet: bool, json: bool) -> Self {
+        let terminal =
+            !json && !cfg!(windows) && std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let color = terminal && std::env::var_os("NO_COLOR").is_none();
         Self {
             quiet,
             json,
             show_tool_events: Cell::new(true),
             show_commands: Cell::new(true),
+            terminal,
+            color,
+            heartbeat_open: Cell::new(false),
         }
     }
 
@@ -121,13 +132,22 @@ impl EventSink {
     }
 
     pub fn command_heartbeat(&self, seconds: u64) -> Result<()> {
-        if !self.quiet && self.show_commands.get() {
-            self.stderr(
-                "command_heartbeat",
-                &format!("... Command still running  {seconds}s"),
-            )?;
+        if self.quiet || !self.show_commands.get() {
+            return Ok(());
         }
-        Ok(())
+        let message = format!("... Command still running  {seconds}s");
+        if self.terminal {
+            // Rewrite a single status line in place instead of appending.
+            let message = sanitize_terminal(&redact(&message));
+            if self.color {
+                eprint!("\r\x1b[2K\x1b[2m{message}\x1b[0m");
+            } else {
+                eprint!("\r\x1b[2K{message}");
+            }
+            self.heartbeat_open.set(true);
+            return Ok(());
+        }
+        self.stderr("command_heartbeat", &message)
     }
 
     pub fn command_finished(&self, code: Option<i32>, elapsed_ms: u128) -> Result<()> {
@@ -265,10 +285,32 @@ impl EventSink {
                 })?
             );
         } else {
-            eprintln!("{}", sanitize_terminal(&message));
+            // The transient heartbeat line is replaced by the next event.
+            if self.heartbeat_open.replace(false) {
+                eprint!("\r\x1b[2K");
+            }
+            let message = sanitize_terminal(&message);
+            match self.color.then(|| event_color(event)).flatten() {
+                Some(code) => eprintln!("\x1b[{code}m{message}\x1b[0m"),
+                None => eprintln!("{message}"),
+            }
         }
         Ok(())
     }
+}
+
+/// ANSI color per system event kind; command output itself stays uncolored so
+/// it stands apart from qin's own messages.
+fn event_color(event: &str) -> Option<&'static str> {
+    Some(match event {
+        "phase" => "36",                                                // cyan
+        "tool_started" | "command_started" | "command_preview" => "34", // blue
+        "tool_finished" | "command_finished" | "success" => "32",       // green
+        "tool_failed" | "command_failed" => "31",                       // red
+        "approval_required" => "33",                                    // yellow
+        "command_heartbeat" => "2",                                     // dim
+        _ => return None,
+    })
 }
 
 pub fn sanitize_terminal(value: &str) -> String {
@@ -369,5 +411,14 @@ mod tests {
         assert!(!redacted.contains("abc"));
         assert_eq!(sanitize_terminal("ok\u{1b}[31m\u{202e}"), "ok[31m");
         assert_eq!(sanitize_terminal("left\rright"), "leftright");
+    }
+
+    #[test]
+    fn assigns_colors_to_system_events_only() {
+        assert_eq!(event_color("command_finished"), Some("32"));
+        assert_eq!(event_color("tool_failed"), Some("31"));
+        assert_eq!(event_color("approval_required"), Some("33"));
+        assert_eq!(event_color("command_heartbeat"), Some("2"));
+        assert_eq!(event_color("command_output"), None);
     }
 }
