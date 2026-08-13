@@ -248,9 +248,7 @@ impl StateStore {
                 path.display()
             )
         })?;
-        Ok(SessionLock {
-            _file: Some(file),
-        })
+        Ok(SessionLock { _file: Some(file) })
     }
 
     fn migrate(&mut self) -> Result<()> {
@@ -861,9 +859,9 @@ impl StateStore {
             transaction.commit()?;
             self.pending_audits.clear();
         }
-        let journal: String = self
-            .connection()
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        let journal: String =
+            self.connection()
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
         if journal.eq_ignore_ascii_case("wal") {
             self.connection()
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -1109,7 +1107,9 @@ mod tests {
         assert_eq!(store.load_messages(&first).unwrap().len(), 1);
         store.lock_session(&first).unwrap();
 
-        let second = store.new_session(Path::new("/tmp"), Some("second")).unwrap();
+        let second = store
+            .new_session(Path::new("/tmp"), Some("second"))
+            .unwrap();
         assert_ne!(first, second);
         assert_eq!(
             store.current_session().unwrap().as_deref(),

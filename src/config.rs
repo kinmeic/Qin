@@ -657,9 +657,7 @@ impl Config {
                 bail!("storage.busy_timeout_ms cannot exceed 300000");
             }
             if self.storage.retention_days != 0 {
-                bail!(
-                    "storage.retention_days is reserved for a future release and must remain 0"
-                );
+                bail!("storage.retention_days is reserved for a future release and must remain 0");
             }
             if self.storage.low_write != LowWriteConfig::default() {
                 bail!("Custom [storage.low_write] thresholds are reserved for a future release");
@@ -865,8 +863,7 @@ fn validate_secret_source(env_name: Option<&str>, inline: Option<&str>, label: &
         }
         // Values that are valid environment-variable names are looked up in the
         // process environment; anything else is treated as an inline API key.
-        if is_env_var_name(value)
-            && matches!(value, "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME")
+        if is_env_var_name(value) && matches!(value, "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME")
         {
             bail!("{label}.api_key_env is not a safe environment-variable name");
         }
