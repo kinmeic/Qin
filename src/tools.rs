@@ -545,20 +545,17 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         .as_u64()
         .unwrap_or(ctx.config.permissions.command_timeout_seconds)
         .clamp(1, 3600);
-    ctx.events
-        .command_preview(ctx.cwd, command, elevated, timeout)?;
     if ctx.dry_run {
         return text_result("Dry run: command not executed".into());
     }
     let message = if ctx.events.shows_command_details() {
-        // The preview line above already displays the full command.
+        // tool_started already displays the full command.
         "Allow this command? [y/N] ".to_string()
     } else {
         format!("Allow command `{}`? [y/N] ", redact(command))
     };
     approve(ctx, &message, elevated || dangerous(command))?;
-    ctx.events
-        .command_started(ctx.cwd, command, elevated, timeout)?;
+    ctx.events.command_started(ctx.cwd, elevated, timeout)?;
     let started = Instant::now();
     let shell = "/bin/sh";
     let mut process = if elevated && unsafe { libc::geteuid() } != 0 {

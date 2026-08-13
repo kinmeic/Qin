@@ -16,7 +16,7 @@ pub struct EventSink {
     terminal: bool,
     /// ANSI colors for system event lines (disabled by NO_COLOR).
     color: bool,
-    heartbeat_open: Cell<bool>,
+    status_line_open: Cell<bool>,
 }
 
 #[derive(Serialize)]
@@ -38,7 +38,7 @@ impl EventSink {
             show_commands: Cell::new(true),
             terminal,
             color,
-            heartbeat_open: Cell::new(false),
+            status_line_open: Cell::new(false),
         }
     }
 
@@ -84,60 +84,47 @@ impl EventSink {
     pub fn command_started(
         &self,
         cwd: &std::path::Path,
-        command: &str,
         elevated: bool,
         timeout: u64,
     ) -> Result<()> {
-        if !self.quiet && self.show_commands.get() {
-            let level = if elevated {
-                "sudo/root"
-            } else {
-                "standard privileges"
-            };
-            self.stderr(
-                "command_started",
-                &format!(
-                    "→ shell [{level}]  cwd={}  timeout={}s\n  $ {}",
-                    cwd.display(),
-                    timeout,
-                    redact(command)
-                ),
-            )?;
+        if self.quiet || !self.show_commands.get() {
+            return Ok(());
         }
-        Ok(())
-    }
-
-    pub fn command_preview(
-        &self,
-        cwd: &std::path::Path,
-        command: &str,
-        elevated: bool,
-        timeout: u64,
-    ) -> Result<()> {
-        if !self.quiet && self.show_commands.get() {
-            let level = if elevated {
-                "sudo/root"
+        // The command itself was already shown by tool_started; here we
+        // only report the execution context as the run begins.
+        let level = if elevated {
+            "sudo/root"
+        } else {
+            "standard privileges"
+        };
+        let message = format!(
+            "▸ Running [{level}]  cwd={}  timeout={}s",
+            cwd.display(),
+            timeout
+        );
+        if self.terminal {
+            // Transient status line: the heartbeat or command_finished
+            // rewrites this same line instead of appending a new one.
+            if self.status_line_open.replace(false) {
+                eprint!("\r\x1b[2K");
+            }
+            let message = sanitize_terminal(&redact(&message));
+            if self.color {
+                eprint!("\x1b[34m{INDENT}{message}\x1b[0m");
             } else {
-                "standard privileges"
-            };
-            self.stderr(
-                "command_preview",
-                &format!(
-                    "-> Preparing command [{level}]  cwd={}  timeout={}s\n  $ {}",
-                    cwd.display(),
-                    timeout,
-                    redact(command)
-                ),
-            )?;
+                eprint!("{INDENT}{message}");
+            }
+            self.status_line_open.set(true);
+            return Ok(());
         }
-        Ok(())
+        self.stderr("command_started", &message)
     }
 
     pub fn command_output(&self, stream: &str, line: &str) -> Result<()> {
         // Live command output is hidden unless --verbose; JSON consumers
         // always receive it as structured events.
         if self.json || (self.verbose && !self.quiet && self.show_commands.get()) {
-            self.stderr("command_output", &format!("  │ {stream}: {}", redact(line)))?;
+            self.stderr("command_output", &format!("│ {stream}: {}", redact(line)))?;
         }
         Ok(())
     }
@@ -151,11 +138,11 @@ impl EventSink {
             // Rewrite a single status line in place instead of appending.
             let message = sanitize_terminal(&redact(&message));
             if self.color {
-                eprint!("\r\x1b[2K\x1b[2m{message}\x1b[0m");
+                eprint!("\r\x1b[2K\x1b[2m{INDENT}{message}\x1b[0m");
             } else {
-                eprint!("\r\x1b[2K{message}");
+                eprint!("\r\x1b[2K{INDENT}{message}");
             }
-            self.heartbeat_open.set(true);
+            self.status_line_open.set(true);
             return Ok(());
         }
         self.stderr("command_heartbeat", &message)
@@ -194,14 +181,14 @@ impl EventSink {
         if self.json {
             self.stderr("approval_required", &message)?;
         }
-        if self.heartbeat_open.replace(false) {
+        if self.status_line_open.replace(false) {
             eprint!("\r\x1b[2K");
         }
         let message = sanitize_terminal(&redact(&message));
         if self.color {
-            eprint!("\x1b[33m{message}\x1b[0m");
+            eprint!("\x1b[33m{INDENT}{message}\x1b[0m");
         } else {
-            eprint!("{message}");
+            eprint!("{INDENT}{message}");
         }
         std::io::Write::flush(&mut std::io::stderr())?;
         Ok(())
@@ -327,14 +314,15 @@ impl EventSink {
                 })?
             );
         } else {
-            // The transient heartbeat line is replaced by the next event.
-            if self.heartbeat_open.replace(false) {
+            // The transient status line (Running / heartbeat) is replaced by the next event.
+            if self.status_line_open.replace(false) {
                 eprint!("\r\x1b[2K");
             }
             let message = sanitize_terminal(&message);
+            let indent = if indented_event(event) { INDENT } else { "" };
             match self.color.then(|| event_color(event)).flatten() {
-                Some(code) => eprintln!("\x1b[{code}m{message}\x1b[0m"),
-                None => eprintln!("{message}"),
+                Some(code) => eprintln!("\x1b[{code}m{indent}{message}\x1b[0m"),
+                None => eprintln!("{indent}{message}"),
             }
         }
         Ok(())
@@ -345,14 +333,33 @@ impl EventSink {
 /// it stands apart from qin's own messages.
 fn event_color(event: &str) -> Option<&'static str> {
     Some(match event {
-        "phase" => "36",                                                // cyan
-        "tool_started" | "command_started" | "command_preview" => "34", // blue
-        "tool_finished" | "command_finished" | "success" => "32",       // green
-        "tool_failed" | "command_failed" => "31",                       // red
-        "approval_required" => "33",                                    // yellow
-        "command_heartbeat" => "2",                                     // dim
+        "phase" => "36",                                          // cyan
+        "tool_started" | "command_started" => "34",               // blue
+        "tool_finished" | "command_finished" | "success" => "32", // green
+        "tool_failed" | "command_failed" => "31",                 // red
+        "approval_required" => "33",                              // yellow
+        "command_heartbeat" => "2",                               // dim
         _ => return None,
     })
+}
+
+/// Two-column indent for events that belong to a tool/command invocation
+/// under the current "● Requesting the model" phase line.
+const INDENT: &str = "  ";
+
+fn indented_event(event: &str) -> bool {
+    matches!(
+        event,
+        "tool_started"
+            | "tool_finished"
+            | "tool_failed"
+            | "command_started"
+            | "command_output"
+            | "command_heartbeat"
+            | "command_finished"
+            | "command_failed"
+            | "approval_required"
+    )
 }
 
 pub fn sanitize_terminal(value: &str) -> String {
@@ -462,5 +469,25 @@ mod tests {
         assert_eq!(event_color("approval_required"), Some("33"));
         assert_eq!(event_color("command_heartbeat"), Some("2"));
         assert_eq!(event_color("command_output"), None);
+    }
+
+    #[test]
+    fn indents_tool_and_command_events_only() {
+        for event in [
+            "tool_started",
+            "tool_finished",
+            "tool_failed",
+            "command_started",
+            "command_output",
+            "command_heartbeat",
+            "command_finished",
+            "command_failed",
+            "approval_required",
+        ] {
+            assert!(indented_event(event), "{event}");
+        }
+        for event in ["phase", "success", "session", "final_answer"] {
+            assert!(!indented_event(event), "{event}");
+        }
     }
 }
