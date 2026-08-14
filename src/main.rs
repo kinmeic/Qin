@@ -210,8 +210,8 @@ async fn run() -> Result<()> {
             }
         }
         Command::Doctor => doctor(&explicit_config, &events)?,
-        Command::Update => {
-            let outcome = update::run(dry_run).await?;
+        Command::Update { internal_delegated } => {
+            let outcome = update::run(dry_run, internal_delegated).await?;
             let message = match outcome {
                 UpdateOutcome::UpToDate {
                     current,
@@ -236,6 +236,7 @@ async fn run() -> Result<()> {
                     "qin updated from v{current} to v{latest}; executable: {}",
                     executable.display()
                 ),
+                UpdateOutcome::Delegated => return Ok(()),
             };
             events.success(&message)?;
         }

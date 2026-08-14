@@ -2,6 +2,10 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.3.0
+
+- Fixed `qin update` for protected system installations by detecting unwritable executable directories before downloading and safely delegating only the update command to a trusted `sudo` or `doas` executable.
+
 ## 0.2.9
 
 - Fixed `sudo qin` to reuse the invoking user's configuration and SQLite data directories instead of unexpectedly switching to `/etc/qin` and `/var/lib/qin`.

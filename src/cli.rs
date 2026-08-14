@@ -96,7 +96,11 @@ pub enum Command {
     Doctor,
 
     /// Check the latest GitHub release and replace the running qin executable when newer
-    Update,
+    Update {
+        /// Prevent recursive privilege delegation in the internal updater subprocess
+        #[arg(long, hide = true)]
+        internal_delegated: bool,
+    },
 
     /// View or validate configuration
     Config {
@@ -254,7 +258,12 @@ mod tests {
     #[test]
     fn recognizes_update_subcommand() {
         let cli = Cli::try_parse_from(strings(&["qin", "update"])).expect("should parse");
-        assert!(matches!(cli.command, Command::Update));
+        assert!(matches!(
+            cli.command,
+            Command::Update {
+                internal_delegated: false
+            }
+        ));
     }
 
     #[test]

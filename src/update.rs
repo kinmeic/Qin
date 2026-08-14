@@ -1,6 +1,8 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -35,6 +37,7 @@ pub enum UpdateOutcome {
         latest: Version,
         executable: PathBuf,
     },
+    Delegated,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,7 +55,7 @@ struct ReleaseAsset {
     size: u64,
 }
 
-pub async fn run(dry_run: bool) -> Result<UpdateOutcome> {
+pub async fn run(dry_run: bool, delegation_attempted: bool) -> Result<UpdateOutcome> {
     let executable = current_executable()?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .context("The current qin version is not valid semantic versioning")?;
@@ -76,6 +79,21 @@ pub async fn run(dry_run: bool) -> Result<UpdateOutcome> {
         });
     }
 
+    match probe_install_directory(&executable) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return delegate_privileged_update(&executable, delegation_attempted).await;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Unable to prepare an atomic update beside {}",
+                    executable.display()
+                )
+            });
+        }
+    }
+
     let checksums = find_checksum_asset(&release)?;
     let client = github_client()?;
     let checksum_body = download_bytes(&client, checksums, MAX_CHECKSUM_BYTES).await?;
@@ -97,6 +115,146 @@ pub async fn run(dry_run: bool) -> Result<UpdateOutcome> {
         latest,
         executable,
     })
+}
+
+fn probe_install_directory(executable: &Path) -> io::Result<()> {
+    let parent = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the qin executable has no parent directory",
+        )
+    })?;
+    NamedTempFile::new_in(parent).map(drop)
+}
+
+async fn delegate_privileged_update(
+    executable: &Path,
+    delegation_attempted: bool,
+) -> Result<UpdateOutcome> {
+    #[cfg(not(unix))]
+    {
+        let _ = delegation_attempted;
+        bail!(
+            "Updating {} requires administrator privileges",
+            executable.display()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            bail!(
+                "The qin executable directory is not writable even as root; check whether the filesystem containing {} is read-only",
+                executable.display()
+            );
+        }
+        ensure!(
+            !delegation_attempted,
+            "The privilege helper did not grant enough access to replace {}; retry manually as root",
+            executable.display()
+        );
+        ensure_trusted_elevation_target(executable)?;
+        let helper = privilege_helper().with_context(|| {
+            format!(
+                "Updating {} requires administrator privileges, but neither /usr/bin/sudo nor a trusted doas executable was found",
+                executable.display()
+            )
+        })?;
+        eprintln!(
+            "qin update needs administrator access to replace {}; requesting it with {}...",
+            executable.display(),
+            helper.display()
+        );
+        let status = tokio::process::Command::new(&helper)
+            .arg(executable)
+            .arg("update")
+            .arg("--internal-delegated")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .with_context(|| format!("Unable to start {}", helper.display()))?;
+        ensure!(
+            status.success(),
+            "Privileged qin update failed with status {status}. Retry manually: {}",
+            manual_privileged_command(&helper, executable)
+        );
+        Ok(UpdateOutcome::Delegated)
+    }
+}
+
+#[cfg(unix)]
+fn ensure_trusted_elevation_target(executable: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::metadata(executable)
+        .with_context(|| format!("Unable to inspect qin executable: {}", executable.display()))?;
+    ensure!(
+        metadata.is_file() && metadata.uid() == 0 && metadata.permissions().mode() & 0o022 == 0,
+        "Refusing to run an untrusted qin executable as root: {}. Reinstall it with root ownership or run the update manually after reviewing the executable",
+        executable.display()
+    );
+    let parent = executable
+        .parent()
+        .context("The qin executable has no parent directory")?;
+    let parent_metadata = fs::metadata(parent).with_context(|| {
+        format!(
+            "Unable to inspect qin executable directory: {}",
+            parent.display()
+        )
+    })?;
+    ensure!(
+        parent_metadata.is_dir()
+            && parent_metadata.uid() == 0
+            && parent_metadata.permissions().mode() & 0o022 == 0,
+        "Refusing automatic privilege elevation because the qin executable directory is not root-owned and protected from group/world writes: {}",
+        parent.display()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn privilege_helper() -> Option<PathBuf> {
+    [
+        "/usr/bin/sudo",
+        "/bin/sudo",
+        "/usr/bin/doas",
+        "/bin/doas",
+        "/usr/local/bin/doas",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| trusted_root_executable(path))
+}
+
+#[cfg(unix)]
+fn trusted_root_executable(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let trusted_metadata = |metadata: fs::Metadata, directory: bool| {
+        (if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        }) && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o022 == 0
+    };
+
+    fs::metadata(path).is_ok_and(|metadata| trusted_metadata(metadata, false))
+        && path.parent().is_some_and(|parent| {
+            fs::metadata(parent).is_ok_and(|metadata| trusted_metadata(metadata, true))
+        })
+}
+
+#[cfg(unix)]
+fn manual_privileged_command(helper: &Path, executable: &Path) -> String {
+    format!("{} {} update", shell_quote(helper), shell_quote(executable))
+}
+
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 fn current_executable() -> Result<PathBuf> {
@@ -564,6 +722,41 @@ mod tests {
         assert!(validate_archive_path(Path::new("../qin")).is_err());
         assert!(validate_archive_path(Path::new("/tmp/qin")).is_err());
         assert!(validate_archive_path(Path::new("release/qin")).is_ok());
+    }
+
+    #[test]
+    fn probes_a_writable_install_directory_without_leaving_a_file() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("qin");
+        fs::write(&executable, b"qin")?;
+        let before = fs::read_dir(directory.path())?.count();
+
+        probe_install_directory(&executable)?;
+
+        assert_eq!(fs::read_dir(directory.path())?.count(), before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quotes_manual_privileged_update_commands() {
+        assert_eq!(
+            manual_privileged_command(Path::new("/usr/bin/sudo"), Path::new("/opt/qin's bin/qin")),
+            "'/usr/bin/sudo' '/opt/qin'\\''s bin/qin' update"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_writable_privilege_helpers() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let helper = directory.path().join("sudo");
+        fs::write(&helper, b"not sudo")?;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o777))?;
+        assert!(!trusted_root_executable(&helper));
+        Ok(())
     }
 
     #[cfg(unix)]
