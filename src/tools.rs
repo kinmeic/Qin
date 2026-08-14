@@ -629,7 +629,7 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         };
         if approve_command(ctx, &message, high_risk)? == ApprovalDecision::All {
             *ctx.approve_all_commands = true;
-            ctx.events.warning(
+            ctx.events.tool_warning(
                 "All subsequent shell commands in this task are approved; forbidden commands remain blocked",
             )?;
         }
@@ -1591,7 +1591,7 @@ fn is_read_only_command(command: &str) -> bool {
     if trimmed.is_empty()
         || trimmed
             .chars()
-            .any(|value| matches!(value, '>' | '<' | '`' | '\n' | '\r'))
+            .any(|value| matches!(value, '`' | '\n' | '\r'))
         || trimmed.contains("$((")
         || trimmed.contains("$(")
         || trimmed.contains('#')
@@ -1600,14 +1600,34 @@ fn is_read_only_command(command: &str) -> bool {
     }
     let segments = trimmed.split([';', '|', '&']);
     for segment in segments {
-        let tokens: Vec<_> = segment.split_whitespace().collect();
+        // Discarding output streams cannot mutate anything; any other
+        // redirection target (a file) keeps the command approval-gated.
+        let tokens: Vec<_> = segment
+            .split_whitespace()
+            .filter(|token| {
+                !matches!(
+                    *token,
+                    "2>/dev/null" | "2>&1" | "1>/dev/null" | ">/dev/null"
+                )
+            })
+            .collect();
         if tokens.is_empty() {
             continue;
+        }
+        if tokens
+            .iter()
+            .any(|token| token.contains('>') || token.contains('<'))
+        {
+            return false;
         }
         let Some(program) = trusted_program_name(tokens[0]) else {
             return false;
         };
         let args = &tokens[1..];
+        // A bare version/help query against a trusted program cannot mutate.
+        if args.len() == 1 && matches!(args[0], "--version" | "-V" | "version" | "--help" | "-h") {
+            continue;
+        }
         let allowed = matches!(
             program.as_str(),
             "date"
@@ -1665,6 +1685,10 @@ fn is_read_only_command(command: &str) -> bool {
                 | "lspci"
                 | "getent"
                 | "sysctl"
+                | "command"
+                | "pip"
+                | "pip3"
+                | "pipx"
                 | "mount"
                 | "swapon"
                 | "systemctl"
@@ -1709,7 +1733,7 @@ fn trusted_program_name(token: &str) -> Option<String> {
     }
     if matches!(
         name.as_str(),
-        "pwd" | "type" | "printf" | "echo" | "test" | "true" | "false"
+        "pwd" | "type" | "printf" | "echo" | "test" | "true" | "false" | "command"
     ) {
         return Some(name);
     }
@@ -1744,6 +1768,14 @@ fn trusted_executable_directory(directory: Option<&Path>) -> bool {
 
 fn has_mutating_read_command_options(program: &str, args: &[&str]) -> bool {
     match program {
+        "command" => {
+            !(args.len() >= 2
+                && args[0] == "-v"
+                && args[1..].iter().all(|value| !value.starts_with('-')))
+        }
+        "pip" | "pip3" | "pipx" => {
+            !read_only_subcommand(args, &["list", "show", "check", "freeze"], false)
+        }
         "date" => args.iter().any(|value| {
             matches!(*value, "-s" | "--set")
                 || (value.starts_with("-s") && value.len() > 2)
@@ -2645,7 +2677,31 @@ mod tests {
         assert!(is_read_only_command("/usr/bin/apt-cache policy qin"));
         assert!(is_read_only_command("/usr/sbin/sysctl kernel.hostname"));
         assert!(is_read_only_command("/usr/bin/mount"));
+        assert!(is_read_only_command("date 2>/dev/null"));
+        assert!(is_read_only_command(
+            "which python3 python 2>/dev/null; command -v pip3 pip uv conda 2>/dev/null"
+        ));
         assert!(!is_read_only_command("date > now.txt"));
+        assert!(!is_read_only_command("date 2> errors.log"));
+        assert!(!is_read_only_command("date 2>/dev/null > now.txt"));
+        assert!(!is_read_only_command("command -v python3; touch created"));
+        assert!(!is_read_only_command("command python3"));
+        // Bare-name PATH resolution is environment-dependent, so the
+        // pip/command option gates are asserted directly.
+        assert!(!has_mutating_read_command_options(
+            "command",
+            &["-v", "python3"]
+        ));
+        assert!(has_mutating_read_command_options("command", &["python3"]));
+        assert!(!has_mutating_read_command_options("pip3", &["list"]));
+        assert!(!has_mutating_read_command_options(
+            "pip3",
+            &["show", "requests"]
+        ));
+        assert!(has_mutating_read_command_options(
+            "pip3",
+            &["install", "requests"]
+        ));
         assert!(!is_read_only_command("sudo date"));
         assert!(!is_read_only_command("printf x; touch created"));
         assert!(!is_read_only_command("date\ntouch created"));

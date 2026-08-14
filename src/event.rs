@@ -251,6 +251,12 @@ impl EventSink {
         self.stderr("warning", &format!("⚠ {message}"))
     }
 
+    /// A warning that belongs to the current tool/command invocation, so it
+    /// is indented under the phase line like tool and command events.
+    pub fn tool_warning(&self, message: &str) -> Result<()> {
+        self.stderr("tool_warning", &format!("⚠ {message}"))
+    }
+
     pub fn init_outcome(&self, outcome: &InitOutcome) -> Result<()> {
         if self.json {
             println!(
@@ -380,7 +386,7 @@ fn event_color(event: &str) -> Option<&'static str> {
         "tool_started" | "command_started" => "34",               // blue
         "tool_finished" | "command_finished" | "success" => "32", // green
         "tool_failed" | "command_failed" => "31",                 // red
-        "approval_required" | "warning" => "33",                  // yellow
+        "approval_required" | "warning" | "tool_warning" => "33", // yellow
         "command_heartbeat" => "2",                               // dim
         _ => return None,
     })
@@ -402,6 +408,7 @@ fn indented_event(event: &str) -> bool {
             | "command_finished"
             | "command_failed"
             | "approval_required"
+            | "tool_warning"
     )
 }
 
@@ -510,6 +517,7 @@ mod tests {
         assert_eq!(event_color("command_finished"), Some("32"));
         assert_eq!(event_color("tool_failed"), Some("31"));
         assert_eq!(event_color("approval_required"), Some("33"));
+        assert_eq!(event_color("tool_warning"), Some("33"));
         assert_eq!(event_color("command_heartbeat"), Some("2"));
         assert_eq!(event_color("command_output"), None);
     }
@@ -520,6 +528,7 @@ mod tests {
             "tool_started",
             "tool_finished",
             "tool_failed",
+            "tool_warning",
             "command_started",
             "command_output",
             "command_heartbeat",

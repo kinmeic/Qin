@@ -2,6 +2,11 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.4.1
+
+- Indented the "All subsequent shell commands are approved" notice so it aligns with the surrounding tool invocation events.
+- Improved read-only command recognition: harmless stream-discarding redirections (`2>/dev/null`, `2>&1`, `>/dev/null`) no longer force approval, single-argument `--version`/`-V`/`version`/`--help`/`-h` queries against trusted programs (such as `python3 --version`) run without a prompt, and `command -v` plus read-only `pip`/`pip3`/`pipx` subcommands (`list`, `show`, `check`, `freeze`) are now recognized. Redirects to files, arbitrary interpreter invocations, and package mutations still require approval.
+
 ## 0.4.0
 
 - Added release signing: CI signs `SHA256SUMS` with minisign and publishes `SHA256SUMS.minisig`; `qin update` verifies the signature against the embedded release public key before checking hashes and refuses unsigned or tampered releases outright.

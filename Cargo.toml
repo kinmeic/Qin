@@ -1,6 +1,6 @@
 [package]
 name = "qin"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Use natural language to operate Linux, macOS, and OpenWrt without memorizing commands or flags"
