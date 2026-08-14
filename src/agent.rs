@@ -70,6 +70,7 @@ pub struct RunOptions<'a> {
     pub source_path: Option<&'a Path>,
     pub assume_yes: bool,
     pub dry_run: bool,
+    pub agents_md: Option<&'a str>,
 }
 
 pub async fn execute(
@@ -116,6 +117,7 @@ pub async fn execute(
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
         };
         let runtime = runtime_context(options.source, options.source_path)?;
+        let system = system_prompt(options.agents_md);
         let remaining = remaining_time(config, started)?;
         summary_update = tokio::select! {
             result = tokio::time::timeout(
@@ -125,6 +127,7 @@ pub async fn execute(
                     &client,
                     &mut history,
                     &mut summary,
+                    &system,
                     &runtime,
                     &recalled,
                     prompt,
@@ -133,7 +136,14 @@ pub async fn execute(
             ) => result.context("The agent reached its total runtime limit while compacting history")??,
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
         };
-        let mut messages = compose_messages(&summary, &history, &runtime, &recalled, prompt);
+        let mut messages = compose_messages(
+            &system,
+            &summary,
+            &history,
+            &runtime,
+            &recalled,
+            prompt,
+        );
         run_loop(
             config,
             &client,
@@ -251,6 +261,7 @@ async fn run_loop(
                 events,
                 store,
                 session_id,
+                tool_call_id: &call.id,
                 cwd,
                 assume_yes: options.assume_yes,
                 approve_all_commands: &mut approve_all_commands,
@@ -578,12 +589,13 @@ async fn compact_persisted_history(
     client: &reqwest::Client,
     history: &mut Vec<ContextMessage>,
     summary: &mut String,
+    system: &str,
     runtime: &str,
     recalled: &str,
     prompt: &str,
     schemas: &[Value],
 ) -> Result<Option<SummaryUpdate>> {
-    let provisional = compose_messages(summary, history, runtime, recalled, prompt);
+    let provisional = compose_messages(system, summary, history, runtime, recalled, prompt);
     let budget = context_budget(config)?;
     let estimated = estimate_messages(&provisional) + estimate_schemas(schemas);
     if estimated as f64 <= budget as f64 * config.context.compact_trigger_ratio
@@ -593,8 +605,14 @@ async fn compact_persisted_history(
     }
 
     let summary_model = config.summary_model()?;
-    let fixed = estimate_messages(&compose_messages("", &[], runtime, recalled, prompt))
-        + estimate_schemas(schemas);
+    let fixed = estimate_messages(&compose_messages(
+        system,
+        "",
+        &[],
+        runtime,
+        recalled,
+        prompt,
+    )) + estimate_schemas(schemas);
     let target = (budget as f64 * COMPACT_TARGET_RATIO) as u64;
     let summary_allowance = summary_model.max_output_tokens.min(target / 4).max(256);
     let available = target.saturating_sub(fixed + summary_allowance);
@@ -727,14 +745,24 @@ fn fallback_summary(source: &str, max_tokens: usize) -> String {
         .collect()
 }
 
+fn system_prompt(agents_md: Option<&str>) -> String {
+    match agents_md {
+        Some(instructions) => format!(
+            "{SYSTEM_PROMPT}\n\n<project_instructions source=\"AGENTS.md\">\n{instructions}\n</project_instructions>"
+        ),
+        None => SYSTEM_PROMPT.to_string(),
+    }
+}
+
 fn compose_messages(
+    system: &str,
     summary: &str,
     history: &[ContextMessage],
     runtime: &str,
     recalled: &str,
     prompt: &str,
 ) -> Vec<Message> {
-    let mut messages = vec![Message::system(SYSTEM_PROMPT)];
+    let mut messages = vec![Message::system(system)];
     if !summary.is_empty() {
         messages.push(Message::user(&format!(
             "<untrusted_session_summary>\n{summary}\n</untrusted_session_summary>"
@@ -1201,6 +1229,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
                 source_path: None,
                 assume_yes: true,
                 dry_run: false,
+                agents_md: None,
             },
         )
         .await

@@ -1,4 +1,6 @@
 mod agent;
+mod agents_md;
+mod checkpoint;
 mod cli;
 mod config;
 mod event;
@@ -124,6 +126,7 @@ async fn run() -> Result<()> {
             let id = store.new_session(&cwd, title.as_deref())?;
             events.success(&format!("Created and switched to a new session: {id}"))?;
             if !prompt.is_empty() {
+                let agents_md = load_agents_md(&resolver, &config, &events);
                 execute_with(
                     &config,
                     &mut store,
@@ -131,6 +134,7 @@ async fn run() -> Result<()> {
                     prompt.join(" "),
                     "cli",
                     None,
+                    agents_md.as_deref(),
                     &events,
                     assume_yes,
                     dry_run,
@@ -191,6 +195,66 @@ async fn run() -> Result<()> {
             }
         }
         Command::Memory { command } => handle_memory(command, &explicit_config, &events).await?,
+        Command::Checkpoints => {
+            let (config, _, store) = open(&explicit_config, &events)?;
+            if !store.checkpoints_supported() {
+                events.success(
+                    "Checkpoints require the SQLite storage backend (storage.enabled = true)",
+                )?;
+            } else if !config.checkpoints.enabled {
+                events.success("Checkpoints are disabled (checkpoints.enabled = false)")?;
+            } else {
+                let checkpoints = store.list_checkpoints(20)?;
+                if checkpoints.is_empty() {
+                    events.success("No checkpoints recorded yet")?;
+                }
+                for info in checkpoints {
+                    let paths = info
+                        .paths
+                        .iter()
+                        .map(|path| terminal(path))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!(
+                        "{}{} {}  {}  {}",
+                        if info.restored { "(restored) " } else { "" },
+                        short_id(&info.id),
+                        info.created_at,
+                        terminal(&info.tool),
+                        paths
+                    );
+                }
+            }
+        }
+        Command::Undo { checkpoint_id } => {
+            let (_, _, store) = open(&explicit_config, &events)?;
+            if !store.checkpoints_supported() {
+                bail!("Checkpoints require the SQLite storage backend (storage.enabled = true)");
+            }
+            let id = match checkpoint_id {
+                Some(value) => store.resolve_checkpoint_id(&value)?,
+                None => store
+                    .latest_checkpoint_id()?
+                    .context("There are no checkpoints to undo")?,
+            };
+            if store.checkpoint_restored(&id)? {
+                bail!("Checkpoint {} has already been restored", short_id(&id));
+            }
+            let steps = checkpoint::plan_undo(&store, &id)?;
+            println!("Checkpoint {} will:", short_id(&id));
+            for step in &steps {
+                println!("  - {}", terminal(&step.description));
+            }
+            if dry_run {
+                events.success("Dry run: no files were restored")?;
+            } else {
+                confirm_undo(&events, assume_yes)?;
+                for outcome in checkpoint::execute_undo(&store, &id)? {
+                    println!("{}", terminal(&outcome));
+                }
+                events.success(&format!("Restored checkpoint {}", short_id(&id)))?;
+            }
+        }
         Command::Knowledge { command } => {
             handle_knowledge(command, &explicit_config, &events).await?
         }
@@ -210,7 +274,27 @@ async fn run() -> Result<()> {
             }
         }
         Command::Doctor => doctor(&explicit_config, &events)?,
-        Command::Update { internal_delegated } => {
+        Command::Update {
+            internal_delegated,
+            rollback,
+        } => {
+            if rollback {
+                let outcome = update::rollback(dry_run, internal_delegated).await?;
+                let message = match outcome {
+                    update::RollbackOutcome::RolledBack { executable } => format!(
+                        "qin was rolled back to the previous version; executable: {} (backup kept at {}; delete it when satisfied)",
+                        executable.display(),
+                        update::backup_path(&executable).display()
+                    ),
+                    update::RollbackOutcome::DryRun { executable } => format!(
+                        "Dry run: qin would restore the previous executable over {}",
+                        executable.display()
+                    ),
+                    update::RollbackOutcome::Delegated => return Ok(()),
+                };
+                events.success(&message)?;
+                return Ok(());
+            }
             let outcome = update::run(dry_run, internal_delegated).await?;
             let message = match outcome {
                 UpdateOutcome::UpToDate {
@@ -286,12 +370,13 @@ async fn execute_from_file(
     yes: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let (config, _resolver, mut store) = open(explicit, events)?;
+    let (config, resolver, mut store) = open(explicit, events)?;
     events.tool_started("read_prompt_file", &format!("path={}", path.display()))?;
     let loaded = prompt_file::load(path, &config.input)
         .with_context(|| format!("Unable to load prompt file {}", path.display()))?;
     events.prompt_file_loaded(&loaded)?;
     let id = store.ensure_current_session(&std::env::current_dir()?)?;
+    let agents_md = load_agents_md(&resolver, &config, events);
     execute_with(
         &config,
         &mut store,
@@ -299,6 +384,7 @@ async fn execute_from_file(
         loaded.content,
         "file",
         Some(loaded.canonical_path),
+        agents_md.as_deref(),
         events,
         yes,
         dry_run,
@@ -315,12 +401,40 @@ async fn execute_prompt(
     yes: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let (config, _resolver, mut store) = open(explicit, events)?;
+    let (config, resolver, mut store) = open(explicit, events)?;
     let id = store.ensure_current_session(&std::env::current_dir()?)?;
+    let agents_md = load_agents_md(&resolver, &config, events);
     execute_with(
-        &config, &mut store, &id, prompt, source, path, events, yes, dry_run,
+        &config,
+        &mut store,
+        &id,
+        prompt,
+        source,
+        path,
+        agents_md.as_deref(),
+        events,
+        yes,
+        dry_run,
     )
     .await
+}
+
+fn load_agents_md(
+    resolver: &ConfigPathResolver,
+    config: &config::Config,
+    events: &EventSink,
+) -> Option<String> {
+    match agents_md::load(resolver.config_path(), config.input.agents_md_max_bytes) {
+        Ok(Some(loaded)) => Some(loaded.content),
+        Ok(None) => None,
+        Err(error) => {
+            let _ = events.warning(&format!(
+                "Ignoring AGENTS.md: {}",
+                event::redact(&format!("{error:#}"))
+            ));
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -331,6 +445,7 @@ async fn execute_with(
     prompt: String,
     source: &str,
     path: Option<PathBuf>,
+    agents_md: Option<&str>,
     events: &EventSink,
     yes: bool,
     dry_run: bool,
@@ -347,6 +462,7 @@ async fn execute_with(
             source_path: path.as_deref(),
             assume_yes: yes,
             dry_run,
+            agents_md,
         },
     )
     .await?;
@@ -456,6 +572,24 @@ fn doctor(explicit: &Option<PathBuf>, events: &EventSink) -> Result<()> {
     );
     println!("Session backend: {}", terminal(store.backend_label()));
     println!("Model: {}", terminal(&config.primary_model()?.model));
+    match agents_md::load(resolver.config_path(), config.input.agents_md_max_bytes) {
+        Ok(Some(loaded)) => println!(
+            "Project instructions: {} ({} bytes)",
+            terminal(&loaded.path.display().to_string()),
+            loaded.byte_len
+        ),
+        Ok(None) => println!(
+            "Project instructions: none (create {} beside the configuration file to enable)",
+            agents_md::AGENTS_MD_FILE_NAME
+        ),
+        Err(error) => println!(
+            "Project instructions: {}",
+            terminal(&format!(
+                "unusable ({})",
+                event::redact(&format!("{error:#}"))
+            ))
+        ),
+    }
     if config.embeddings_active() {
         println!(
             "Embedding: {} ({} dimensions, {})",
@@ -487,6 +621,23 @@ fn short_id(id: &str) -> &str {
 
 fn terminal(value: &str) -> String {
     event::sanitize_terminal(value)
+}
+
+fn confirm_undo(events: &EventSink, assume_yes: bool) -> Result<()> {
+    if assume_yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!("Restoring a checkpoint requires an interactive confirmation or --yes");
+    }
+    events.approval_prompt("Restore these files now? [y/N] ")?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        bail!("The checkpoint restore was declined by the user")
+    }
 }
 
 fn confirm_session_delete(events: &EventSink, id: &str, assume_yes: bool) -> Result<()> {

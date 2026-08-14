@@ -16,3 +16,13 @@ Please do not open a public issue for an unpatched vulnerability. Use GitHub's p
 - Use `--dry-run` to inspect a plan without running commands or modifying files.
 
 If you require stronger isolation, run `qin` inside a dedicated container, virtual machine, restricted user account, or operating-system sandbox with only the necessary directories mounted.
+
+## Release supply chain
+
+Tagged releases are built on GitHub Actions with SHA-pinned actions and `cargo --locked` builds, and are published with three independent integrity layers:
+
+- **Signatures**: `SHA256SUMS` is signed with minisign (`SHA256SUMS.minisig`). The signing secret key and its password live only in CI secrets; the public key is embedded in the qin binary, and `qin update` refuses any release whose signature is missing or invalid before it even checks hashes.
+- **Provenance**: every release asset carries a GitHub build-provenance attestation (SLSA), verifiable with `gh attestation verify <asset> --repo kinmeic/Qin`.
+- **SBOM**: a CycloneDX SBOM (`qin-v<version>-sbom.cdx.json`) is attached to each release for dependency auditing.
+
+Manual downloads should verify `SHA256SUMS.minisig` with the published public key, then check the archive hash. `qin update` additionally saves the previous executable as `qin.previous` and can restore it with `qin update --rollback`.

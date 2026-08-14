@@ -4,3 +4,7 @@
 *.db-wal
 .DS_Store
 
+
+# Local release signing keys (never commit)
+qin-release.key
+qin-release.pub

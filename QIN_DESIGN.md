@@ -1087,5 +1087,8 @@ OpenWrt 包应安装：
 - 推荐普通用户运行和单次操作按需提权；`sudo qin` 是兼容入口，不是首选工作流。
 - 动态主机信息放在每轮 runtime context，不改变静态系统提示词前缀。
 - 历史全部持久化，但只把预算允许的摘要和最近消息送给模型。
+- 配置文件同目录下手工创建的 `AGENTS.md` 作为 `<project_instructions>` 追加到系统提示词；qin 永不自动创建该文件，符号链接被拒绝，大小受 `input.agents_md_max_bytes` 限制。
+- 强类型文件工具在变更前写入检查点快照（SQLite 元数据 + 数据目录 payload），`qin undo` 逆序恢复；shell 命令影响面不可预知，不做快照，继续依赖审批与回收站。
+- 发布物供应链：CI 用 minisign 签名 SHA256SUMS，公钥内嵌二进制，`qin update` 先验签后验哈希、缺签即拒；所有资产附 GitHub build-provenance attestation 与 CycloneDX SBOM；更新前保留 `qin.previous` 备份，`qin update --rollback` 原子恢复。
 
 这套边界可以让 `qin` 先成为一个小而可靠的命令行 Agent，同时保留未来增加 Skills、MCP 和更复杂自动化能力的空间。

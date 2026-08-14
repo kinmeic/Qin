@@ -244,6 +244,7 @@ pub struct Config {
     pub embeddings: EmbeddingConfig,
     pub knowledge: KnowledgeConfig,
     pub permissions: PermissionsConfig,
+    pub checkpoints: CheckpointsConfig,
     pub search: SearchConfig,
     pub ui: UiConfig,
 }
@@ -261,6 +262,7 @@ impl Default for Config {
             embeddings: EmbeddingConfig::default(),
             knowledge: KnowledgeConfig::default(),
             permissions: PermissionsConfig::default(),
+            checkpoints: CheckpointsConfig::default(),
             search: SearchConfig::default(),
             ui: UiConfig::default(),
         }
@@ -333,6 +335,7 @@ impl ModelConfig {
 #[serde(default)]
 pub struct InputConfig {
     pub fromfile_max_bytes: u64,
+    pub agents_md_max_bytes: u64,
     pub allow_utf8_bom: bool,
     pub reject_nul: bool,
 }
@@ -341,6 +344,7 @@ impl Default for InputConfig {
     fn default() -> Self {
         Self {
             fromfile_max_bytes: 1_048_576,
+            agents_md_max_bytes: 262_144,
             allow_utf8_bom: true,
             reject_nul: true,
         }
@@ -605,6 +609,24 @@ impl Default for PermissionsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CheckpointsConfig {
+    pub enabled: bool,
+    pub max_file_bytes: u64,
+    pub keep: u32,
+}
+
+impl Default for CheckpointsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_file_bytes: 10_485_760,
+            keep: 20,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct SearchProviderConfig {
@@ -786,6 +808,17 @@ impl Config {
         }
         if self.input.fromfile_max_bytes == 0 || self.input.fromfile_max_bytes > 64 * 1024 * 1024 {
             bail!("input.fromfile_max_bytes must be between 1 byte and 64 MiB");
+        }
+        if self.input.agents_md_max_bytes == 0 || self.input.agents_md_max_bytes > 4 * 1024 * 1024 {
+            bail!("input.agents_md_max_bytes must be between 1 byte and 4 MiB");
+        }
+        if self.checkpoints.max_file_bytes == 0
+            || self.checkpoints.max_file_bytes > 256 * 1024 * 1024
+        {
+            bail!("checkpoints.max_file_bytes must be between 1 byte and 256 MiB");
+        }
+        if !(1..=500).contains(&self.checkpoints.keep) {
+            bail!("checkpoints.keep must be between 1 and 500");
         }
         if !(COMPACT_TARGET_RATIO..1.0).contains(&self.context.compact_trigger_ratio) {
             bail!(

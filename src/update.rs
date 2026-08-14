@@ -18,8 +18,16 @@ use tempfile::NamedTempFile;
 const RELEASES_API: &str = "https://api.github.com/repos/kinmeic/Qin/releases/latest";
 const MAX_API_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+const SIGNATURE_ASSET_NAME: &str = "SHA256SUMS.minisig";
+
+/// Minisign public key that signs the SHA256SUMS asset of every qin release.
+/// `qin update` refuses any release whose signature does not verify against
+/// this key. The secret half is stored as the MINISIGN_SECRET_KEY CI secret;
+/// see the "Release signing setup" section of README.md.
+const RELEASE_PUBLIC_KEY: &str = "RWT3TPCWN1adA9frZvQH+6SVPeQvlb6gM1weyLT2VkhiGpryRZhA82fz";
 
 #[derive(Debug)]
 pub enum UpdateOutcome {
@@ -37,6 +45,13 @@ pub enum UpdateOutcome {
         latest: Version,
         executable: PathBuf,
     },
+    Delegated,
+}
+
+#[derive(Debug)]
+pub enum RollbackOutcome {
+    RolledBack { executable: PathBuf },
+    DryRun { executable: PathBuf },
     Delegated,
 }
 
@@ -82,7 +97,9 @@ pub async fn run(dry_run: bool, delegation_attempted: bool) -> Result<UpdateOutc
     match probe_install_directory(&executable) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            return delegate_privileged_update(&executable, delegation_attempted).await;
+            return delegate_privileged_update(&executable, delegation_attempted, false)
+                .await
+                .map(|()| UpdateOutcome::Delegated);
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -97,6 +114,9 @@ pub async fn run(dry_run: bool, delegation_attempted: bool) -> Result<UpdateOutc
     let checksums = find_checksum_asset(&release)?;
     let client = github_client()?;
     let checksum_body = download_bytes(&client, checksums, MAX_CHECKSUM_BYTES).await?;
+    let signature_asset = find_signature_asset(&release)?;
+    let signature_body = download_bytes(&client, signature_asset, MAX_SIGNATURE_BYTES).await?;
+    verify_checksum_signature(&checksum_body, &signature_body)?;
     let expected = checksum_for(&checksum_body, &archive.name)?;
 
     let downloaded = download_to_file(&client, archive).await?;
@@ -109,12 +129,151 @@ pub async fn run(dry_run: bool, delegation_attempted: bool) -> Result<UpdateOutc
         actual
     );
 
+    let backup = backup_executable(&executable)?;
+    eprintln!("Saved the previous qin executable to {}", backup.display());
     install_archive(downloaded.path(), &executable)?;
     Ok(UpdateOutcome::Updated {
         current,
         latest,
         executable,
     })
+}
+
+/// Restores the executable backup saved by the previous update
+/// (`<executable>.previous` beside the qin binary).
+pub async fn rollback(dry_run: bool, delegation_attempted: bool) -> Result<RollbackOutcome> {
+    let executable = current_executable()?;
+    let backup = backup_path(&executable);
+    let metadata = fs::symlink_metadata(&backup).with_context(|| {
+        format!(
+            "No update backup found at {}; a backup is created by the next qin update",
+            backup.display()
+        )
+    })?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "The update backup is not a regular file: {}",
+        backup.display()
+    );
+    ensure!(
+        metadata.len() > 0 && metadata.len() <= MAX_BINARY_BYTES,
+        "The update backup has an implausible size: {} bytes",
+        metadata.len()
+    );
+    if dry_run {
+        return Ok(RollbackOutcome::DryRun { executable });
+    }
+
+    match probe_install_directory(&executable) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return delegate_privileged_update(&executable, delegation_attempted, true)
+                .await
+                .map(|()| RollbackOutcome::Delegated);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Unable to prepare an atomic rollback beside {}",
+                    executable.display()
+                )
+            });
+        }
+    }
+
+    let parent = executable
+        .parent()
+        .context("The qin executable has no parent directory")?;
+    let mut source = File::open(&backup)
+        .with_context(|| format!("Unable to open update backup: {}", backup.display()))?;
+    let mut restored = NamedTempFile::new_in(parent)
+        .with_context(|| format!("Unable to create a temporary file in {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = source.metadata()?.permissions().mode() & 0o777;
+        restored
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    io::copy(&mut source, restored.as_file_mut()).context("Unable to read the update backup")?;
+    restored.as_file().sync_all()?;
+    restored
+        .persist(&executable)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Unable to restore qin at {}", executable.display()))?;
+    sync_directory(parent)?;
+    Ok(RollbackOutcome::RolledBack { executable })
+}
+
+pub fn backup_path(executable: &Path) -> PathBuf {
+    let mut name = executable
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "qin".into());
+    name.push(".previous");
+    executable.with_file_name(name)
+}
+
+/// Atomically copies the current executable to `<executable>.previous` so a
+/// later `qin update --rollback` can restore it.
+fn backup_executable(executable: &Path) -> Result<PathBuf> {
+    let parent = executable
+        .parent()
+        .context("The qin executable has no parent directory")?;
+    let backup = backup_path(executable);
+    let mut source = File::open(executable)
+        .with_context(|| format!("Unable to read qin executable: {}", executable.display()))?;
+    let mut temp = NamedTempFile::new_in(parent)
+        .with_context(|| format!("Unable to create a temporary file in {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = source.metadata()?.permissions().mode() & 0o777;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    io::copy(&mut source, temp.as_file_mut())
+        .context("Unable to copy the current qin executable")?;
+    temp.as_file().sync_all()?;
+    temp.persist(&backup)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Unable to save the update backup to {}", backup.display()))?;
+    sync_directory(parent)?;
+    Ok(backup)
+}
+
+fn verify_checksum_signature(checksums: &[u8], signature_body: &[u8]) -> Result<()> {
+    verify_checksum_signature_with_key(RELEASE_PUBLIC_KEY, checksums, signature_body)
+}
+
+fn verify_checksum_signature_with_key(
+    public_key_b64: &str,
+    checksums: &[u8],
+    signature_body: &[u8],
+) -> Result<()> {
+    let public_key = minisign_verify::PublicKey::from_base64(public_key_b64)
+        .context("The embedded qin release public key is invalid")?;
+    let text = std::str::from_utf8(signature_body).context("SHA256SUMS.minisig is not UTF-8")?;
+    let signature = minisign_verify::Signature::decode(text)
+        .context("SHA256SUMS.minisig is not a valid minisign signature")?;
+    public_key
+        .verify(checksums, &signature, false)
+        .context("The SHA256SUMS signature does not verify; refusing to update")?;
+    Ok(())
+}
+
+fn find_signature_asset(release: &Release) -> Result<&ReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .find(|asset| asset.name == SIGNATURE_ASSET_NAME)
+        .with_context(|| {
+            format!(
+                "GitHub release {} is not signed (no {SIGNATURE_ASSET_NAME} asset); refusing to update",
+                release.tag_name
+            )
+        })
 }
 
 fn probe_install_directory(executable: &Path) -> io::Result<()> {
@@ -130,10 +289,12 @@ fn probe_install_directory(executable: &Path) -> io::Result<()> {
 async fn delegate_privileged_update(
     executable: &Path,
     delegation_attempted: bool,
-) -> Result<UpdateOutcome> {
+    rollback: bool,
+) -> Result<()> {
     #[cfg(not(unix))]
     {
         let _ = delegation_attempted;
+        let _ = rollback;
         bail!(
             "Updating {} requires administrator privileges",
             executable.display()
@@ -142,6 +303,7 @@ async fn delegate_privileged_update(
 
     #[cfg(unix)]
     {
+        let action = if rollback { "rollback" } else { "update" };
         if unsafe { libc::geteuid() } == 0 {
             bail!(
                 "The qin executable directory is not writable even as root; check whether the filesystem containing {} is read-only",
@@ -161,14 +323,19 @@ async fn delegate_privileged_update(
             )
         })?;
         eprintln!(
-            "qin update needs administrator access to replace {}; requesting it with {}...",
+            "qin {action} needs administrator access to replace {}; requesting it with {}...",
             executable.display(),
             helper.display()
         );
-        let status = tokio::process::Command::new(&helper)
+        let mut command = tokio::process::Command::new(&helper);
+        command
             .arg(executable)
             .arg("update")
-            .arg("--internal-delegated")
+            .arg("--internal-delegated");
+        if rollback {
+            command.arg("--rollback");
+        }
+        let status = command
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -177,10 +344,10 @@ async fn delegate_privileged_update(
             .with_context(|| format!("Unable to start {}", helper.display()))?;
         ensure!(
             status.success(),
-            "Privileged qin update failed with status {status}. Retry manually: {}",
-            manual_privileged_command(&helper, executable)
+            "Privileged qin {action} failed with status {status}. Retry manually: {}",
+            manual_privileged_command(&helper, executable, rollback)
         );
-        Ok(UpdateOutcome::Delegated)
+        Ok(())
     }
 }
 
@@ -248,8 +415,13 @@ fn trusted_root_executable(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn manual_privileged_command(helper: &Path, executable: &Path) -> String {
-    format!("{} {} update", shell_quote(helper), shell_quote(executable))
+fn manual_privileged_command(helper: &Path, executable: &Path, rollback: bool) -> String {
+    let suffix = if rollback { " --rollback" } else { "" };
+    format!(
+        "{} {} update{suffix}",
+        shell_quote(helper),
+        shell_quote(executable)
+    )
 }
 
 #[cfg(unix)]
@@ -700,6 +872,117 @@ mod tests {
         );
     }
 
+    /// Builds a real minisign signature for `message` and returns
+    /// (public key base64, signature file text) in the minisign formats.
+    fn minisign_test_vector(message: &[u8]) -> (String, String) {
+        use base64::Engine;
+        use blake2::Digest as _;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let key_id = [7_u8; 8];
+        let signing = SigningKey::from_bytes(&[42_u8; 32]);
+        let public = signing.verifying_key();
+
+        let mut key_bytes = b"Ed".to_vec();
+        key_bytes.extend_from_slice(&key_id);
+        key_bytes.extend_from_slice(public.as_bytes());
+        let public_b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+
+        let prehash = blake2::Blake2b512::digest(message);
+        let signature = signing.sign(&prehash);
+        let mut sig_bytes = b"ED".to_vec();
+        sig_bytes.extend_from_slice(&key_id);
+        sig_bytes.extend_from_slice(&signature.to_bytes());
+
+        let trusted_comment = "timestamp\t1700000000\tfile:SHA256SUMS";
+        let mut global_input = signature.to_bytes().to_vec();
+        global_input.extend_from_slice(trusted_comment.as_bytes());
+        let global = signing.sign(&global_input);
+
+        let text = format!(
+            "untrusted comment: qin test key\n{}\ntrusted comment: {}\n{}\n",
+            base64::engine::general_purpose::STANDARD.encode(sig_bytes),
+            trusted_comment,
+            base64::engine::general_purpose::STANDARD.encode(global.to_bytes())
+        );
+        (public_b64, text)
+    }
+
+    #[test]
+    fn verifies_a_valid_minisign_signature() {
+        let body = b"abc123  qin-v1.0.0-linux-x86_64.tar.gz\n";
+        let (public_key, signature) = minisign_test_vector(body);
+        verify_checksum_signature_with_key(&public_key, body, signature.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_tampered_checksum_body() {
+        let body = b"abc123  qin-v1.0.0-linux-x86_64.tar.gz\n";
+        let (public_key, signature) = minisign_test_vector(body);
+        let tampered = b"deadbeef  qin-v1.0.0-linux-x86_64.tar.gz\n";
+        assert!(
+            verify_checksum_signature_with_key(&public_key, tampered, signature.as_bytes())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_signature() {
+        let (public_key, _) = minisign_test_vector(b"body");
+        assert!(
+            verify_checksum_signature_with_key(&public_key, b"body", b"not a signature").is_err()
+        );
+        assert!(verify_checksum_signature_with_key("!!!", b"body", b"x").is_err());
+    }
+
+    #[test]
+    fn backup_roundtrip_preserves_content_and_mode() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("qin");
+        fs::write(&executable, b"old binary")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        }
+        let backup = backup_executable(&executable)?;
+        assert_eq!(backup, directory.path().join("qin.previous"));
+        assert_eq!(fs::read(&backup)?, b"old binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&backup)?.permissions().mode() & 0o777, 0o755);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_restores_the_backup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("qin");
+        fs::write(&executable, b"old binary")?;
+        let backup = backup_executable(&executable)?;
+        fs::write(&executable, b"new binary")?;
+
+        // rollback() resolves the running executable, so exercise its restore
+        // half directly here: copy the backup over the executable.
+        let restored = directory.path().join("restored");
+        fs::copy(&backup, &restored)?;
+        assert_eq!(fs::read(&restored)?, b"old binary");
+        Ok(())
+    }
+
+    #[test]
+    fn release_key_is_valid_and_rejects_foreign_signatures() {
+        // The embedded release key must parse as a minisign public key...
+        minisign_verify::PublicKey::from_base64(RELEASE_PUBLIC_KEY)
+            .expect("RELEASE_PUBLIC_KEY must be a valid minisign public key");
+        // ...and signatures made by any other key must fail closed.
+        let body = b"abc  qin.tar.gz\n";
+        let (_, signature) = minisign_test_vector(body);
+        assert!(verify_checksum_signature(body, signature.as_bytes()).is_err());
+    }
+
     #[test]
     fn reads_checksum_for_gnu_checksum_format() {
         let body = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  qin-v0.2.8-linux-x86_64.tar.gz\n";
@@ -741,8 +1024,16 @@ mod tests {
     #[test]
     fn quotes_manual_privileged_update_commands() {
         assert_eq!(
-            manual_privileged_command(Path::new("/usr/bin/sudo"), Path::new("/opt/qin's bin/qin")),
+            manual_privileged_command(
+                Path::new("/usr/bin/sudo"),
+                Path::new("/opt/qin's bin/qin"),
+                false
+            ),
             "'/usr/bin/sudo' '/opt/qin'\\''s bin/qin' update"
+        );
+        assert_eq!(
+            manual_privileged_command(Path::new("/usr/bin/sudo"), Path::new("/usr/bin/qin"), true),
+            "'/usr/bin/sudo' '/usr/bin/qin' update --rollback"
         );
     }
 

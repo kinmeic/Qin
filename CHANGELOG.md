@@ -2,6 +2,14 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.4.0
+
+- Added release signing: CI signs `SHA256SUMS` with minisign and publishes `SHA256SUMS.minisig`; `qin update` verifies the signature against the embedded release public key before checking hashes and refuses unsigned or tampered releases outright.
+- Added GitHub build-provenance attestations (SLSA) for every release asset and a CycloneDX SBOM (`qin-v<version>-sbom.cdx.json`) attached to each release.
+- Added update rollback: `qin update` saves the previous executable as `qin.previous` and `qin update --rollback` restores it atomically, with the same trusted sudo/doas delegation for protected installations.
+- Added file checkpoints and `qin undo`: typed file tools snapshot affected files before mutating them, `qin checkpoints` lists recent checkpoints, and `qin undo [ID]` restores overwritten content, removes created files, renames moved paths back, and recovers deleted files from snapshots or the trash directory after confirmation. Configurable via `[checkpoints]` (`enabled`, `max_file_bytes`, `keep`); requires the SQLite storage backend and does not track shell commands.
+- Added AGENTS.md support: a hand-created, non-empty `AGENTS.md` beside the active configuration file is injected into the system prompt as project instructions (symlink-free, size-capped by `input.agents_md_max_bytes`, never auto-created); `qin doctor` reports whether it was loaded.
+
 ## 0.3.0
 
 - Fixed `qin update` for protected system installations by detecting unwritable executable directories before downloading and safely delegating only the update command to a trusted `sudo` or `doas` executable.

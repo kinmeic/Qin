@@ -33,6 +33,26 @@ pub struct SessionInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct CheckpointInfo {
+    pub id: String,
+    pub tool: String,
+    pub created_at: String,
+    pub restored: bool,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointEntryRow {
+    pub seq: i64,
+    pub path: String,
+    pub kind: String,
+    pub related_path: Option<String>,
+    pub existed_before: bool,
+    pub snapshot_file: Option<String>,
+    pub original_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct KnowledgeRow {
     pub id: String,
     pub kind: String,
@@ -78,6 +98,7 @@ pub struct StateStore {
     database_owner_uid: Option<u32>,
     pending_audits: Vec<PendingAudit>,
     notice: Option<String>,
+    checkpoints_dir: Option<PathBuf>,
 }
 
 enum Backend {
@@ -380,6 +401,7 @@ impl StateStore {
             database_owner_uid: None,
             pending_audits: Vec::new(),
             notice: None,
+            checkpoints_dir: None,
         })
     }
 
@@ -447,6 +469,7 @@ impl StateStore {
             database_owner_uid: None,
             pending_audits: Vec::new(),
             notice: None,
+            checkpoints_dir: None,
         })
     }
 
@@ -500,6 +523,7 @@ impl StateStore {
             database_owner_uid: resolver.owner_uid(),
             pending_audits: Vec::new(),
             notice: None,
+            checkpoints_dir: Some(canonical_parent.join("checkpoints")),
         };
         store.migrate()?;
         store.secure_database_files()?;
@@ -708,6 +732,35 @@ impl StateStore {
             transaction.execute("INSERT INTO schema_migrations(version) VALUES (2)", [])?;
             transaction.commit()?;
         }
+        if version < 3 {
+            let transaction = self.connection_mut().transaction()?;
+            transaction.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    restored INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_checkpoints_created ON checkpoints(created_at);
+                CREATE TABLE IF NOT EXISTS checkpoint_entries (
+                    checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    related_path TEXT,
+                    existed_before INTEGER NOT NULL,
+                    snapshot_file TEXT,
+                    original_sha256 TEXT,
+                    PRIMARY KEY (checkpoint_id, seq)
+                );
+                "#,
+            )?;
+            transaction.execute("INSERT INTO schema_migrations(version) VALUES (3)", [])?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -813,6 +866,178 @@ impl StateStore {
         }
     }
 
+    pub fn checkpoints_dir(&self) -> Option<&Path> {
+        self.checkpoints_dir.as_deref()
+    }
+
+    /// Checkpoint metadata lives in SQLite; the lightweight memory backends
+    /// (tmpfs JSON / Redis) do not support checkpoints.
+    pub fn checkpoints_supported(&self) -> bool {
+        !matches!(self.backend, Backend::Memory(_))
+    }
+
+    pub fn insert_checkpoint(
+        &self,
+        id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        tool: &str,
+    ) -> Result<()> {
+        if !self.checkpoints_supported() {
+            return Ok(());
+        }
+        self.connection().execute(
+            "INSERT INTO checkpoints(id,session_id,tool_call_id,tool) VALUES (?1,?2,?3,?4)",
+            params![id, session_id, tool_call_id, tool],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_checkpoint_entry(
+        &self,
+        checkpoint_id: &str,
+        entry: &CheckpointEntryRow,
+    ) -> Result<()> {
+        if !self.checkpoints_supported() {
+            return Ok(());
+        }
+        self.connection().execute(
+            "INSERT INTO checkpoint_entries(checkpoint_id,seq,path,kind,related_path,existed_before,snapshot_file,original_sha256) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                checkpoint_id,
+                entry.seq,
+                entry.path,
+                entry.kind,
+                entry.related_path,
+                entry.existed_before as i64,
+                entry.snapshot_file,
+                entry.original_sha256
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn checkpoint_entries(&self, checkpoint_id: &str) -> Result<Vec<CheckpointEntryRow>> {
+        let mut statement = self.connection().prepare(
+            "SELECT seq,path,kind,related_path,existed_before,snapshot_file,original_sha256 FROM checkpoint_entries WHERE checkpoint_id=?1 ORDER BY seq",
+        )?;
+        let rows = statement.query_map([checkpoint_id], |row| {
+            Ok(CheckpointEntryRow {
+                seq: row.get(0)?,
+                path: row.get(1)?,
+                kind: row.get(2)?,
+                related_path: row.get(3)?,
+                existed_before: row.get::<_, i64>(4)? != 0,
+                snapshot_file: row.get(5)?,
+                original_sha256: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn list_checkpoints(&self, limit: usize) -> Result<Vec<CheckpointInfo>> {
+        if !self.checkpoints_supported() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection().prepare(
+            "SELECT id,tool,created_at,restored FROM checkpoints ORDER BY rowid DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        let mut infos = Vec::new();
+        for row in rows {
+            let (id, tool, created_at, restored) = row?;
+            let entries = self.checkpoint_entries(&id)?;
+            infos.push(CheckpointInfo {
+                id,
+                tool,
+                created_at,
+                restored,
+                paths: entries.into_iter().map(|entry| entry.path).collect(),
+            });
+        }
+        Ok(infos)
+    }
+
+    pub fn latest_checkpoint_id(&self) -> Result<Option<String>> {
+        if !self.checkpoints_supported() {
+            return Ok(None);
+        }
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT id FROM checkpoints WHERE restored=0 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn resolve_checkpoint_id(&self, id_or_prefix: &str) -> Result<String> {
+        let like = format!("{id_or_prefix}%");
+        let mut statement = self
+            .connection()
+            .prepare("SELECT id FROM checkpoints WHERE id LIKE ?1")?;
+        let ids = statement.query_map([like], |row| row.get::<_, String>(0))?;
+        let ids = ids.collect::<rusqlite::Result<Vec<_>>>()?;
+        match ids.as_slice() {
+            [] => bail!("Checkpoint does not exist: {id_or_prefix}"),
+            [id] => Ok(id.clone()),
+            _ => bail!("Checkpoint identifier is ambiguous: {id_or_prefix}"),
+        }
+    }
+
+    pub fn checkpoint_restored(&self, id: &str) -> Result<bool> {
+        Ok(self.connection().query_row(
+            "SELECT restored FROM checkpoints WHERE id=?1",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    pub fn mark_checkpoint_restored(&self, id: &str) -> Result<()> {
+        self.connection()
+            .execute("UPDATE checkpoints SET restored=1 WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// Removes all checkpoints beyond the newest `keep`; returns the pruned
+    /// checkpoint ids so the caller can remove their snapshot directories.
+    pub fn prune_checkpoints(&self, keep: u32) -> Result<Vec<String>> {
+        if !self.checkpoints_supported() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .connection()
+            .prepare("SELECT id FROM checkpoints ORDER BY rowid DESC LIMIT -1 OFFSET ?1")?;
+        let ids = statement
+            .query_map([keep as i64], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in &ids {
+            self.connection()
+                .execute("DELETE FROM checkpoints WHERE id=?1", [id])?;
+        }
+        Ok(ids)
+    }
+
+    fn checkpoint_ids_for_session(&self, session_id: &str) -> Result<Vec<String>> {
+        if !self.checkpoints_supported() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .connection()
+            .prepare("SELECT id FROM checkpoints WHERE session_id=?1")?;
+        Ok(statement
+            .query_map([session_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn delete_session(
         &mut self,
         id_or_prefix: &str,
@@ -831,8 +1056,10 @@ impl StateStore {
             self.save_memory_state()?;
             return Ok((id, new_current));
         }
+        let checkpoint_ids = self.checkpoint_ids_for_session(&id)?;
         let transaction = self.connection_mut().transaction()?;
         transaction.execute("DELETE FROM tool_executions WHERE session_id=?1", [&id])?;
+        transaction.execute("DELETE FROM checkpoints WHERE session_id=?1", [&id])?;
         transaction.execute("DELETE FROM sessions WHERE id=?1", [&id])?;
         let mut new_current = None;
         if was_current {
@@ -849,6 +1076,14 @@ impl StateStore {
             new_current = Some(replacement);
         }
         transaction.commit()?;
+        if let Some(root) = &self.checkpoints_dir {
+            for checkpoint_id in checkpoint_ids {
+                let directory = root.join(&checkpoint_id);
+                if directory.exists() {
+                    let _ = fs::remove_dir_all(&directory);
+                }
+            }
+        }
         self.secure_database_files()?;
         Ok((id, new_current))
     }

@@ -223,6 +223,20 @@ qin memory list
 
 Documents are chunked, embedded, and stored with canonical vectors. Search combines semantic similarity with text signals. Long-term memory is intended for stable preferences, project facts, important decisions, and reusable procedures—not transient command output.
 
+### Project instructions (AGENTS.md)
+
+Create an `AGENTS.md` file by hand in the same directory as the active `config.toml` (run `qin config path` to see it) to give qin persistent instructions—coding conventions, preferred tools, house rules. When present and non-empty, its contents are appended to the system prompt as `<project_instructions>` on every run. qin never creates or modifies the file; a missing or empty file is simply ignored. The size is capped by `input.agents_md_max_bytes` (default 256 KiB), symbolic links are refused, and `qin doctor` reports whether the file was loaded.
+
+### Checkpoints and undo
+
+```bash
+qin checkpoints
+qin undo            # restore the latest checkpoint
+qin undo <ID>       # restore a specific checkpoint (short IDs work)
+```
+
+Before typed file tools (`write_file`, `apply_patch`, `move_path`, `copy_path`, `remove_path`) mutate anything, qin snapshots the affected files under the data directory and records a checkpoint. `qin undo` prints the planned restore steps, asks for confirmation, then reverses them: overwritten content is restored, newly created files are removed, moves are renamed back, and deleted files are recovered from their snapshot or the trash directory. Files larger than `checkpoints.max_file_bytes` (default 10 MiB) are recorded without content and cannot be content-restored. Checkpoints require the SQLite storage backend (`storage.enabled = true`) and are pruned to the newest `checkpoints.keep` (default 20); set `checkpoints.enabled = false` to disable them entirely, for example on OpenWrt flash storage. Shell commands are not checkpointed—an arbitrary command's blast radius cannot be known in advance—so they keep relying on approvals and the trash directory.
+
 ### Diagnostics and maintenance
 
 ```bash
@@ -235,7 +249,7 @@ qin update
 ```
 
 `qin sync` commits pending audit records, checkpoints WAL databases, and asks SQLite to flush cached pages.
-`qin update` checks the latest GitHub release for the current platform, verifies its SHA-256 checksum, and atomically replaces the running executable when a newer version is available. For a protected, root-owned system installation such as `/usr/local/bin/qin`, qin safely asks `sudo` or `doas` to rerun only the update after a new version is found; entering `sudo qin update` yourself remains supported. User-owned or otherwise untrusted executables are never elevated automatically. `qin update --dry-run` only checks and reports what would change, and never requests administrator access.
+`qin update` checks the latest GitHub release for the current platform, verifies the minisign signature of the release's `SHA256SUMS` against the public key embedded in qin, then verifies the archive's SHA-256 checksum, and atomically replaces the running executable when a newer version is available. A release without a valid signature is refused outright. Before replacing the binary, the previous executable is saved beside it as `qin.previous`; `qin update --rollback` restores that backup atomically (with the same `sudo`/`doas` delegation for protected installations). Release assets also carry GitHub build-provenance attestations, and a CycloneDX SBOM (`qin-v<version>-sbom.cdx.json`) is attached to each release. For a protected, root-owned system installation such as `/usr/local/bin/qin`, qin safely asks `sudo` or `doas` to rerun only the update after a new version is found; entering `sudo qin update` yourself remains supported. User-owned or otherwise untrusted executables are never elevated automatically. `qin update --dry-run` only checks and reports what would change, and never requests administrator access.
 `qin config wizard` walks through the model connection, optional Redis/SQLite storage, and safety settings. Existing files are backed up before replacement; use `qin config wizard --force` or the global `--yes` flag to skip the final replacement confirmation. `--dry-run` performs the full review and validation without writing the file. API keys and Redis URLs can be supplied through environment variables, and the wizard never asks you to paste an API key into the config file; an existing inline API key is preserved unless you explicitly replace it with an environment-variable reference.
 
 For forward compatibility, unknown fields and configuration sections produce a warning and are ignored instead of preventing qin from starting. Known fields with invalid types or values remain errors. An ignored setting does not take effect; use `qin config check` and review its warnings after moving a configuration file between qin versions.
@@ -263,6 +277,16 @@ cargo test --all-targets --all-features
 ```
 
 The detailed architecture, permission model, session database, vector search design, and low-write OpenWrt strategy are documented in [QIN_DESIGN.md](QIN_DESIGN.md).
+
+### Release signing setup (maintainers)
+
+Releases sign `SHA256SUMS` with minisign. The current release public key is embedded as `RELEASE_PUBLIC_KEY` in `src/update.rs`, and CI signs with the `MINISIGN_SECRET_KEY` / `MINISIGN_PASSWORD` Actions secrets. To rotate the key:
+
+1. Generate a new key pair locally: `minisign -G -p qin-release.pub -s qin-release.key`
+2. Update the GitHub Actions secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` with the new secret key file content and password.
+3. Replace `RELEASE_PUBLIC_KEY` in `src/update.rs` with the new public key string from `qin-release.pub`, then cut a release so users update to a binary that trusts the new key.
+
+Verification fails closed: a release whose `SHA256SUMS.minisig` is missing or invalid is refused by `qin update`.
 
 ## License
 

@@ -77,6 +77,12 @@ pub enum Command {
     /// Permanently delete a session and all of its stored history
     Delete { session_id: String },
 
+    /// List recent file checkpoints recorded before tool mutations
+    Checkpoints,
+
+    /// Restore the files captured by a checkpoint (defaults to the latest)
+    Undo { checkpoint_id: Option<String> },
+
     /// Manage long-term memory
     Memory {
         #[command(subcommand)]
@@ -97,6 +103,10 @@ pub enum Command {
 
     /// Check the latest GitHub release and replace the running qin executable when newer
     Update {
+        /// Restore the executable backup saved by the previous update
+        #[arg(long)]
+        rollback: bool,
+
         /// Prevent recursive privilege delegation in the internal updater subprocess
         #[arg(long, hide = true)]
         internal_delegated: bool,
@@ -184,6 +194,8 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
         "use",
         "show",
         "delete",
+        "checkpoints",
+        "undo",
         "memory",
         "knowledge",
         "sync",
@@ -261,6 +273,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Update {
+                rollback: false,
                 internal_delegated: false
             }
         ));

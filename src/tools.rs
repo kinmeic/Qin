@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
+use crate::checkpoint::Recorder;
 use crate::config::Config;
 use crate::event::{EventSink, redact};
 use crate::knowledge;
@@ -20,6 +21,7 @@ pub struct ToolContext<'a> {
     pub events: &'a EventSink,
     pub store: &'a mut StateStore,
     pub session_id: &'a str,
+    pub tool_call_id: &'a str,
     pub cwd: &'a Path,
     pub assume_yes: bool,
     pub approve_all_commands: &'a mut bool,
@@ -390,10 +392,21 @@ fn write_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         creates_new_file,
     )?;
     if !ctx.dry_run {
+        let recorder = Recorder::new(ctx, "write_file")?;
+        if let Some(recorder) = &recorder {
+            if creates_new_file {
+                recorder.created(ctx.store, &path)?;
+            } else {
+                recorder.overwrite(ctx.store, &path)?;
+            }
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         atomic_write(&path, content.as_bytes())?;
+        if let Some(recorder) = &recorder {
+            recorder.commit(ctx.store)?;
+        }
     }
     text_result(if ctx.dry_run {
         "Dry run: file not written".into()
@@ -422,7 +435,17 @@ fn move_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         if dst.exists() && (src.is_dir() || dst.is_dir()) {
             bail!("Overwriting a directory with move_path is not supported safely");
         }
+        let recorder = Recorder::new(ctx, "move_path")?;
+        if let Some(recorder) = &recorder {
+            if dst.exists() {
+                recorder.overwrite(ctx.store, &dst)?;
+            }
+            recorder.moved(ctx.store, &src, &dst)?;
+        }
         fs::rename(&src, &dst)?;
+        if let Some(recorder) = &recorder {
+            recorder.commit(ctx.store)?;
+        }
     }
     text_result(if ctx.dry_run {
         "Dry run: path not moved".into()
@@ -449,10 +472,19 @@ fn copy_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         creates_new_file,
     )?;
     if !ctx.dry_run {
+        let recorder = Recorder::new(ctx, "copy_path")?;
+        if let Some(recorder) = &recorder {
+            if !creates_new_file {
+                recorder.overwrite(ctx.store, &dst)?;
+            }
+        }
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
         atomic_copy(&src, &dst)?;
+        if let Some(recorder) = &recorder {
+            recorder.commit(ctx.store)?;
+        }
     }
     text_result(if ctx.dry_run {
         "Dry run: file not copied".into()
@@ -481,6 +513,7 @@ fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         )?;
     }
     if !ctx.dry_run {
+        let recorder = Recorder::new(ctx, "remove_path")?;
         if use_trash {
             let parent = path.parent().context("The path has no parent directory")?;
             let trash = parent.join(".qin-trash");
@@ -501,7 +534,15 @@ fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
                     destination.display()
                 )
             })?;
+            if let Some(recorder) = &recorder {
+                recorder.deleted(ctx.store, &path, Some(&destination))?;
+            }
         } else {
+            if let Some(recorder) = &recorder {
+                // Snapshots cover regular files only; directory deletions are
+                // recorded as unrecoverable metadata.
+                recorder.deleted(ctx.store, &path, None)?;
+            }
             if path.is_dir() {
                 if !args["recursive"].as_bool().unwrap_or(false) {
                     bail!("Deleting a directory requires recursive=true")
@@ -510,6 +551,9 @@ fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
             } else {
                 fs::remove_file(&path)?;
             }
+        }
+        if let Some(recorder) = &recorder {
+            recorder.commit(ctx.store)?;
         }
     }
     text_result(if ctx.dry_run {
@@ -543,7 +587,14 @@ fn apply_patch(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         false,
     )?;
     if !ctx.dry_run {
+        let recorder = Recorder::new(ctx, "apply_patch")?;
+        if let Some(recorder) = &recorder {
+            recorder.overwrite(ctx.store, &path)?;
+        }
         atomic_write(&path, content.replacen(old, new, 1).as_bytes())?;
+        if let Some(recorder) = &recorder {
+            recorder.commit(ctx.store)?;
+        }
     }
     text_result(if ctx.dry_run {
         "Dry run: file not modified".into()
@@ -2169,7 +2220,7 @@ fn command_exists(name: &str) -> bool {
         std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())
     })
 }
-fn guard_delete(path: &Path, cwd: &Path) -> Result<()> {
+pub(crate) fn guard_delete(path: &Path, cwd: &Path) -> Result<()> {
     let canonical = path.canonicalize()?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if canonical == Path::new("/")
@@ -2183,7 +2234,7 @@ fn guard_delete(path: &Path, cwd: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn reject_symlink_target(path: &Path) -> Result<()> {
+pub(crate) fn reject_symlink_target(path: &Path) -> Result<()> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         bail!(
             "Refusing to write through a symbolic-link target: {}",
@@ -2246,7 +2297,7 @@ fn is_external_path(cwd: &Path, path: &Path) -> bool {
     !comparable.starts_with(workspace)
 }
 
-fn open_read_no_follow(path: &Path) -> Result<fs::File> {
+pub(crate) fn open_read_no_follow(path: &Path) -> Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2259,7 +2310,7 @@ fn open_read_no_follow(path: &Path) -> Result<fs::File> {
         .with_context(|| format!("Unable to open {} safely for reading", path.display()))
 }
 
-fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .context("The output path has no parent directory")?;
@@ -2278,7 +2329,7 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
     let parent = destination
         .parent()
         .context("The destination path has no parent directory")?;
@@ -2304,7 +2355,7 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn set_private_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!(
@@ -2796,6 +2847,7 @@ mod tests {
             events: &events,
             store: &mut store,
             session_id: &session,
+            tool_call_id: "test-call",
             cwd: dir.path(),
             assume_yes: true,
             approve_all_commands: &mut approve_all_commands,
@@ -2835,6 +2887,7 @@ mod tests {
             events: &events,
             store: &mut store,
             session_id: &session,
+            tool_call_id: "test-call",
             cwd: dir.path(),
             assume_yes: false,
             approve_all_commands: &mut approve_all_commands,
@@ -2870,6 +2923,7 @@ mod tests {
             events: &events,
             store: &mut store,
             session_id: &session,
+            tool_call_id: "test-call",
             cwd: dir.path(),
             assume_yes: false,
             approve_all_commands: &mut approve_all_commands,
@@ -2904,6 +2958,7 @@ mod tests {
             events: &events,
             store: &mut store,
             session_id: &session,
+            tool_call_id: "test-call",
             cwd: dir.path(),
             assume_yes: true,
             approve_all_commands: &mut approve_all_commands,

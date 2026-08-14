@@ -44,6 +44,10 @@ tool_result_max_tokens = 6000
 
 [input]
 fromfile_max_bytes = 1048576
+# Optional AGENTS.md placed beside this configuration file is injected into
+# the system prompt as project instructions. qin never creates the file;
+# create it by hand when you want persistent per-profile instructions.
+agents_md_max_bytes = 262144
 allow_utf8_bom = true
 reject_nul = true
 
@@ -99,6 +103,15 @@ elevation = "auto"
 trash_instead_of_delete = true
 command_timeout_seconds = 120
 max_output_bytes = 1048576
+
+[checkpoints]
+# Snapshot files before typed file tools (write_file, apply_patch, move_path,
+# copy_path, remove_path) mutate them, so "qin undo" can restore the previous
+# state. Requires the SQLite storage backend; shell commands are not tracked.
+# On OpenWrt flash storage, consider enabled = false to avoid extra writes.
+enabled = true
+max_file_bytes = 10485760
+keep = 20
 
 [search]
 order = ["exa", "brave", "native"]
