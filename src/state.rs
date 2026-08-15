@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
@@ -10,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -79,6 +81,26 @@ pub struct SequencedMessage {
     pub message: StoredMessage,
 }
 
+/// Append-only facts about an agent turn. Messages remain the materialized
+/// conversation view; events are the durable execution record used for
+/// observability and crash recovery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionEvent {
+    pub seq: i64,
+    pub kind: String,
+    pub turn_id: String,
+    pub tool_call_id: Option<String>,
+    pub data: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ToolResultMetadata<'a> {
+    pub status: &'a str,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+}
+
 pub struct SummaryUpdate {
     pub content: String,
     pub through_seq: i64,
@@ -130,6 +152,8 @@ struct MemorySession {
     updated_at: String,
     last_cwd: String,
     messages: Vec<SequencedMessage>,
+    #[serde(default)]
+    events: Vec<SessionEvent>,
     summary: Option<String>,
     summary_through_seq: i64,
 }
@@ -307,7 +331,13 @@ fn memory_session_is_newer(candidate: &MemorySession, current: &MemorySession) -
     }
     let candidate_seq = candidate.messages.last().map_or(0, |message| message.seq);
     let current_seq = current.messages.last().map_or(0, |message| message.seq);
-    (candidate_seq, candidate.summary_through_seq) > (current_seq, current.summary_through_seq)
+    let candidate_event_seq = candidate.events.last().map_or(0, |event| event.seq);
+    let current_event_seq = current.events.last().map_or(0, |event| event.seq);
+    (
+        candidate_seq,
+        candidate_event_seq,
+        candidate.summary_through_seq,
+    ) > (current_seq, current_event_seq, current.summary_through_seq)
 }
 
 impl MemorySession {
@@ -320,6 +350,7 @@ impl MemorySession {
             updated_at: now,
             last_cwd: cwd.to_string_lossy().into_owned(),
             messages: Vec::new(),
+            events: Vec::new(),
             summary: None,
             summary_through_seq: 0,
         }
@@ -363,6 +394,182 @@ struct PendingAudit {
     risk: String,
     exit_code: Option<i32>,
     duration_ms: u64,
+}
+
+const MAX_EVENT_DATA_BYTES: usize = 1024 * 1024;
+
+fn encode_event_data(data: &Value) -> Result<String> {
+    let encoded = serde_json::to_string(data)?;
+    if encoded.len() > MAX_EVENT_DATA_BYTES {
+        bail!("Session event data exceeds the 1 MiB size limit");
+    }
+    Ok(encoded)
+}
+
+/// Bounds an event payload to the size limit. Oversized message content is
+/// truncated only in the event copy; the materialized messages table always
+/// keeps the full content, so recovery never depends on the truncated text.
+fn bound_event_data(mut data: Value) -> Result<Value> {
+    if serde_json::to_string(&data)?.len() <= MAX_EVENT_DATA_BYTES {
+        return Ok(data);
+    }
+    if let Some(message) = data.get_mut("message").and_then(Value::as_object_mut) {
+        if let Some(Value::String(content)) = message.get_mut("content") {
+            content.truncate(char_boundary(content, MAX_EVENT_DATA_BYTES / 2));
+            content.push_str("\n[content truncated in the event log]");
+            message.insert("event_content_truncated".into(), Value::Bool(true));
+        }
+    }
+    encode_event_data(&data)?;
+    Ok(data)
+}
+
+fn char_boundary(value: &str, max_bytes: usize) -> usize {
+    if value.len() <= max_bytes {
+        return value.len();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn append_event_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    kind: &str,
+    turn_id: &str,
+    tool_call_id: Option<&str>,
+    data: &Value,
+) -> Result<i64> {
+    let seq: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM session_events WHERE session_id=?1",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let encoded = encode_event_data(data)?;
+    transaction.execute(
+        "INSERT INTO session_events(session_id,seq,kind,turn_id,tool_call_id,data) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![session_id, seq, kind, turn_id, tool_call_id, encoded],
+    )?;
+    Ok(seq)
+}
+
+fn append_message_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    message: &StoredMessage,
+) -> Result<i64> {
+    let seq: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?1",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO messages(session_id,seq,role,content,tool_calls,tool_call_id) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            session_id,
+            seq,
+            message.role,
+            message.content,
+            message.tool_calls,
+            message.tool_call_id
+        ],
+    )?;
+    Ok(seq)
+}
+
+fn append_memory_event(
+    session: &mut MemorySession,
+    kind: &str,
+    turn_id: &str,
+    tool_call_id: Option<&str>,
+    data: Value,
+) -> i64 {
+    let seq = session.events.last().map_or(0, |event| event.seq) + 1;
+    session.events.push(SessionEvent {
+        seq,
+        kind: kind.into(),
+        turn_id: turn_id.into(),
+        tool_call_id: tool_call_id.map(str::to_owned),
+        data,
+        created_at: now_timestamp(),
+    });
+    seq
+}
+
+fn append_memory_message(session: &mut MemorySession, message: &StoredMessage) -> i64 {
+    let seq = session.messages.last().map_or(0, |entry| entry.seq) + 1;
+    session.messages.push(SequencedMessage {
+        seq,
+        message: message.clone(),
+    });
+    seq
+}
+
+#[derive(Clone)]
+struct RecoverableToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+struct OpenTurn {
+    turn_id: String,
+    calls: BTreeMap<String, RecoverableToolCall>,
+    call_events: BTreeMap<String, ()>,
+    result_events: BTreeMap<String, ()>,
+}
+
+fn stored_message_from_event(data: &Value) -> Option<StoredMessage> {
+    serde_json::from_value(data.get("message")?.clone()).ok()
+}
+
+fn event_message(message: &StoredMessage) -> StoredMessage {
+    let mut event_message = message.clone();
+    if let Some(raw) = message.tool_calls.as_deref()
+        && let Ok(mut calls) = serde_json::from_str::<Value>(raw)
+        && let Some(calls) = calls.as_array_mut()
+    {
+        for call in &mut *calls {
+            if let Some(function) = call.get_mut("function").and_then(Value::as_object_mut)
+                && function.contains_key("arguments")
+            {
+                function.insert("arguments".into(), Value::String("{}".into()));
+            }
+        }
+        event_message.tool_calls = Some(calls_to_json(calls));
+    }
+    event_message
+}
+
+fn calls_to_json(calls: &[Value]) -> String {
+    Value::Array(calls.to_vec()).to_string()
+}
+
+fn tool_calls_from_message(message: &StoredMessage) -> Vec<RecoverableToolCall> {
+    let Some(raw) = message.tool_calls.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(calls)) = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    calls
+        .into_iter()
+        .filter_map(|call| {
+            Some(RecoverableToolCall {
+                id: call.get("id")?.as_str()?.to_owned(),
+                name: call.get("function")?.get("name")?.as_str()?.to_owned(),
+                arguments: call
+                    .get("function")?
+                    .get("arguments")?
+                    .as_str()
+                    .unwrap_or("{}")
+                    .to_owned(),
+            })
+        })
+        .collect()
 }
 
 impl StateStore {
@@ -759,6 +966,30 @@ impl StateStore {
                 "#,
             )?;
             transaction.execute("INSERT INTO schema_migrations(version) VALUES (3)", [])?;
+            transaction.commit()?;
+        }
+        if version < 4 {
+            let transaction = self.connection_mut().transaction()?;
+            transaction.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS session_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    tool_call_id TEXT,
+                    data TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(session_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_events_session_seq
+                    ON session_events(session_id, seq);
+                CREATE INDEX IF NOT EXISTS idx_session_events_turn
+                    ON session_events(session_id, turn_id, seq);
+                "#,
+            )?;
+            transaction.execute("INSERT INTO schema_migrations(version) VALUES (4)", [])?;
             transaction.commit()?;
         }
         Ok(())
@@ -1171,6 +1402,405 @@ impl StateStore {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Returns the durable append-only execution log for a session.
+    pub fn load_events(&self, session_id: &str) -> Result<Vec<SessionEvent>> {
+        if let Backend::Memory(memory) = &self.backend {
+            return Ok(memory
+                .session
+                .as_ref()
+                .filter(|session| session.id == session_id)
+                .map(|session| session.events.clone())
+                .unwrap_or_default());
+        }
+        let mut statement = self.connection().prepare(
+            "SELECT seq,kind,turn_id,tool_call_id,data,created_at FROM session_events WHERE session_id=?1 ORDER BY seq",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        raw.into_iter()
+            .map(|(seq, kind, turn_id, tool_call_id, data, created_at)| {
+                Ok(SessionEvent {
+                    seq,
+                    kind,
+                    turn_id,
+                    tool_call_id,
+                    data: serde_json::from_str(&data)
+                        .with_context(|| "Session event data is invalid JSON")?,
+                    created_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Durably starts a turn and materializes the user's message in one
+    /// backend transaction. Callers should hold the session lock first.
+    pub fn start_turn(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        message: &StoredMessage,
+        cwd: &Path,
+    ) -> Result<()> {
+        let start_data = bound_event_data(json!({"cwd": cwd.to_string_lossy()}))?;
+        let message_data = bound_event_data(json!({"message": message}))?;
+        if matches!(self.backend, Backend::Memory(_)) {
+            {
+                let Backend::Memory(memory) = &mut self.backend else {
+                    unreachable!()
+                };
+                let Some(session) = memory
+                    .session
+                    .as_mut()
+                    .filter(|session| session.id == session_id)
+                else {
+                    bail!("Session does not exist: {session_id}");
+                };
+                append_memory_event(session, "turn/start", turn_id, None, start_data);
+                append_memory_event(session, "user/message", turn_id, None, message_data);
+                append_memory_message(session, message);
+                session.last_cwd = cwd.to_string_lossy().into_owned();
+                session.updated_at = now_timestamp();
+            }
+            self.save_memory_state()?;
+            return Ok(());
+        }
+        let transaction = self.connection_mut().transaction()?;
+        append_event_tx(
+            &transaction,
+            session_id,
+            "turn/start",
+            turn_id,
+            None,
+            &start_data,
+        )?;
+        append_event_tx(
+            &transaction,
+            session_id,
+            "user/message",
+            turn_id,
+            None,
+            &message_data,
+        )?;
+        append_message_tx(&transaction, session_id, message)?;
+        transaction.execute(
+            "UPDATE sessions SET status='active',updated_at=CURRENT_TIMESTAMP,last_cwd=?2 WHERE id=?1",
+            params![session_id, cwd.to_string_lossy()],
+        )?;
+        transaction.commit()?;
+        self.secure_database_files()?;
+        Ok(())
+    }
+
+    /// Appends an assistant response before the next tool is started.
+    pub fn append_assistant_message(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        message: &StoredMessage,
+    ) -> Result<()> {
+        self.append_turn_message(session_id, turn_id, "assistant/message", None, message)
+    }
+
+    fn append_turn_message(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        kind: &str,
+        tool_call_id: Option<&str>,
+        message: &StoredMessage,
+    ) -> Result<()> {
+        let data = bound_event_data(json!({"message": event_message(message)}))?;
+        if matches!(self.backend, Backend::Memory(_)) {
+            {
+                let Backend::Memory(memory) = &mut self.backend else {
+                    unreachable!()
+                };
+                let Some(session) = memory
+                    .session
+                    .as_mut()
+                    .filter(|session| session.id == session_id)
+                else {
+                    bail!("Session does not exist: {session_id}");
+                };
+                append_memory_event(session, kind, turn_id, tool_call_id, data);
+                append_memory_message(session, message);
+                session.updated_at = now_timestamp();
+            }
+            self.save_memory_state()?;
+            return Ok(());
+        }
+        let transaction = self.connection_mut().transaction()?;
+        append_event_tx(&transaction, session_id, kind, turn_id, tool_call_id, &data)?;
+        append_message_tx(&transaction, session_id, message)?;
+        transaction.execute(
+            "UPDATE sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            [session_id],
+        )?;
+        transaction.commit()?;
+        self.secure_database_files()?;
+        Ok(())
+    }
+
+    /// Records the intent to execute a tool before control crosses into the
+    /// tool implementation. This is the recovery boundary for side effects.
+    pub fn append_tool_call(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Result<()> {
+        let data = bound_event_data(json!({
+            "name": name,
+            "arguments_sha256": sha256(arguments),
+            "arguments_bytes": arguments.len(),
+        }))?;
+        if matches!(self.backend, Backend::Memory(_)) {
+            {
+                let Backend::Memory(memory) = &mut self.backend else {
+                    unreachable!()
+                };
+                let Some(session) = memory
+                    .session
+                    .as_mut()
+                    .filter(|session| session.id == session_id)
+                else {
+                    bail!("Session does not exist: {session_id}");
+                };
+                append_memory_event(session, "tool/call", turn_id, Some(call_id), data);
+                session.updated_at = now_timestamp();
+            }
+            self.save_memory_state()?;
+            return Ok(());
+        }
+        let transaction = self.connection_mut().transaction()?;
+        append_event_tx(
+            &transaction,
+            session_id,
+            "tool/call",
+            turn_id,
+            Some(call_id),
+            &data,
+        )?;
+        transaction.execute(
+            "UPDATE sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            [session_id],
+        )?;
+        transaction.commit()?;
+        self.secure_database_files()?;
+        Ok(())
+    }
+
+    /// Atomically records a tool result and materializes the corresponding
+    /// tool message. The interrupted status is intentionally non-retryable:
+    /// the external side effect may already have happened.
+    pub fn append_tool_result(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        message: &StoredMessage,
+        metadata: ToolResultMetadata<'_>,
+    ) -> Result<()> {
+        let data = bound_event_data(json!({
+            "message": message,
+            "status": metadata.status,
+            "exit_code": metadata.exit_code,
+            "duration_ms": metadata.duration_ms,
+        }))?;
+        if matches!(self.backend, Backend::Memory(_)) {
+            {
+                let Backend::Memory(memory) = &mut self.backend else {
+                    unreachable!()
+                };
+                let Some(session) = memory
+                    .session
+                    .as_mut()
+                    .filter(|session| session.id == session_id)
+                else {
+                    bail!("Session does not exist: {session_id}");
+                };
+                append_memory_event(session, "tool/result", turn_id, Some(call_id), data);
+                append_memory_message(session, message);
+                session.updated_at = now_timestamp();
+            }
+            self.save_memory_state()?;
+            return Ok(());
+        }
+        let transaction = self.connection_mut().transaction()?;
+        append_event_tx(
+            &transaction,
+            session_id,
+            "tool/result",
+            turn_id,
+            Some(call_id),
+            &data,
+        )?;
+        append_message_tx(&transaction, session_id, message)?;
+        transaction.execute(
+            "UPDATE sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            [session_id],
+        )?;
+        transaction.commit()?;
+        self.secure_database_files()?;
+        Ok(())
+    }
+
+    /// Closes a turn with an explicit outcome. A failed turn is still a
+    /// complete durable record, while a missing end event means the process
+    /// died between two persistence points and must be recovered.
+    pub fn finish_turn(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let data = bound_event_data(json!({"status": status, "error": error}))?;
+        if matches!(self.backend, Backend::Memory(_)) {
+            {
+                let Backend::Memory(memory) = &mut self.backend else {
+                    unreachable!()
+                };
+                let Some(session) = memory
+                    .session
+                    .as_mut()
+                    .filter(|session| session.id == session_id)
+                else {
+                    bail!("Session does not exist: {session_id}");
+                };
+                append_memory_event(session, "turn/end", turn_id, None, data);
+                session.updated_at = now_timestamp();
+            }
+            self.save_memory_state()?;
+            return Ok(());
+        }
+        let transaction = self.connection_mut().transaction()?;
+        append_event_tx(&transaction, session_id, "turn/end", turn_id, None, &data)?;
+        transaction.execute(
+            "UPDATE sessions SET status=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            params![session_id, status],
+        )?;
+        transaction.commit()?;
+        self.secure_database_files()?;
+        Ok(())
+    }
+
+    /// Repairs open turns after the caller has acquired the session lock.
+    /// Missing tool results become explicit `interrupted` records; qin never
+    /// silently replays an operation that may have already changed the world.
+    pub fn recover_session(&mut self, session_id: &str) -> Result<usize> {
+        let events = self.load_events(session_id)?;
+        // Assistant/message events blank tool-call arguments (the full text
+        // already lives in the materialized messages), so a re-emitted
+        // tool/call event re-reads the real arguments from there to keep its
+        // arguments hash truthful.
+        let recorded_calls = self
+            .load_messages(session_id)?
+            .iter()
+            .flat_map(tool_calls_from_message)
+            .map(|call| (call.id.clone(), call))
+            .collect::<BTreeMap<_, _>>();
+        let mut open_turns = BTreeMap::<String, OpenTurn>::new();
+        for event in &events {
+            match event.kind.as_str() {
+                "turn/start" => {
+                    open_turns.entry(event.turn_id.clone()).or_insert(OpenTurn {
+                        turn_id: event.turn_id.clone(),
+                        calls: BTreeMap::new(),
+                        call_events: BTreeMap::new(),
+                        result_events: BTreeMap::new(),
+                    });
+                }
+                "assistant/message" => {
+                    if let Some(turn) = open_turns.get_mut(&event.turn_id)
+                        && let Some(message) = stored_message_from_event(&event.data)
+                    {
+                        for call in tool_calls_from_message(&message) {
+                            turn.calls.insert(call.id.clone(), call);
+                        }
+                    }
+                }
+                "tool/call" => {
+                    if let Some(turn) = open_turns.get_mut(&event.turn_id)
+                        && let Some(call_id) = event.tool_call_id.as_deref()
+                    {
+                        turn.call_events.insert(call_id.to_owned(), ());
+                    }
+                }
+                "tool/result" => {
+                    if let Some(turn) = open_turns.get_mut(&event.turn_id)
+                        && let Some(call_id) = event.tool_call_id.as_deref()
+                    {
+                        turn.result_events.insert(call_id.to_owned(), ());
+                    }
+                }
+                "turn/end" => {
+                    open_turns.remove(&event.turn_id);
+                }
+                _ => {}
+            }
+        }
+
+        let mut repaired = 0;
+        for turn in open_turns.into_values() {
+            for call in turn.calls.values() {
+                if turn.result_events.contains_key(&call.id) {
+                    continue;
+                }
+                if !turn.call_events.contains_key(&call.id) {
+                    let recorded = recorded_calls.get(&call.id).unwrap_or(call);
+                    self.append_tool_call(
+                        session_id,
+                        &turn.turn_id,
+                        &recorded.id,
+                        &recorded.name,
+                        &recorded.arguments,
+                    )?;
+                }
+                let message = StoredMessage {
+                    role: "tool".into(),
+                    content: Some(format!(
+                        "Tool execution was interrupted before qin could record its outcome: {}. The external state is unknown; verify it before retrying.",
+                        call.name
+                    )),
+                    tool_calls: None,
+                    tool_call_id: Some(call.id.clone()),
+                };
+                self.append_tool_result(
+                    session_id,
+                    &turn.turn_id,
+                    &call.id,
+                    &message,
+                    ToolResultMetadata {
+                        status: "interrupted",
+                        exit_code: None,
+                        duration_ms: 0,
+                    },
+                )?;
+                repaired += 1;
+            }
+            self.finish_turn(
+                session_id,
+                &turn.turn_id,
+                "interrupted",
+                Some("The previous qin process ended before the turn was closed"),
+            )?;
+            repaired += 1;
+        }
+        Ok(repaired)
     }
 
     #[cfg(test)]
@@ -1755,6 +2385,25 @@ mod tests {
         }
     }
 
+    fn assistant_tool_message(call_id: &str) -> StoredMessage {
+        StoredMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(
+                json!([{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"note.txt\",\"content\":\"hello\"}"
+                    }
+                }])
+                .to_string(),
+            ),
+            tool_call_id: None,
+        }
+    }
+
     fn memory_session_with_timestamp(timestamp: &str) -> MemorySession {
         let mut session = MemorySession::new(Path::new("/tmp"), None);
         session.updated_at = timestamp.into();
@@ -1788,6 +2437,188 @@ mod tests {
     fn invalid_redis_state_is_not_an_availability_error() {
         let error = decode_redis_session(b"not-json").err().unwrap();
         assert!(error.downcast_ref::<InvalidRedisState>().is_some());
+    }
+
+    #[test]
+    fn event_log_is_incremental_and_recovers_open_tool_without_replaying_it() {
+        let (_dir, mut store) = store();
+        let session = store
+            .new_session(Path::new("/tmp"), Some("events"))
+            .unwrap();
+        let turn = "turn-1";
+        store
+            .start_turn(
+                &session,
+                turn,
+                &user_message("write a note"),
+                Path::new("/tmp"),
+            )
+            .unwrap();
+        store
+            .append_assistant_message(&session, turn, &assistant_tool_message("call-1"))
+            .unwrap();
+        store
+            .append_tool_call(
+                &session,
+                turn,
+                "call-1",
+                "write_file",
+                r#"{"path":"note.txt","content":"hello"}"#,
+            )
+            .unwrap();
+
+        let events = store.load_events(&session).unwrap();
+        let kinds = events
+            .iter()
+            .map(|event| event.kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "turn/start",
+                "user/message",
+                "assistant/message",
+                "tool/call"
+            ]
+        );
+        assert!(events[3].data.get("arguments").is_none());
+        assert!(events[3].data.get("arguments_sha256").is_some());
+
+        assert_eq!(store.recover_session(&session).unwrap(), 2);
+        let events = store.load_events(&session).unwrap();
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("turn/end")
+        );
+        assert_eq!(store.recover_session(&session).unwrap(), 0);
+        let messages = store.load_messages(&session).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages[2]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("external state is unknown"))
+        );
+    }
+
+    #[test]
+    fn oversized_message_content_is_truncated_in_the_event_copy_only() {
+        let (_dir, mut store) = store();
+        let session = store
+            .new_session(Path::new("/tmp"), Some("events"))
+            .unwrap();
+        let turn = "turn-big";
+        store
+            .start_turn(&session, turn, &user_message("go"), Path::new("/tmp"))
+            .unwrap();
+        store
+            .append_assistant_message(&session, turn, &assistant_tool_message("call-big"))
+            .unwrap();
+        let big = "x".repeat(MAX_EVENT_DATA_BYTES * 2);
+        let result = StoredMessage {
+            role: "tool".into(),
+            content: Some(big.clone()),
+            tool_calls: None,
+            tool_call_id: Some("call-big".into()),
+        };
+        store
+            .append_tool_result(
+                &session,
+                turn,
+                "call-big",
+                &result,
+                ToolResultMetadata {
+                    status: "completed",
+                    exit_code: Some(0),
+                    duration_ms: 1,
+                },
+            )
+            .unwrap();
+
+        // The materialized conversation keeps the full content.
+        let messages = store.load_messages(&session).unwrap();
+        assert_eq!(
+            messages.last().and_then(|m| m.content.as_deref()),
+            Some(big.as_str())
+        );
+        // The event copy is truncated and marked instead of failing the turn.
+        let events = store.load_events(&session).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == "tool/result")
+            .unwrap();
+        let content = event.data["message"]["content"].as_str().unwrap();
+        assert!(content.len() < big.len());
+        assert!(content.contains("content truncated in the event log"));
+        assert_eq!(
+            event.data["message"]["event_content_truncated"],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn recovery_reemits_a_missing_tool_call_with_the_truthful_arguments_hash() {
+        let (_dir, mut store) = store();
+        let session = store
+            .new_session(Path::new("/tmp"), Some("events"))
+            .unwrap();
+        let turn = "turn-crash-before-call";
+        store
+            .start_turn(&session, turn, &user_message("write"), Path::new("/tmp"))
+            .unwrap();
+        store
+            .append_assistant_message(&session, turn, &assistant_tool_message("call-1"))
+            .unwrap();
+        // Simulated crash: the process died before the tool/call event.
+
+        assert_eq!(store.recover_session(&session).unwrap(), 2);
+        let events = store.load_events(&session).unwrap();
+        let call_event = events
+            .iter()
+            .find(|event| event.kind == "tool/call")
+            .unwrap();
+        let real_arguments = r#"{"path":"note.txt","content":"hello"}"#;
+        assert_eq!(
+            call_event.data["arguments_sha256"].as_str(),
+            Some(sha256(real_arguments).as_str())
+        );
+        assert_eq!(
+            call_event.data["arguments_bytes"].as_i64(),
+            Some(real_arguments.len() as i64)
+        );
+        let messages = store.load_messages(&session).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(store.recover_session(&session).unwrap(), 0);
+    }
+
+    #[test]
+    fn memory_event_log_survives_restart_before_recovery() {
+        let (dir, mut store) = memory_store();
+        let session = store.ensure_current_session(Path::new("/tmp")).unwrap();
+        store
+            .start_turn(
+                &session,
+                "turn-memory",
+                &user_message("inspect"),
+                Path::new("/tmp"),
+            )
+            .unwrap();
+        store
+            .append_assistant_message(
+                &session,
+                "turn-memory",
+                &assistant_tool_message("call-memory"),
+            )
+            .unwrap();
+        store
+            .append_tool_call(&session, "turn-memory", "call-memory", "write_file", "{}")
+            .unwrap();
+        drop(store);
+
+        let (_dir, mut reopened) = reopen_memory_store(dir);
+        assert_eq!(reopened.load_events(&session).unwrap().len(), 4);
+        assert_eq!(reopened.recover_session(&session).unwrap(), 2);
+        assert_eq!(reopened.recover_session(&session).unwrap(), 0);
     }
 
     #[test]

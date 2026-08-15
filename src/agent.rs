@@ -6,11 +6,12 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::config::{COMPACT_TARGET_RATIO, Config, ModelConfig};
 use crate::event::EventSink;
 use crate::knowledge;
-use crate::state::{StateStore, StoredMessage, SummaryUpdate};
+use crate::state::{StateStore, StoredMessage, SummaryUpdate, ToolResultMetadata};
 use crate::tools::{self, ToolContext};
 
 const SYSTEM_PROMPT: &str = r#"You are qin, a local agent running in the user's command-line environment. You share the user's current working directory.
@@ -95,12 +96,14 @@ pub async fn execute(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut summary = store.summary(session_id)?.unwrap_or_default();
-    let mut pending = vec![StoredMessage {
+    let user_message = StoredMessage {
         role: "user".into(),
         content: Some(prompt.into()),
         tool_calls: None,
         tool_call_id: None,
-    }];
+    };
+    let turn_id = Uuid::new_v4().to_string();
+    store.start_turn(session_id, &turn_id, &user_message, &cwd)?;
     let mut summary_update = None;
     let result = async {
         let schemas = if config.primary_model()?.supports_tools {
@@ -154,15 +157,22 @@ pub async fn execute(
             &cwd,
             &schemas,
             &mut messages,
-            &mut pending,
+            &turn_id,
             started,
         )
         .await
     }
     .await;
 
+    let (status, error) = match &result {
+        Ok(_) => ("completed", None),
+        Err(error) => ("failed", Some(error.to_string())),
+    };
     store
-        .append_messages_with_summary(session_id, &pending, &cwd, summary_update.as_ref())
+        .finish_turn(session_id, &turn_id, status, error.as_deref())
+        .context("Unable to persist the agent turn outcome")?;
+    store
+        .append_messages_with_summary(session_id, &[], &cwd, summary_update.as_ref())
         .context("Unable to persist the completed agent turn")?;
 
     let answer = result?;
@@ -193,7 +203,7 @@ async fn run_loop(
     cwd: &Path,
     schemas: &[Value],
     messages: &mut Vec<Message>,
-    pending: &mut Vec<StoredMessage>,
+    turn_id: &str,
     started: tokio::time::Instant,
 ) -> Result<String> {
     let mut tool_count = 0_u32;
@@ -223,7 +233,8 @@ async fn run_loop(
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
         };
         let assistant = outcome;
-        pending.push(to_stored(&assistant)?);
+        let stored_assistant = to_stored(&assistant)?;
+        store.append_assistant_message(session_id, turn_id, &stored_assistant)?;
         messages.push(assistant.clone());
         let calls = assistant.tool_calls.clone().unwrap_or_default();
         if calls.is_empty() {
@@ -233,81 +244,166 @@ async fn run_loop(
                 .context("The model returned neither content nor tool calls");
         }
         if schemas.is_empty() {
-            for call in calls {
-                let message = Message::tool(
-                    &call.id,
-                    "Tool call not executed because tools are disabled for this model".into(),
-                );
-                pending.push(to_stored(&message)?);
-                messages.push(message);
-            }
+            record_unexecuted_tool_calls(
+                store,
+                session_id,
+                turn_id,
+                &calls,
+                "tools are disabled for this model",
+            )?;
             bail!("The model returned tool calls even though supports_tools=false");
         }
         tool_count += calls.len() as u32;
         if tool_count > config.agent.max_tool_calls {
-            for call in calls {
-                let message = Message::tool(
-                    &call.id,
-                    "Tool call not executed because the per-run tool-call limit was reached".into(),
-                );
-                pending.push(to_stored(&message)?);
-                messages.push(message);
-            }
-            bail!("The agent reached its tool-call limit");
-        }
-        for call in calls {
-            let mut tool_ctx = ToolContext {
-                config,
-                events,
+            record_unexecuted_tool_calls(
                 store,
                 session_id,
-                tool_call_id: &call.id,
-                cwd,
-                assume_yes: options.assume_yes,
-                approve_all_commands: &mut approve_all_commands,
-                dry_run: options.dry_run,
-            };
-            let remaining = remaining_time(config, started)?;
-            let tool_started = tokio::time::Instant::now();
-            let tool_outcome = tokio::time::timeout(
-                remaining,
-                tools::execute(
-                    &call.id,
-                    &call.function.name,
-                    &call.function.arguments,
-                    &mut tool_ctx,
-                ),
-            )
-            .await;
-            let (result, canceled) = match tool_outcome {
-                Ok(Ok(result)) => (result.content, false),
-                Ok(Err(error)) => {
-                    let canceled = error.to_string() == "Command canceled by the user";
-                    (format!("Tool execution failed: {error:#}"), canceled)
+                turn_id,
+                &calls,
+                "the per-run tool-call limit was reached",
+            )?;
+            bail!("The agent reached its tool-call limit");
+        }
+        for (index, call) in calls.iter().enumerate() {
+            let remaining = match remaining_time(config, started) {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    record_unexecuted_tool_calls(
+                        store,
+                        session_id,
+                        turn_id,
+                        &calls[index..],
+                        "the agent reached its total runtime limit",
+                    )?;
+                    return Err(error);
                 }
-                Err(_) => {
-                    let error = "Tool execution failed: the agent reached its total runtime limit";
-                    tools::audit_interrupted(
+            };
+            store.append_tool_call(
+                session_id,
+                turn_id,
+                &call.id,
+                &call.function.name,
+                &call.function.arguments,
+            )?;
+            let tool_started = tokio::time::Instant::now();
+            let tool_outcome = {
+                let mut tool_ctx = ToolContext {
+                    config,
+                    events,
+                    store,
+                    session_id,
+                    tool_call_id: &call.id,
+                    cwd,
+                    assume_yes: options.assume_yes,
+                    approve_all_commands: &mut approve_all_commands,
+                    dry_run: options.dry_run,
+                };
+                match tokio::time::timeout(
+                    remaining,
+                    tools::execute(
                         &call.id,
                         &call.function.name,
                         &call.function.arguments,
                         &mut tool_ctx,
-                        error,
-                        tool_started.elapsed().as_millis() as u64,
-                    )?;
-                    (error.into(), true)
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => (result.content, false, "completed", result.exit_code),
+                    Ok(Err(error)) => {
+                        let canceled = error.to_string() == "Command canceled by the user";
+                        (
+                            format!("Tool execution failed: {error:#}"),
+                            canceled,
+                            "failed",
+                            None,
+                        )
+                    }
+                    Err(_) => {
+                        let error =
+                            "Tool execution failed: the agent reached its total runtime limit";
+                        tools::audit_interrupted(
+                            &call.id,
+                            &call.function.name,
+                            &call.function.arguments,
+                            &mut tool_ctx,
+                            error,
+                            tool_started.elapsed().as_millis() as u64,
+                        )?;
+                        (error.into(), true, "interrupted", None)
+                    }
                 }
             };
+            let (result, canceled, status, exit_code) = tool_outcome;
             let bounded = truncate_tool_result(&result, config.context.tool_result_max_tokens);
             let message = Message::tool(&call.id, bounded);
-            pending.push(to_stored(&message)?);
+            let stored = to_stored(&message)?;
+            store.append_tool_result(
+                session_id,
+                turn_id,
+                &call.id,
+                &stored,
+                ToolResultMetadata {
+                    status,
+                    exit_code,
+                    duration_ms: tool_started.elapsed().as_millis() as u64,
+                },
+            )?;
             messages.push(message);
             if canceled {
+                let reason = if status == "interrupted" {
+                    "the agent reached its total runtime limit"
+                } else {
+                    "the agent was canceled"
+                };
+                record_unexecuted_tool_calls(
+                    store,
+                    session_id,
+                    turn_id,
+                    &calls[index + 1..],
+                    reason,
+                )?;
                 bail!("Agent canceled or timed out during tool execution");
             }
         }
     }
     bail!("The agent reached its maximum iteration count without producing a final answer")
+}
+
+/// Persists explicit "not executed" records for tool calls the agent never
+/// reached, keeping the stored conversation balanced: an assistant message
+/// with tool calls must be followed by a tool message for every call, or the
+/// next request to the API is rejected.
+fn record_unexecuted_tool_calls(
+    store: &mut StateStore,
+    session_id: &str,
+    turn_id: &str,
+    calls: &[ToolCall],
+    reason: &str,
+) -> Result<()> {
+    for call in calls {
+        store.append_tool_call(
+            session_id,
+            turn_id,
+            &call.id,
+            &call.function.name,
+            &call.function.arguments,
+        )?;
+        let message = Message::tool(&call.id, format!("Tool call not executed because {reason}"));
+        let stored = to_stored(&message)?;
+        store.append_tool_result(
+            session_id,
+            turn_id,
+            &call.id,
+            &stored,
+            ToolResultMetadata {
+                status: "failed",
+                exit_code: None,
+                duration_ms: 0,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn remaining_time(config: &Config, started: tokio::time::Instant) -> Result<Duration> {
@@ -1237,7 +1333,111 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
         assert_eq!(answer, "Directory inspection complete");
         let messages = store.load_messages(&session).unwrap();
         assert_eq!(messages.len(), 4);
+        let event_kinds = store
+            .load_events(&session)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_kinds,
+            vec![
+                "turn/start",
+                "user/message",
+                "assistant/message",
+                "tool/call",
+                "tool/result",
+                "assistant/message",
+                "turn/end"
+            ]
+        );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_mid_tool_loop_keeps_the_stored_conversation_balanced() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_slow","type":"function","function":{"name":"shell","arguments":"{\"command\":\"sleep 5\"}"}},{"id":"call_fast","type":"function","function":{"name":"list_directory","arguments":"{\"path\":\".\"}"}}]}}]}"#.to_string();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.knowledge.enabled = false;
+        config.storage.database = "agent.db".into();
+        config.agent.wall_time_seconds = 1;
+        config.ui.command_heartbeat_seconds = 60;
+        let mut models = BTreeMap::new();
+        models.insert(
+            "primary".into(),
+            ModelConfig {
+                base_url: format!("http://{address}/v1"),
+                api_style: "chat_completions".into(),
+                model: "test".into(),
+                summary_model: String::new(),
+                api_key_env: None,
+                api_key: Some("key".into()),
+                context_window: 16384,
+                max_output_tokens: 1024,
+                stream: false,
+                supports_tools: true,
+                supports_parallel_tools: false,
+                supports_native_search: false,
+            },
+        );
+        config.models = models;
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("test")).unwrap();
+        let result = execute(
+            &config,
+            &mut store,
+            &session,
+            "Run the checks",
+            &EventSink::new(true, false, false),
+            RunOptions {
+                source: "cli",
+                source_path: None,
+                assume_yes: true,
+                dry_run: false,
+                agents_md: None,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        server.join().unwrap();
+
+        // Every tool call in the assistant message has a matching tool
+        // message, so the next turn's API request is still valid.
+        let messages = store.load_messages(&session).unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_slow"));
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_fast"));
+        assert!(
+            messages[3].content.as_deref().unwrap().contains(
+                "Tool call not executed because the agent reached its total runtime limit"
+            )
+        );
+
+        // The turn was closed explicitly, so recovery has nothing to repair.
+        assert_eq!(store.recover_session(&session).unwrap(), 0);
+        let events = store.load_events(&session).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "tool/result")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("turn/end")
+        );
     }
 
     #[tokio::test]

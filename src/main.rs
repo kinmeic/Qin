@@ -451,6 +451,12 @@ async fn execute_with(
     dry_run: bool,
 ) -> Result<()> {
     let _session_lock = store.lock_session(id)?;
+    let recovered = store.recover_session(id)?;
+    if recovered > 0 {
+        events.warning(&format!(
+            "Recovered {recovered} unfinished event(s) from the previous qin process; external tool state was not retried automatically"
+        ))?;
+    }
     let response = agent::execute(
         config,
         store,

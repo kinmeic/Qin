@@ -35,77 +35,186 @@ pub struct ToolResult {
     pub completion_summary: Option<String>,
 }
 
-pub fn definitions(config: &Config) -> Vec<Value> {
-    let mut tools = vec![
-        tool(
-            "list_directory",
-            "List directory contents",
-            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
-        ),
-        tool(
-            "read_file",
-            "Read a UTF-8 text file",
-            json!({"type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["path"]}),
-        ),
-        tool(
-            "stat_path",
-            "Inspect a path's type, size, and permissions",
-            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
-        ),
-        tool(
-            "create_directory",
-            "Create a directory",
-            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
-        ),
-        tool(
-            "write_file",
-            "Write a UTF-8 file, replacing any existing content",
-            json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
-        ),
-        tool(
-            "move_path",
-            "Move or rename a file or directory",
-            json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["source","destination"]}),
-        ),
-        tool(
-            "copy_path",
-            "Copy a file",
-            json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["source","destination"]}),
-        ),
-        tool(
-            "remove_path",
-            "Delete a file or directory (dangerous operation)",
-            json!({"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean"}},"required":["path"]}),
-        ),
-        tool(
-            "apply_patch",
-            "Apply an exact text replacement to a file",
-            json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}),
-        ),
-        tool(
-            "search_memory",
-            "Semantically search long-term memory",
-            json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}),
-        ),
-        tool(
-            "save_memory",
-            "Save a user preference, fact, or reusable procedure to long-term memory",
-            json!({"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}),
-        ),
-        tool(
-            "web_search",
-            "Search the internet using Exa, then Brave, then model-native search",
-            json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}),
-        ),
-    ];
-    tools.retain(|schema| {
-        let name = schema["function"]["name"].as_str().unwrap_or_default();
-        tool_enabled(name, config)
-    });
-    if config.permissions.allow_shell {
-        tools.push(tool("shell", "Run a shell command. The command is displayed and approval is requested according to risk before execution", json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"}},"required":["command"]})));
+#[derive(Clone, Copy)]
+enum ToolAvailability {
+    Always,
+    WorkspaceWrite,
+    Shell,
+    Knowledge,
+    KnowledgeWrite,
+    WebSearch,
+}
+
+impl ToolAvailability {
+    fn enabled(self, config: &Config) -> bool {
+        match self {
+            Self::Always => true,
+            Self::WorkspaceWrite => config.permissions.workspace_write,
+            Self::Shell => config.permissions.allow_shell,
+            Self::Knowledge => config.knowledge_active(),
+            Self::KnowledgeWrite => config.knowledge_active() && config.permissions.workspace_write,
+            Self::WebSearch => {
+                config.search.exa.enabled
+                    || config.search.brave.enabled
+                    || config.search.native.enabled
+            }
+        }
     }
-    tools
+}
+
+#[derive(Clone, Copy)]
+enum ToolHandler {
+    ListDirectory,
+    ReadFile,
+    StatPath,
+    CreateDirectory,
+    WriteFile,
+    MovePath,
+    CopyPath,
+    RemovePath,
+    ApplyPatch,
+    Shell,
+    SearchMemory,
+    SaveMemory,
+    WebSearch,
+}
+
+struct ToolDefinition {
+    name: &'static str,
+    description: &'static str,
+    parameters: Value,
+    allowed_keys: &'static [&'static str],
+    availability: ToolAvailability,
+    handler: ToolHandler,
+}
+
+fn tool_registry() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "list_directory",
+            description: "List directory contents",
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            allowed_keys: &["path"],
+            availability: ToolAvailability::Always,
+            handler: ToolHandler::ListDirectory,
+        },
+        ToolDefinition {
+            name: "read_file",
+            description: "Read a UTF-8 text file",
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["path"]}),
+            allowed_keys: &["path", "max_bytes"],
+            availability: ToolAvailability::Always,
+            handler: ToolHandler::ReadFile,
+        },
+        ToolDefinition {
+            name: "stat_path",
+            description: "Inspect a path's type, size, and permissions",
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            allowed_keys: &["path"],
+            availability: ToolAvailability::Always,
+            handler: ToolHandler::StatPath,
+        },
+        ToolDefinition {
+            name: "create_directory",
+            description: "Create a directory",
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            allowed_keys: &["path"],
+            availability: ToolAvailability::WorkspaceWrite,
+            handler: ToolHandler::CreateDirectory,
+        },
+        ToolDefinition {
+            name: "write_file",
+            description: "Write a UTF-8 file, replacing any existing content",
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
+            allowed_keys: &["path", "content"],
+            availability: ToolAvailability::WorkspaceWrite,
+            handler: ToolHandler::WriteFile,
+        },
+        ToolDefinition {
+            name: "move_path",
+            description: "Move or rename a file or directory",
+            parameters: json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["source","destination"]}),
+            allowed_keys: &["source", "destination", "overwrite"],
+            availability: ToolAvailability::WorkspaceWrite,
+            handler: ToolHandler::MovePath,
+        },
+        ToolDefinition {
+            name: "copy_path",
+            description: "Copy a file",
+            parameters: json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["source","destination"]}),
+            allowed_keys: &["source", "destination", "overwrite"],
+            availability: ToolAvailability::WorkspaceWrite,
+            handler: ToolHandler::CopyPath,
+        },
+        ToolDefinition {
+            name: "remove_path",
+            description: "Delete a file or directory (dangerous operation)",
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean"}},"required":["path"]}),
+            allowed_keys: &["path", "recursive"],
+            availability: ToolAvailability::WorkspaceWrite,
+            handler: ToolHandler::RemovePath,
+        },
+        ToolDefinition {
+            name: "apply_patch",
+            description: "Apply an exact text replacement to a file",
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}),
+            allowed_keys: &["path", "old_text", "new_text"],
+            availability: ToolAvailability::WorkspaceWrite,
+            handler: ToolHandler::ApplyPatch,
+        },
+        ToolDefinition {
+            name: "shell",
+            description: "Run a shell command. The command is displayed and approval is requested according to risk before execution",
+            parameters: json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"}},"required":["command"]}),
+            allowed_keys: &["command", "timeout_seconds", "elevated"],
+            availability: ToolAvailability::Shell,
+            handler: ToolHandler::Shell,
+        },
+        ToolDefinition {
+            name: "search_memory",
+            description: "Semantically search long-term memory",
+            parameters: json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}),
+            allowed_keys: &["query", "limit"],
+            availability: ToolAvailability::Knowledge,
+            handler: ToolHandler::SearchMemory,
+        },
+        ToolDefinition {
+            name: "save_memory",
+            description: "Save a user preference, fact, or reusable procedure to long-term memory",
+            parameters: json!({"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}),
+            allowed_keys: &["content"],
+            availability: ToolAvailability::KnowledgeWrite,
+            handler: ToolHandler::SaveMemory,
+        },
+        ToolDefinition {
+            name: "web_search",
+            description: "Search the internet using Exa, then Brave, then model-native search",
+            parameters: json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}),
+            allowed_keys: &["query", "limit"],
+            availability: ToolAvailability::WebSearch,
+            handler: ToolHandler::WebSearch,
+        },
+    ]
+}
+
+fn find_tool_definition(name: &str) -> Option<ToolDefinition> {
+    tool_registry()
+        .into_iter()
+        .find(|definition| definition.name == name)
+}
+
+pub fn definitions(config: &Config) -> Vec<Value> {
+    tool_registry()
+        .into_iter()
+        .filter(|definition| definition.availability.enabled(config))
+        .map(|definition| {
+            tool(
+                definition.name,
+                definition.description,
+                definition.parameters,
+            )
+        })
+        .collect()
 }
 
 fn tool(name: &str, description: &str, mut parameters: Value) -> Value {
@@ -121,56 +230,96 @@ pub async fn execute(
     arguments: &str,
     ctx: &mut ToolContext<'_>,
 ) -> Result<ToolResult> {
+    let (definition, args) = prepare_tool(name, arguments)?;
+    let started = Instant::now();
+    let audit_args = truncate(safe_args(name, &args), 8_192);
+    ctx.events.tool_started(name, &display_args(name, &args))?;
+    let authorization = authorize_tool(name, &definition, ctx);
+    let mut result = match authorization {
+        Ok(()) => dispatch_tool(definition.handler, &args, ctx).await,
+        Err(error) => Err(error),
+    };
+    normalize_result(&mut result, ctx.config.permissions.max_output_bytes);
+    observe_tool(call_id, name, &args, &audit_args, &result, started, ctx)?;
+    result
+}
+
+fn prepare_tool(name: &str, arguments: &str) -> Result<(ToolDefinition, Value)> {
+    let definition = find_tool_definition(name).with_context(|| format!("Unknown tool: {name}"))?;
     let args: Value = serde_json::from_str(arguments)
         .with_context(|| format!("Arguments for tool {name} are not valid JSON"))?;
     if !args.is_object() {
         bail!("Arguments for tool {name} must be a JSON object");
     }
     validate_argument_keys(name, &args)?;
-    let started = Instant::now();
-    let audit_args = truncate(safe_args(name, &args), 8_192);
-    ctx.events.tool_started(name, &display_args(name, &args))?;
-    let preapproval = if !tool_enabled(name, ctx.config) {
-        Err(anyhow::anyhow!(
-            "Tool {name} is disabled by the current configuration"
-        ))
-    } else if ctx.config.permissions.approval == "always" && risk(name) == "read_only" {
-        approve(ctx, &format!("Allow read-only tool {name}? [y/N] "), false)
-    } else {
-        Ok(())
-    };
-    let mut result = match preapproval {
-        Ok(()) => execute_inner(name, &args, ctx).await,
-        Err(error) => Err(error),
-    };
-    if let Ok(value) = &mut result {
-        value.content = truncate(
-            std::mem::take(&mut value.content),
-            ctx.config.permissions.max_output_bytes,
-        );
+    Ok((definition, args))
+}
+
+fn authorize_tool(name: &str, definition: &ToolDefinition, ctx: &ToolContext<'_>) -> Result<()> {
+    if !definition.availability.enabled(ctx.config) {
+        bail!("Tool {name} is disabled by the current configuration");
     }
-    match &result {
+    if ctx.config.permissions.approval == "always" && risk(name) == "read_only" {
+        approve(ctx, &format!("Allow read-only tool {name}? [y/N] "), false)?;
+    }
+    Ok(())
+}
+
+async fn dispatch_tool(
+    handler: ToolHandler,
+    args: &Value,
+    ctx: &mut ToolContext<'_>,
+) -> Result<ToolResult> {
+    match handler {
+        ToolHandler::ListDirectory => list_directory(args, ctx),
+        ToolHandler::ReadFile => read_file(args, ctx),
+        ToolHandler::StatPath => stat_path(args, ctx),
+        ToolHandler::CreateDirectory => create_directory(args, ctx),
+        ToolHandler::WriteFile => write_file(args, ctx),
+        ToolHandler::MovePath => move_path(args, ctx),
+        ToolHandler::CopyPath => copy_path(args, ctx),
+        ToolHandler::RemovePath => remove_path(args, ctx),
+        ToolHandler::ApplyPatch => apply_patch(args, ctx),
+        ToolHandler::Shell => shell(args, ctx).await,
+        ToolHandler::SearchMemory => search_memory(args, ctx).await,
+        ToolHandler::SaveMemory => save_memory(args, ctx).await,
+        ToolHandler::WebSearch => web_search(args, ctx).await,
+    }
+}
+
+fn normalize_result(result: &mut Result<ToolResult>, max_output_bytes: usize) {
+    if let Ok(value) = result {
+        value.content = truncate(std::mem::take(&mut value.content), max_output_bytes);
+    }
+}
+
+fn observe_tool(
+    call_id: &str,
+    name: &str,
+    args: &Value,
+    audit_args: &str,
+    result: &Result<ToolResult>,
+    started: Instant,
+    ctx: &mut ToolContext<'_>,
+) -> Result<()> {
+    let elapsed = started.elapsed().as_millis();
+    match result {
         Ok(value) => {
-            // run_shell already reports completion via command_finished;
-            // emitting tool_finished as well would duplicate the line.
-            // Dry runs never reach command_finished, so keep the generic line.
+            // shell emits command_finished itself; dry runs still need the
+            // generic completion event because no process was started.
             if name != "shell" || ctx.dry_run {
                 let summary = value
                     .completion_summary
                     .clone()
                     .unwrap_or_else(|| one_line(&value.content));
-                ctx.events
-                    .tool_finished(name, &summary, started.elapsed().as_millis())?;
+                ctx.events.tool_finished(name, &summary, elapsed)?;
             }
         }
-        Err(error) => {
-            ctx.events
-                .tool_failed(name, &error.to_string(), started.elapsed().as_millis())?
-        }
+        Err(error) => ctx.events.tool_failed(name, &error.to_string(), elapsed)?,
     }
     let owned_error = result.as_ref().err().map(ToString::to_string);
-    let (status, audit_text, exit) = match &result {
-        Ok(v) => ("completed", v.content.as_str(), v.exit_code),
+    let (status, audit_text, exit) = match result {
+        Ok(value) => ("completed", value.content.as_str(), value.exit_code),
         Err(_) => (
             "failed",
             owned_error.as_deref().unwrap_or("unknown error"),
@@ -181,14 +330,14 @@ pub async fn execute(
         ctx.session_id,
         call_id,
         name,
-        &audit_args,
+        audit_args,
         &truncate(redact(audit_text), 8_192),
         status,
-        risk_for(name, &args),
+        risk_for(name, args),
         exit,
-        started.elapsed().as_millis() as u64,
+        elapsed as u64,
     )?;
-    result
+    Ok(())
 }
 
 pub fn audit_interrupted(
@@ -214,58 +363,15 @@ pub fn audit_interrupted(
     )
 }
 
-async fn execute_inner(name: &str, args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
-    match name {
-        "list_directory" => list_directory(args, ctx),
-        "read_file" => read_file(args, ctx),
-        "stat_path" => stat_path(args, ctx),
-        "create_directory" => create_directory(args, ctx),
-        "write_file" => write_file(args, ctx),
-        "move_path" => move_path(args, ctx),
-        "copy_path" => copy_path(args, ctx),
-        "remove_path" => remove_path(args, ctx),
-        "apply_patch" => apply_patch(args, ctx),
-        "shell" => shell(args, ctx).await,
-        "search_memory" => search_memory(args, ctx).await,
-        "save_memory" => save_memory(args, ctx).await,
-        "web_search" => web_search(args, ctx).await,
-        _ => bail!("Unknown tool: {name}"),
-    }
-}
-
-fn tool_enabled(name: &str, config: &Config) -> bool {
-    match name {
-        "list_directory" | "read_file" | "stat_path" => true,
-        "create_directory" | "write_file" | "move_path" | "copy_path" | "remove_path"
-        | "apply_patch" => config.permissions.workspace_write,
-        "shell" => config.permissions.allow_shell,
-        "search_memory" => config.knowledge_active(),
-        "save_memory" => config.knowledge_active() && config.permissions.workspace_write,
-        "web_search" => {
-            config.search.exa.enabled || config.search.brave.enabled || config.search.native.enabled
-        }
-        _ => false,
-    }
-}
-
 fn validate_argument_keys(name: &str, args: &Value) -> Result<()> {
-    let allowed: &[&str] = match name {
-        "list_directory" | "stat_path" => &["path"],
-        "read_file" => &["path", "max_bytes"],
-        "create_directory" => &["path"],
-        "remove_path" => &["path", "recursive"],
-        "write_file" => &["path", "content"],
-        "move_path" | "copy_path" => &["source", "destination", "overwrite"],
-        "apply_patch" => &["path", "old_text", "new_text"],
-        "shell" => &["command", "timeout_seconds", "elevated"],
-        "search_memory" | "web_search" => &["query", "limit"],
-        "save_memory" => &["content"],
-        _ => bail!("Unknown tool: {name}"),
-    };
+    let definition = find_tool_definition(name).with_context(|| format!("Unknown tool: {name}"))?;
     let object = args
         .as_object()
         .context("Tool arguments must be an object")?;
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+    if let Some(key) = object
+        .keys()
+        .find(|key| !definition.allowed_keys.contains(&key.as_str()))
+    {
         bail!("Tool {name} received an unsupported argument: {key}");
     }
     for key in ["max_bytes", "timeout_seconds", "limit"] {
@@ -2591,6 +2697,27 @@ fn append_truncation_marker(output: &mut String, max_bytes: usize) {
 mod tests {
     use super::*;
     use crate::config::ConfigPathResolver;
+
+    #[test]
+    fn registry_controls_both_schemas_and_runtime_availability() {
+        let mut config = Config::default();
+        config.permissions.allow_shell = false;
+        let names = definitions(&config)
+            .into_iter()
+            .map(|schema| schema["function"]["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|name| name == "shell"));
+        assert!(find_tool_definition("shell").is_some());
+        assert!(validate_argument_keys("read_file", &json!({"path": "x"})).is_ok());
+        assert!(validate_argument_keys("read_file", &json!({"path": "x", "extra": 1})).is_err());
+
+        config.permissions.allow_shell = true;
+        assert!(
+            definitions(&config)
+                .into_iter()
+                .any(|schema| schema["function"]["name"] == "shell")
+        );
+    }
 
     #[test]
     fn display_args_shows_a_friendly_summary() {

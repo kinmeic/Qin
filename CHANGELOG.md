@@ -2,6 +2,12 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.4.2
+
+- Added a registry-backed tool execution pipeline with explicit preparation, authorization, dispatch, normalization, and observation stages.
+- Persisted turn, user-message, assistant-message, tool-call, and tool-result events incrementally, including crash recovery that records interrupted tool outcomes without replaying potentially completed side effects.
+- Added redacted event metadata for tool arguments and recovery coverage for both SQLite and lightweight non-SQLite session stores.
+
 ## 0.4.1
 
 - Indented the "All subsequent shell commands are approved" notice so it aligns with the surrounding tool invocation events.
