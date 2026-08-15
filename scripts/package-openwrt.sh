@@ -43,4 +43,10 @@ tar -C "$work_dir/control" --sort=name --owner=0 --group=0 --numeric-owner --mti
 tar -C "$work_dir/data" --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' -czf "$work_dir/data.tar.gz" .
 
 ipk=$output_dir/qin_${version}-1_${architecture}.ipk
-(cd "$work_dir" && ar r "$ipk" debian-binary control.tar.gz data.tar.gz)
+# OpenWrt's legacy opkg expects an outer gzip-compressed tar archive.  The
+# Debian ar layout looks similar but is rejected by opkg on OpenWrt 24.10.
+tar -C "$work_dir" --owner=0 --group=0 --numeric-owner --mtime='@0' \
+	-czf "$ipk" ./debian-binary ./control.tar.gz ./data.tar.gz
+
+# Fail the build if the artifact is not a readable OpenWrt package.
+tar -tzf "$ipk" >/dev/null
