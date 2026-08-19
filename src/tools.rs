@@ -9,7 +9,9 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use uuid::Uuid;
 
+use crate::approval::{ApprovalOutcome, ApprovalRequest};
 use crate::checkpoint::Recorder;
 use crate::config::Config;
 use crate::event::{EventSink, redact};
@@ -21,7 +23,9 @@ pub struct ToolContext<'a> {
     pub events: &'a EventSink,
     pub store: &'a mut StateStore,
     pub session_id: &'a str,
+    pub turn_id: &'a str,
     pub tool_call_id: &'a str,
+    pub tool_name: &'a str,
     pub cwd: &'a Path,
     pub assume_yes: bool,
     pub approve_all_commands: &'a mut bool,
@@ -124,7 +128,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "write_file",
-            description: "Write a UTF-8 file, replacing any existing content",
+            description: "Write a UTF-8 file, replacing existing content; prefer apply_patch for localized edits",
             parameters: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
             allowed_keys: &["path", "content"],
             availability: ToolAvailability::WorkspaceWrite,
@@ -156,7 +160,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "apply_patch",
-            description: "Apply an exact text replacement to a file",
+            description: "Inspect an existing UTF-8 file, then replace old_text exactly once with new_text; if it is not unique, reread with more context instead of guessing; preserve unrelated content and verify the result",
             parameters: json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}),
             allowed_keys: &["path", "old_text", "new_text"],
             availability: ToolAvailability::WorkspaceWrite,
@@ -164,7 +168,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "shell",
-            description: "Run a shell command. The command is displayed and approval is requested according to risk before execution",
+            description: "Run a shell command; approval is risk-based, policy denials and rejected approvals are final for this command, and workarounds are not allowed",
             parameters: json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"}},"required":["command"]}),
             allowed_keys: &["command", "timeout_seconds", "elevated"],
             availability: ToolAvailability::Shell,
@@ -233,7 +237,11 @@ pub async fn execute(
     let (definition, args) = prepare_tool(name, arguments)?;
     let started = Instant::now();
     let audit_args = truncate(safe_args(name, &args), 8_192);
-    ctx.events.tool_started(name, &display_args(name, &args))?;
+    ctx.events.tool_started_with_data(
+        name,
+        &display_args(name, &args),
+        Some(tool_presentation(ctx.tool_call_id, name, &args, ctx.cwd)),
+    )?;
     let authorization = authorize_tool(name, &definition, ctx);
     let mut result = match authorization {
         Ok(()) => dispatch_tool(definition.handler, &args, ctx).await,
@@ -255,7 +263,11 @@ fn prepare_tool(name: &str, arguments: &str) -> Result<(ToolDefinition, Value)> 
     Ok((definition, args))
 }
 
-fn authorize_tool(name: &str, definition: &ToolDefinition, ctx: &ToolContext<'_>) -> Result<()> {
+fn authorize_tool(
+    name: &str,
+    definition: &ToolDefinition,
+    ctx: &mut ToolContext<'_>,
+) -> Result<()> {
     if !definition.availability.enabled(ctx.config) {
         bail!("Tool {name} is disabled by the current configuration");
     }
@@ -312,10 +324,27 @@ fn observe_tool(
                     .completion_summary
                     .clone()
                     .unwrap_or_else(|| one_line(&value.content));
-                ctx.events.tool_finished(name, &summary, elapsed)?;
+                ctx.events.tool_finished_with_data(
+                    name,
+                    &summary,
+                    elapsed,
+                    Some(json!({
+                        "tool_call_id": call_id,
+                        "status": "completed",
+                        "exit_code": value.exit_code,
+                    })),
+                )?;
             }
         }
-        Err(error) => ctx.events.tool_failed(name, &error.to_string(), elapsed)?,
+        Err(error) => ctx.events.tool_failed_with_data(
+            name,
+            &error.to_string(),
+            elapsed,
+            Some(json!({
+                "tool_call_id": call_id,
+                "status": "failed",
+            })),
+        )?,
     }
     let owned_error = result.as_ref().err().map(ToString::to_string);
     let (status, audit_text, exit) = match result {
@@ -349,7 +378,15 @@ pub fn audit_interrupted(
     duration_ms: u64,
 ) -> Result<()> {
     let args = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-    ctx.events.tool_failed(name, error, duration_ms as u128)?;
+    ctx.events.tool_failed_with_data(
+        name,
+        error,
+        duration_ms as u128,
+        Some(json!({
+            "tool_call_id": call_id,
+            "status": "interrupted",
+        })),
+    )?;
     ctx.store.audit_tool(
         ctx.session_id,
         call_id,
@@ -391,7 +428,7 @@ fn validate_argument_keys(name: &str, args: &Value) -> Result<()> {
     Ok(())
 }
 
-fn list_directory(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn list_directory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_existing(ctx.cwd, string(args, "path")?)?;
     approve_external_access(ctx, &path, "List directory")?;
     let mut entries = fs::read_dir(&path)?
@@ -416,7 +453,7 @@ fn list_directory(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     Ok(text(entries.join("\n")))
 }
 
-fn read_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn read_file(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_existing(ctx.cwd, string(args, "path")?)?;
     approve_external_access(ctx, &path, "Read file")?;
     let max = args["max_bytes"]
@@ -444,7 +481,7 @@ fn read_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     text_result(String::from_utf8(bytes).context("The file is not valid UTF-8 text")?)
 }
 
-fn stat_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn stat_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_existing(ctx.cwd, string(args, "path")?)?;
     approve_external_access(ctx, &path, "Inspect path")?;
     let md = fs::symlink_metadata(&path)?;
@@ -465,7 +502,7 @@ fn stat_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     ))
 }
 
-fn create_directory(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn create_directory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_target(ctx.cwd, string(args, "path")?)?;
     approve_path_mutation(
         ctx,
@@ -483,7 +520,7 @@ fn create_directory(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     })
 }
 
-fn write_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn write_file(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_target(ctx.cwd, string(args, "path")?)?;
     reject_symlink_target(&path)?;
     let creates_new_file = !path.exists();
@@ -521,7 +558,7 @@ fn write_file(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     })
 }
 
-fn move_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn move_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let src = resolve_target(ctx.cwd, string(args, "source")?)?;
     let dst = resolve_target(ctx.cwd, string(args, "destination")?)?;
     if !src.exists() {
@@ -560,7 +597,7 @@ fn move_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     })
 }
 
-fn copy_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn copy_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let src = resolve_existing(ctx.cwd, string(args, "source")?)?;
     let dst = resolve_target(ctx.cwd, string(args, "destination")?)?;
     reject_symlink_target(&dst)?;
@@ -599,7 +636,7 @@ fn copy_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     })
 }
 
-fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn remove_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_target(ctx.cwd, string(args, "path")?)?;
     guard_delete(&path, ctx.cwd)?;
     let use_trash = ctx.config.permissions.trash_instead_of_delete;
@@ -671,7 +708,7 @@ fn remove_path(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
     })
 }
 
-fn apply_patch(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+fn apply_patch(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_target(ctx.cwd, string(args, "path")?)?;
     reject_symlink_target(&path)?;
     let old = string(args, "old_text")?;
@@ -741,11 +778,16 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         }
     }
     let interactive_terminal = (elevated || invokes_elevation) && io::stdin().is_terminal();
-    ctx.events.command_started(
+    ctx.events.command_started_with_data(
         ctx.cwd,
         elevated || invokes_elevation,
         timeout,
         interactive_terminal,
+        Some(json!({
+            "tool_call_id": ctx.tool_call_id,
+            "card": "terminal",
+            "kind": "execute",
+        })),
     )?;
     let started = Instant::now();
     let mut terminal_mode = TerminalModeGuard::capture(interactive_terminal);
@@ -816,7 +858,11 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                         if remaining > 0 {
                             let visible = prefix_at_boundary(&text, remaining);
                             if !visible.is_empty() {
-                                ctx.events.command_output(label, visible)?;
+                                ctx.events.command_output_with_data(
+                                    label,
+                                    visible,
+                                    Some(json!({"tool_call_id": ctx.tool_call_id})),
+                                )?;
                                 streamed_bytes = streamed_bytes.saturating_add(visible.len());
                             }
                             if visible.len() < text.len() {
@@ -824,7 +870,11 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                             }
                         }
                         if streamed_bytes >= ctx.config.ui.command_output_max_bytes && !stream_truncated_notice {
-                            ctx.events.command_output("qin", "[Live command output truncated]")?;
+                            ctx.events.command_output_with_data(
+                                "qin",
+                                "[Live command output truncated]",
+                                Some(json!({"tool_call_id": ctx.tool_call_id})),
+                            )?;
                             stream_truncated_notice = true;
                         }
                     }
@@ -832,7 +882,10 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                 None => break,
             },
             _ = heartbeat.tick(), if !interactive_terminal => {
-                ctx.events.command_heartbeat(started.elapsed().as_secs())?
+                ctx.events.command_heartbeat_with_data(
+                    started.elapsed().as_secs(),
+                    Some(json!({"tool_call_id": ctx.tool_call_id})),
+                )?
             },
             _ = &mut deadline => {
                 child.kill().await.ok();
@@ -855,8 +908,15 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     if output_truncated {
         append_truncation_marker(&mut output, ctx.config.permissions.max_output_bytes);
     }
-    ctx.events
-        .command_finished(status.code(), started.elapsed().as_millis())?;
+    ctx.events.command_finished_with_data(
+        status.code(),
+        started.elapsed().as_millis(),
+        Some(json!({
+            "tool_call_id": ctx.tool_call_id,
+            "status": if status.success() { "completed" } else { "failed" },
+            "exit_code": status.code(),
+        })),
+    )?;
     let output = format!(
         "exit_code={}\n{output}",
         status
@@ -1056,7 +1116,7 @@ async fn save_memory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResu
     })
 }
 
-async fn web_search(args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+async fn web_search(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let query = string(args, "query")?;
     if query.trim().is_empty() || query.chars().count() > 2_000 {
         bail!("The web-search query must contain between 1 and 2,000 characters");
@@ -1245,7 +1305,7 @@ async fn read_json_limited(response: reqwest::Response, max_bytes: usize) -> Res
 }
 
 fn approve_path_mutation(
-    ctx: &ToolContext<'_>,
+    ctx: &mut ToolContext<'_>,
     message: &str,
     paths: &[&Path],
     reversible_without_overwrite: bool,
@@ -1274,7 +1334,7 @@ fn auto_approves_path_mutation(
         && paths.iter().all(|path| !is_external_path(cwd, path))
 }
 
-fn approve_external_access(ctx: &ToolContext<'_>, path: &Path, action: &str) -> Result<()> {
+fn approve_external_access(ctx: &mut ToolContext<'_>, path: &Path, action: &str) -> Result<()> {
     if is_external_path(ctx.cwd, path) {
         approve(
             ctx,
@@ -1287,28 +1347,26 @@ fn approve_external_access(ctx: &ToolContext<'_>, path: &Path, action: &str) -> 
     }
     Ok(())
 }
-fn approve(ctx: &ToolContext<'_>, message: &str, high_risk: bool) -> Result<()> {
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalAnswer {
+    Once,
+    All,
+    Rejected,
+    Cancelled,
+    Unavailable,
+}
+
+fn approve(ctx: &mut ToolContext<'_>, message: &str, high_risk: bool) -> Result<()> {
     if ctx.assume_yes && !high_risk {
         return Ok(());
     }
     if ctx.config.permissions.approval == "never" && !high_risk {
         return Ok(());
     }
-    if !io::stdin().is_terminal() {
-        bail!(
-            "Approval is required in a non-interactive environment; review the action and use --yes (extremely high-risk actions are never bypassed)"
-        )
-    }
-    ctx.events.approval_prompt(message)?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    if matches!(
-        answer.trim().to_lowercase().as_str(),
-        "y" | "yes" | "\u{662f}"
-    ) {
-        Ok(())
-    } else {
-        bail!("Execution was declined by the user")
+    match request_approval(ctx, message, high_risk, false)? {
+        ApprovalAnswer::Once => Ok(()),
+        answer => bail!(approval_denial_message(answer)),
     }
 }
 
@@ -1319,7 +1377,7 @@ enum ApprovalDecision {
 }
 
 fn approve_command(
-    ctx: &ToolContext<'_>,
+    ctx: &mut ToolContext<'_>,
     message: &str,
     high_risk: bool,
 ) -> Result<ApprovalDecision> {
@@ -1329,24 +1387,110 @@ fn approve_command(
     if ctx.config.permissions.approval == "never" && !high_risk {
         return Ok(ApprovalDecision::Once);
     }
-    if !io::stdin().is_terminal() {
-        bail!(
-            "Approval is required in a non-interactive environment; review the action and use --yes (extremely high-risk actions are never bypassed)"
-        )
+    match request_approval(ctx, message, high_risk, true)? {
+        ApprovalAnswer::Once => Ok(ApprovalDecision::Once),
+        ApprovalAnswer::All => Ok(ApprovalDecision::All),
+        answer => bail!(approval_denial_message(answer)),
     }
-    ctx.events.approval_prompt(message)?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    parse_command_approval(&answer).context("Execution was declined by the user")
 }
 
-fn parse_command_approval(answer: &str) -> Option<ApprovalDecision> {
-    match answer.trim().to_lowercase().as_str() {
-        "y" | "yes" | "\u{662f}" => Some(ApprovalDecision::Once),
-        "a" | "all" | "\u{5168}\u{90e8}" => Some(ApprovalDecision::All),
-        _ => None,
+fn request_approval(
+    ctx: &mut ToolContext<'_>,
+    message: &str,
+    high_risk: bool,
+    allow_all: bool,
+) -> Result<ApprovalAnswer> {
+    let approval_id = Uuid::new_v4().to_string();
+    ctx.store.append_approval_asked(&ApprovalRequest {
+        session_id: ctx.session_id,
+        turn_id: ctx.turn_id,
+        tool_call_id: ctx.tool_call_id,
+        approval_id: &approval_id,
+        tool_name: ctx.tool_name,
+        reason: message,
+        high_risk,
+        allow_all,
+    })?;
+
+    let prompt_data = json!({
+        "approval_id": approval_id.clone(),
+        "tool_call_id": ctx.tool_call_id,
+        "tool_name": ctx.tool_name,
+        "high_risk": high_risk,
+        "allow_all": allow_all,
+    });
+    if let Err(error) = ctx
+        .events
+        .approval_prompt_with_data(message, Some(prompt_data))
+    {
+        let _ = ctx.store.append_approval_decided(
+            ctx.session_id,
+            ctx.turn_id,
+            ctx.tool_call_id,
+            &approval_id,
+            ApprovalOutcome::Unavailable,
+        );
+        let _ = ctx.events.approval_decided(
+            &approval_id,
+            ctx.tool_call_id,
+            ApprovalOutcome::Unavailable.as_str(),
+        );
+        return Err(error).context("Unable to render the approval prompt");
+    }
+    let answer = if !io::stdin().is_terminal() {
+        ApprovalAnswer::Unavailable
+    } else {
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(_) => parse_approval_answer(&input, allow_all),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => ApprovalAnswer::Cancelled,
+            Err(_) => ApprovalAnswer::Unavailable,
+        }
+    };
+    let outcome = approval_outcome(answer);
+    ctx.store.append_approval_decided(
+        ctx.session_id,
+        ctx.turn_id,
+        ctx.tool_call_id,
+        &approval_id,
+        outcome,
+    )?;
+    let _ = ctx
+        .events
+        .approval_decided(&approval_id, ctx.tool_call_id, outcome.as_str());
+    Ok(answer)
+}
+
+fn approval_outcome(answer: ApprovalAnswer) -> ApprovalOutcome {
+    match answer {
+        ApprovalAnswer::Once => ApprovalOutcome::AllowedOnce,
+        ApprovalAnswer::All => ApprovalOutcome::AllowedForTask,
+        ApprovalAnswer::Rejected => ApprovalOutcome::Rejected,
+        ApprovalAnswer::Cancelled => ApprovalOutcome::Cancelled,
+        ApprovalAnswer::Unavailable => ApprovalOutcome::Unavailable,
     }
 }
+
+fn approval_denial_message(answer: ApprovalAnswer) -> &'static str {
+    match answer {
+        ApprovalAnswer::Rejected => "Execution was declined by the user",
+        ApprovalAnswer::Cancelled => "Approval was canceled; execution was not performed",
+        ApprovalAnswer::Unavailable => {
+            "Approval was unavailable; execution was not performed (use --yes only for permitted non-high-risk actions)"
+        }
+        ApprovalAnswer::Once | ApprovalAnswer::All => "Approval was not granted",
+    }
+}
+
+fn parse_approval_answer(answer: &str, allow_all: bool) -> ApprovalAnswer {
+    match answer.trim().to_lowercase().as_str() {
+        "y" | "yes" | "\u{662f}" => ApprovalAnswer::Once,
+        "a" | "all" | "\u{5168}\u{90e8}" if allow_all => ApprovalAnswer::All,
+        "" | "n" | "no" | "\u{4e0d}" | "\u{5426}" => ApprovalAnswer::Rejected,
+        _ => ApprovalAnswer::Rejected,
+    }
+}
+
 fn dangerous(command: &str) -> bool {
     let lower = command.to_lowercase();
     let compact: String = lower
@@ -2561,6 +2705,69 @@ fn display_args(name: &str, args: &Value) -> String {
         .unwrap_or_else(|| one_line(&truncate(safe_args(name, args), 200)))
 }
 
+/// Builds renderer-only metadata for JSON event consumers. It deliberately
+/// describes the card and affected locations without copying file contents or
+/// raw command arguments into the event stream.
+fn tool_presentation(call_id: &str, name: &str, args: &Value, cwd: &Path) -> Value {
+    let (card, kind) = match name {
+        "shell" => ("terminal", "execute"),
+        "apply_patch" | "write_file" => ("diff", "edit"),
+        "remove_path" => ("generic", "delete"),
+        "list_directory" | "read_file" | "stat_path" | "search_memory" | "web_search" => {
+            ("generic", "read")
+        }
+        _ => ("generic", "edit"),
+    };
+    let mut data = json!({
+        "tool_call_id": call_id,
+        "card": card,
+        "kind": kind,
+        "risk": risk_for(name, args),
+    });
+    let mut locations = Vec::new();
+    for key in ["path", "source", "destination"] {
+        if let Some(path) = args.get(key).and_then(Value::as_str) {
+            locations.push(json!({"path": presentation_path(path)}));
+        }
+    }
+    if !locations.is_empty() {
+        data["locations"] = Value::Array(locations);
+    }
+    if name == "apply_patch"
+        && let (Some(path), Some(old_text), Some(new_text)) = (
+            args.get("path").and_then(Value::as_str),
+            args.get("old_text").and_then(Value::as_str),
+            args.get("new_text").and_then(Value::as_str),
+        )
+    {
+        data["diffs"] = json!([{
+            "path": presentation_path(path),
+            "old_bytes": old_text.len(),
+            "new_bytes": new_text.len(),
+            "content_redacted": true,
+        }]);
+    } else if name == "write_file"
+        && let (Some(path), Some(content)) = (
+            args.get("path").and_then(Value::as_str),
+            args.get("content").and_then(Value::as_str),
+        )
+    {
+        data["diffs"] = json!([{
+            "path": presentation_path(path),
+            "new_bytes": content.len(),
+            "content_redacted": true,
+        }]);
+    }
+    if name == "shell" {
+        data["cwd"] = Value::String(presentation_path(&cwd.display().to_string()));
+    }
+    data
+}
+
+fn presentation_path(value: &str) -> String {
+    truncate(redact(value), 1_024)
+}
+
 fn safe_args(name: &str, args: &Value) -> String {
     let mut view = args.clone();
     if matches!(name, "write_file" | "apply_patch" | "save_memory") {
@@ -2909,13 +3116,21 @@ mod tests {
 
     #[test]
     fn parses_one_time_and_task_wide_command_approvals() {
-        assert_eq!(parse_command_approval("y\n"), Some(ApprovalDecision::Once));
-        assert_eq!(parse_command_approval("ALL\n"), Some(ApprovalDecision::All));
+        assert_eq!(parse_approval_answer("y\n", true), ApprovalAnswer::Once);
+        assert_eq!(parse_approval_answer("ALL\n", true), ApprovalAnswer::All);
         assert_eq!(
-            parse_command_approval("\u{5168}\u{90e8}\n"),
-            Some(ApprovalDecision::All)
+            parse_approval_answer("\u{5168}\u{90e8}\n", true),
+            ApprovalAnswer::All
         );
-        assert_eq!(parse_command_approval("n\n"), None);
+        assert_eq!(parse_approval_answer("n\n", true), ApprovalAnswer::Rejected);
+        assert_eq!(
+            approval_outcome(ApprovalAnswer::Once),
+            ApprovalOutcome::AllowedOnce
+        );
+        assert_eq!(
+            approval_outcome(ApprovalAnswer::All),
+            ApprovalOutcome::AllowedForTask
+        );
     }
 
     #[test]
@@ -2987,6 +3202,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_presentation_exposes_safe_diff_metadata() {
+        let presentation = tool_presentation(
+            "call-1",
+            "apply_patch",
+            &json!({
+                "path": "requirements.txt",
+                "old_text": "secret-old",
+                "new_text": "secret-new"
+            }),
+            Path::new("/tmp/project"),
+        );
+        assert_eq!(presentation["card"], "diff");
+        assert_eq!(presentation["kind"], "edit");
+        assert_eq!(presentation["tool_call_id"], "call-1");
+        assert_eq!(presentation["diffs"][0]["old_bytes"], 10);
+        assert_eq!(presentation["diffs"][0]["new_bytes"], 10);
+        assert_eq!(presentation["diffs"][0]["content_redacted"], true);
+        let encoded = presentation.to_string();
+        assert!(!encoded.contains("secret-old"));
+        assert!(!encoded.contains("secret-new"));
+    }
+
+    #[test]
+    fn edit_tool_descriptions_require_exact_unique_replacements() {
+        let apply_patch = tool_registry()
+            .into_iter()
+            .find(|definition| definition.name == "apply_patch")
+            .unwrap();
+        assert!(apply_patch.description.contains("exactly once"));
+        assert!(
+            apply_patch
+                .description
+                .contains("preserve unrelated content")
+        );
+        assert!(apply_patch.description.contains("verify the result"));
+    }
+
+    #[test]
     fn caps_output_and_normalizes_targets() {
         let mut value = String::new();
         assert!(append_capped(&mut value, "abcdef", 4));
@@ -3030,7 +3283,9 @@ mod tests {
             events: &events,
             store: &mut store,
             session_id: &session,
+            turn_id: "test-turn",
             tool_call_id: "test-call",
+            tool_name: "shell",
             cwd: dir.path(),
             assume_yes: true,
             approve_all_commands: &mut approve_all_commands,
@@ -3070,7 +3325,9 @@ mod tests {
             events: &events,
             store: &mut store,
             session_id: &session,
+            turn_id: "test-turn",
             tool_call_id: "test-call",
+            tool_name: "shell",
             cwd: dir.path(),
             assume_yes: false,
             approve_all_commands: &mut approve_all_commands,
@@ -3106,7 +3363,9 @@ mod tests {
             events: &events,
             store: &mut store,
             session_id: &session,
+            turn_id: "test-turn",
             tool_call_id: "test-call",
+            tool_name: "shell",
             cwd: dir.path(),
             assume_yes: false,
             approve_all_commands: &mut approve_all_commands,
@@ -3141,7 +3400,9 @@ mod tests {
             events: &events,
             store: &mut store,
             session_id: &session,
+            turn_id: "test-turn",
             tool_call_id: "test-call",
+            tool_name: "shell",
             cwd: dir.path(),
             assume_yes: true,
             approve_all_commands: &mut approve_all_commands,

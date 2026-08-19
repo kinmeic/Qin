@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+use crate::approval::{ApprovalOutcome, ApprovalRequest};
 use crate::config::{Config, ConfigPathResolver, ConfigScope};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1443,6 +1444,88 @@ impl StateStore {
             .collect()
     }
 
+    /// Records the start of one approval request without duplicating tool
+    /// arguments. The tool-call id links the request to the already logged
+    /// invocation, while the fresh approval id pairs it with its decision.
+    pub fn append_approval_asked(&mut self, request: &ApprovalRequest<'_>) -> Result<()> {
+        let reason = crate::event::sanitize_terminal(&crate::event::redact(
+            &request.reason.chars().take(2_048).collect::<String>(),
+        ));
+        self.append_durable_event(
+            request.session_id,
+            "approval/asked",
+            request.turn_id,
+            Some(request.tool_call_id),
+            json!({
+                "approval_id": request.approval_id,
+                "tool_name": request.tool_name,
+                "reason": reason,
+                "high_risk": request.high_risk,
+                "allow_all": request.allow_all,
+            }),
+        )
+    }
+
+    /// Records the matching closed approval outcome. Callers may continue only
+    /// for the scope represented by `allowed-once` or `allowed-for-task`.
+    pub fn append_approval_decided(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+        approval_id: &str,
+        outcome: ApprovalOutcome,
+    ) -> Result<()> {
+        self.append_durable_event(
+            session_id,
+            "approval/decided",
+            turn_id,
+            Some(tool_call_id),
+            json!({
+                "approval_id": approval_id,
+                "outcome": outcome.as_str(),
+            }),
+        )
+    }
+
+    fn append_durable_event(
+        &mut self,
+        session_id: &str,
+        kind: &str,
+        turn_id: &str,
+        tool_call_id: Option<&str>,
+        data: Value,
+    ) -> Result<()> {
+        let data = bound_event_data(data)?;
+        if matches!(self.backend, Backend::Memory(_)) {
+            {
+                let Backend::Memory(memory) = &mut self.backend else {
+                    unreachable!()
+                };
+                let Some(session) = memory
+                    .session
+                    .as_mut()
+                    .filter(|session| session.id == session_id)
+                else {
+                    bail!("Session does not exist: {session_id}");
+                };
+                append_memory_event(session, kind, turn_id, tool_call_id, data);
+                session.updated_at = now_timestamp();
+            }
+            self.save_memory_state()?;
+            return Ok(());
+        }
+        let transaction = self.connection_mut().transaction()?;
+        append_event_tx(&transaction, session_id, kind, turn_id, tool_call_id, &data)?;
+        transaction.execute(
+            "UPDATE sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            [session_id],
+        )?;
+        transaction.commit()?;
+        self.secure_database_files()?;
+        Ok(())
+    }
+
     /// Durably starts a turn and materializes the user's message in one
     /// backend transaction. Callers should hold the session lock first.
     pub fn start_turn(
@@ -2437,6 +2520,93 @@ mod tests {
     fn invalid_redis_state_is_not_an_availability_error() {
         let error = decode_redis_session(b"not-json").err().unwrap();
         assert!(error.downcast_ref::<InvalidRedisState>().is_some());
+    }
+
+    #[test]
+    fn approval_events_are_paired_and_linked_to_the_tool_call() {
+        let (_dir, mut store) = store();
+        let session = store
+            .new_session(Path::new("/tmp"), Some("approval"))
+            .unwrap();
+        store
+            .start_turn(
+                &session,
+                "turn-approval",
+                &user_message("edit the file"),
+                Path::new("/tmp"),
+            )
+            .unwrap();
+        store
+            .append_approval_asked(&ApprovalRequest {
+                session_id: &session,
+                turn_id: "turn-approval",
+                tool_call_id: "call-approval",
+                approval_id: "approval-1",
+                tool_name: "shell",
+                reason: "Allow this command? [y/N/All] ",
+                high_risk: false,
+                allow_all: true,
+            })
+            .unwrap();
+        store
+            .append_approval_decided(
+                &session,
+                "turn-approval",
+                "call-approval",
+                "approval-1",
+                ApprovalOutcome::AllowedForTask,
+            )
+            .unwrap();
+
+        let events = store.load_events(&session).unwrap();
+        assert_eq!(events[2].kind, "approval/asked");
+        assert_eq!(events[3].kind, "approval/decided");
+        assert_eq!(events[2].tool_call_id.as_deref(), Some("call-approval"));
+        assert_eq!(events[3].tool_call_id.as_deref(), Some("call-approval"));
+        assert_eq!(events[2].data["approval_id"], "approval-1");
+        assert_eq!(events[2].data["allow_all"], true);
+        assert_eq!(events[3].data["outcome"], "allowed-for-task");
+    }
+
+    #[test]
+    fn approval_events_survive_the_memory_session_backend() {
+        let (dir, mut store) = memory_store();
+        let session = store.ensure_current_session(Path::new("/tmp")).unwrap();
+        store
+            .start_turn(
+                &session,
+                "turn-memory-approval",
+                &user_message("edit the file"),
+                Path::new("/tmp"),
+            )
+            .unwrap();
+        store
+            .append_approval_asked(&ApprovalRequest {
+                session_id: &session,
+                turn_id: "turn-memory-approval",
+                tool_call_id: "call-memory-approval",
+                approval_id: "approval-memory-1",
+                tool_name: "apply_patch",
+                reason: "modify file",
+                high_risk: false,
+                allow_all: false,
+            })
+            .unwrap();
+        store
+            .append_approval_decided(
+                &session,
+                "turn-memory-approval",
+                "call-memory-approval",
+                "approval-memory-1",
+                ApprovalOutcome::Rejected,
+            )
+            .unwrap();
+        drop(store);
+
+        let (_dir, reopened) = reopen_memory_store(dir);
+        let events = reopened.load_events(&session).unwrap();
+        assert_eq!(events[2].kind, "approval/asked");
+        assert_eq!(events[3].data["outcome"], "rejected");
     }
 
     #[test]

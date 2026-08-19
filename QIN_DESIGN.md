@@ -340,6 +340,8 @@ reject_nul = true
 - 多个并行命令的每一行带短 `tool_call_id` 前缀，防止输出交错后无法判断来源。
 - `--quiet` 可隐藏普通进度和命令输出，但不隐藏审批、错误和最终状态；`--json` 用结构化事件表达同一生命周期。
 - 无 TTY 且命令需要审批时，不等待 stdin，直接返回权限/审批错误；只有已明确授权的 `--yes` 范围内操作可以继续。
+- 工具开始事件可附带仅供 renderer 使用的 `call_id`、`card`、`kind`、安全位置和脱敏大小；不得把文件正文或未脱敏命令复制到事件元数据。
+- 每次实际审批都追加成对的 `approval/asked` 与 `approval/decided` 事件，使用独立 approval id 关联；`allowed-once` 仅放行当前操作，`allowed-for-task` 放行当前任务内后续命令，拒绝、取消或不可用都必须失败关闭。
 
 配置建议：
 
@@ -634,6 +636,8 @@ trait Tool {
 ```
 
 路由器统一完成：JSON Schema 校验、参数脱敏视图、路径解析、策略、审批、超时、取消、输出上限、审计和错误分类。工具 handler 不自行决定是否审批。
+
+审批结果使用封闭集合 `allowed-once`、`allowed-for-task`、`rejected`、`cancelled`、`unavailable`；任务级授权必须被持久化，不能伪装成单次授权。缺少审批入口、审批器异常或非交互环境都不能隐式放行。文件编辑工具应要求唯一精确匹配，并向 renderer 提供 diff 卡片意图而不是重复发送正文。
 
 ### 8.3 并行规则
 

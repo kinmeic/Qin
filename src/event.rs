@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::Serialize;
+use serde_json::Value;
 use std::cell::Cell;
 
 use crate::config::{ConfigPathResolver, InitOutcome, UiConfig};
@@ -14,6 +15,10 @@ pub struct EventSink {
     show_commands: Cell<bool>,
     /// stderr is an interactive terminal: heartbeats rewrite one line in place.
     terminal: bool,
+    /// Both stdin and stderr are terminals, so approval answers can stay on
+    /// the same line as their prompt. This is separate from status-line
+    /// support because Windows and mixed stdin/stderr setups differ.
+    approval_inline: bool,
     /// ANSI colors for system event lines (disabled by NO_COLOR).
     color: bool,
     status_line_open: Cell<bool>,
@@ -23,12 +28,16 @@ pub struct EventSink {
 struct JsonEvent<'a> {
     event: &'a str,
     message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
 
 impl EventSink {
     pub fn new(quiet: bool, json: bool, verbose: bool) -> Self {
-        let terminal =
-            !json && !cfg!(windows) && std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let stdin_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        let stderr_terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let terminal = !json && !cfg!(windows) && stderr_terminal;
+        let approval_inline = approval_prompt_is_inline(json, stdin_terminal, stderr_terminal);
         let color = terminal && std::env::var_os("NO_COLOR").is_none();
         Self {
             quiet,
@@ -37,6 +46,7 @@ impl EventSink {
             show_tool_events: Cell::new(true),
             show_commands: Cell::new(true),
             terminal,
+            approval_inline,
             color,
             status_line_open: Cell::new(false),
         }
@@ -61,35 +71,62 @@ impl EventSink {
     }
 
     pub fn tool_started(&self, name: &str, detail: &str) -> Result<()> {
+        self.tool_started_with_data(name, detail, None)
+    }
+
+    /// Emits a tool start with renderer-only metadata. The metadata is never
+    /// sent to the model and is intentionally limited to safe locations,
+    /// sizes, and presentation hints rather than file contents.
+    pub fn tool_started_with_data(
+        &self,
+        name: &str,
+        detail: &str,
+        data: Option<Value>,
+    ) -> Result<()> {
         if !self.quiet && self.show_tool_events.get() {
-            self.stderr("tool_started", &format!("→ {name}  {detail}"))?;
+            self.stderr_with_data("tool_started", &format!("→ {name}  {detail}"), data)?;
         }
         Ok(())
     }
 
-    pub fn tool_finished(&self, name: &str, summary: &str, elapsed_ms: u128) -> Result<()> {
+    pub fn tool_finished_with_data(
+        &self,
+        name: &str,
+        summary: &str,
+        elapsed_ms: u128,
+        data: Option<Value>,
+    ) -> Result<()> {
         if !self.quiet && self.show_tool_events.get() {
-            self.stderr(
+            self.stderr_with_data(
                 "tool_finished",
                 &tool_finished_message(name, summary, elapsed_ms),
+                data,
             )?;
         }
         Ok(())
     }
 
-    pub fn tool_failed(&self, name: &str, error: &str, elapsed_ms: u128) -> Result<()> {
-        self.stderr(
+    pub fn tool_failed_with_data(
+        &self,
+        name: &str,
+        error: &str,
+        elapsed_ms: u128,
+        data: Option<Value>,
+    ) -> Result<()> {
+        self.stderr_with_data(
             "tool_failed",
             &format!("✗ {name}  {error}  {}", format_elapsed(elapsed_ms)),
+            data,
         )
     }
 
-    pub fn command_started(
+    pub fn command_started_with_data(
         &self,
         cwd: &std::path::Path,
         elevated: bool,
         timeout: u64,
         interactive_terminal: bool,
+        data: Option<Value>,
     ) -> Result<()> {
         if self.quiet || !self.show_commands.get() {
             return Ok(());
@@ -121,19 +158,28 @@ impl EventSink {
             self.status_line_open.set(true);
             return Ok(());
         }
-        self.stderr("command_started", &message)
+        self.stderr_with_data("command_started", &message, data)
     }
 
-    pub fn command_output(&self, stream: &str, line: &str) -> Result<()> {
+    pub fn command_output_with_data(
+        &self,
+        stream: &str,
+        line: &str,
+        data: Option<Value>,
+    ) -> Result<()> {
         // Live command output is hidden unless --verbose; JSON consumers
         // always receive it as structured events.
         if self.json || (self.verbose && !self.quiet && self.show_commands.get()) {
-            self.stderr("command_output", &format!("│ {stream}: {}", redact(line)))?;
+            self.stderr_with_data(
+                "command_output",
+                &format!("│ {stream}: {}", redact(line)),
+                data,
+            )?;
         }
         Ok(())
     }
 
-    pub fn command_heartbeat(&self, seconds: u64) -> Result<()> {
+    pub fn command_heartbeat_with_data(&self, seconds: u64, data: Option<Value>) -> Result<()> {
         if self.quiet || !self.show_commands.get() {
             return Ok(());
         }
@@ -152,10 +198,15 @@ impl EventSink {
             self.status_line_open.set(true);
             return Ok(());
         }
-        self.stderr("command_heartbeat", &message)
+        self.stderr_with_data("command_heartbeat", &message, data)
     }
 
-    pub fn command_finished(&self, code: Option<i32>, elapsed_ms: u128) -> Result<()> {
+    pub fn command_finished_with_data(
+        &self,
+        code: Option<i32>,
+        elapsed_ms: u128,
+        data: Option<Value>,
+    ) -> Result<()> {
         let ok = code == Some(0);
         if self.quiet || (ok && !self.show_commands.get()) {
             return Ok(());
@@ -170,23 +221,30 @@ impl EventSink {
                 format_elapsed(elapsed_ms)
             )
         };
-        self.stderr(
+        self.stderr_with_data(
             if ok {
                 "command_finished"
             } else {
                 "command_failed"
             },
             &message,
+            data,
         )
     }
 
-    /// Prints the approval prompt exactly once, without a trailing newline so
-    /// the user's answer stays on the same line. JSON mode additionally emits
-    /// the machine-readable event.
+    /// Prints the approval prompt exactly once. Interactive terminals keep the
+    /// user's answer on the same line; event-stream and JSON output use a
+    /// complete line so consumers can render the whole prompt.
     pub fn approval_prompt(&self, message: &str) -> Result<()> {
+        self.approval_prompt_with_data(message, None)
+    }
+
+    /// Emits an approval prompt and, for structured consumers, the stable
+    /// request metadata needed to attach it to a tool call.
+    pub fn approval_prompt_with_data(&self, message: &str, data: Option<Value>) -> Result<()> {
         let message = format!("? {message}");
-        if self.json {
-            self.stderr("approval_required", &message)?;
+        if !self.approval_inline {
+            return self.stderr_with_data("approval_required", &message, data);
         }
         if self.status_line_open.replace(false) {
             eprint!("\r\x1b[2K");
@@ -199,6 +257,29 @@ impl EventSink {
         }
         std::io::Write::flush(&mut std::io::stderr())?;
         Ok(())
+    }
+
+    /// Notifies structured/non-interactive consumers that an approval request
+    /// has reached a closed outcome. Interactive TTYs do not need an extra
+    /// line after the user's answer.
+    pub fn approval_decided(
+        &self,
+        approval_id: &str,
+        tool_call_id: &str,
+        outcome: &str,
+    ) -> Result<()> {
+        if self.approval_inline {
+            return Ok(());
+        }
+        self.stderr_with_data(
+            "approval_decided",
+            &format!("Approval {outcome}"),
+            Some(serde_json::json!({
+                "approval_id": approval_id,
+                "tool_call_id": tool_call_id,
+                "outcome": outcome,
+            })),
+        )
     }
 
     pub fn prompt_file_loaded(&self, loaded: &LoadedPrompt) -> Result<()> {
@@ -321,13 +402,18 @@ impl EventSink {
     }
 
     fn stderr(&self, event: &str, message: &str) -> Result<()> {
+        self.stderr_with_data(event, message, None)
+    }
+
+    fn stderr_with_data(&self, event: &str, message: &str, data: Option<Value>) -> Result<()> {
         let message = redact(message);
         if self.json {
             eprintln!(
                 "{}",
                 serde_json::to_string(&JsonEvent {
                     event,
-                    message: &message
+                    message: &message,
+                    data,
                 })?
             );
         } else {
@@ -378,6 +464,10 @@ fn tool_finished_message(name: &str, summary: &str, elapsed_ms: u128) -> String 
     }
 }
 
+fn approval_prompt_is_inline(json: bool, stdin_terminal: bool, stderr_terminal: bool) -> bool {
+    !json && stdin_terminal && stderr_terminal
+}
+
 /// ANSI color per system event kind; command output itself stays uncolored so
 /// it stands apart from qin's own messages.
 fn event_color(event: &str) -> Option<&'static str> {
@@ -386,7 +476,7 @@ fn event_color(event: &str) -> Option<&'static str> {
         "tool_started" | "command_started" => "34",               // blue
         "tool_finished" | "command_finished" | "success" => "32", // green
         "tool_failed" | "command_failed" => "31",                 // red
-        "approval_required" | "warning" | "tool_warning" => "33", // yellow
+        "approval_required" | "approval_decided" | "warning" | "tool_warning" => "33", // yellow
         "command_heartbeat" => "2",                               // dim
         _ => return None,
     })
@@ -408,6 +498,7 @@ fn indented_event(event: &str) -> bool {
             | "command_finished"
             | "command_failed"
             | "approval_required"
+            | "approval_decided"
             | "tool_warning"
     )
 }
@@ -517,6 +608,7 @@ mod tests {
         assert_eq!(event_color("command_finished"), Some("32"));
         assert_eq!(event_color("tool_failed"), Some("31"));
         assert_eq!(event_color("approval_required"), Some("33"));
+        assert_eq!(event_color("approval_decided"), Some("33"));
         assert_eq!(event_color("tool_warning"), Some("33"));
         assert_eq!(event_color("command_heartbeat"), Some("2"));
         assert_eq!(event_color("command_output"), None);
@@ -535,6 +627,7 @@ mod tests {
             "command_finished",
             "command_failed",
             "approval_required",
+            "approval_decided",
         ] {
             assert!(indented_event(event), "{event}");
         }
@@ -566,5 +659,33 @@ mod tests {
             tool_finished_message("read_file", "", 247),
             "✓ read_file  0.25s"
         );
+    }
+
+    #[test]
+    fn approval_prompts_are_inline_only_for_plain_interactive_terminals() {
+        assert!(approval_prompt_is_inline(false, true, true));
+        assert!(!approval_prompt_is_inline(false, false, true));
+        assert!(!approval_prompt_is_inline(false, true, false));
+        assert!(!approval_prompt_is_inline(false, false, false));
+        assert!(!approval_prompt_is_inline(true, true, true));
+    }
+
+    #[test]
+    fn structured_event_data_is_present_only_when_supplied() {
+        let with_data = serde_json::to_value(JsonEvent {
+            event: "approval_required",
+            message: "? Modify file requirements.txt? [y/N] ",
+            data: Some(serde_json::json!({"approval_id": "a-1"})),
+        })
+        .unwrap();
+        assert_eq!(with_data["data"]["approval_id"], "a-1");
+
+        let without_data = serde_json::to_value(JsonEvent {
+            event: "tool_finished",
+            message: "done",
+            data: None,
+        })
+        .unwrap();
+        assert!(without_data.get("data").is_none());
     }
 }

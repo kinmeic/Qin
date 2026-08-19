@@ -2,6 +2,12 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.4.3
+
+- Fixed approval prompts for non-TTY and JSON event consumers so the complete `[y/N]` prompt is emitted as a line instead of being hidden after the tool filename.
+- Added closed approval outcomes with durable `approval/asked` and `approval/decided` pairs linked to the tool call, including distinct one-time and task-wide grants; missing or unavailable approval fails closed.
+- Added policy-aware system instructions, stricter `apply_patch` and shell tool guidance, and safe JSON presentation metadata for tool cards, locations, and redacted diff sizes.
+
 ## 0.4.2
 
 - Added a registry-backed tool execution pipeline with explicit preparation, authorization, dispatch, normalization, and observation stages.

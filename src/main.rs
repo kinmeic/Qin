@@ -1,5 +1,6 @@
 mod agent;
 mod agents_md;
+mod approval;
 mod checkpoint;
 mod cli;
 mod config;
