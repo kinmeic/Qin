@@ -32,11 +32,15 @@ pub struct ToolContext<'a> {
     pub dry_run: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolResult {
     pub content: String,
     pub exit_code: Option<i32>,
     pub completion_summary: Option<String>,
+    /// Renderer-only metadata. The model receives only `content`; this value
+    /// is safe for event consumers because it contains locations, sizes, and
+    /// status hints rather than file contents or raw commands.
+    pub presentation: Option<Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +87,7 @@ enum ToolHandler {
     WebSearch,
 }
 
+#[derive(Clone)]
 struct ToolDefinition {
     name: &'static str,
     description: &'static str,
@@ -234,25 +239,47 @@ pub async fn execute(
     arguments: &str,
     ctx: &mut ToolContext<'_>,
 ) -> Result<ToolResult> {
-    let (definition, args) = prepare_tool(name, arguments)?;
+    let prepared = prepare_tool(name, arguments, ctx)?;
     let started = Instant::now();
-    let audit_args = truncate(safe_args(name, &args), 8_192);
     ctx.events.tool_started_with_data(
         name,
-        &display_args(name, &args),
-        Some(tool_presentation(ctx.tool_call_id, name, &args, ctx.cwd)),
+        &display_args(name, &prepared.args),
+        Some(prepared.presentation.clone()),
     )?;
-    let authorization = authorize_tool(name, &definition, ctx);
+    let authorization = authorize_tool(name, &prepared.definition, ctx);
     let mut result = match authorization {
-        Ok(()) => dispatch_tool(definition.handler, &args, ctx).await,
+        Ok(()) => dispatch_tool(prepared.definition.handler, &prepared.args, ctx).await,
         Err(error) => Err(error),
     };
     normalize_result(&mut result, ctx.config.permissions.max_output_bytes);
-    observe_tool(call_id, name, &args, &audit_args, &result, started, ctx)?;
+    finalize_result(
+        call_id,
+        name,
+        &prepared.args,
+        ctx.cwd,
+        &mut result,
+        started.elapsed().as_millis() as u64,
+    );
+    observe_tool(
+        call_id,
+        name,
+        &prepared.args,
+        &prepared.audit_args,
+        &result,
+        started,
+        ctx,
+    )?;
     result
 }
 
-fn prepare_tool(name: &str, arguments: &str) -> Result<(ToolDefinition, Value)> {
+struct PreparedTool {
+    definition: ToolDefinition,
+    args: Value,
+    audit_args: String,
+    presentation: Value,
+}
+
+fn prepare_tool(name: &str, arguments: &str, ctx: &ToolContext<'_>) -> Result<PreparedTool> {
     let definition = find_tool_definition(name).with_context(|| format!("Unknown tool: {name}"))?;
     let args: Value = serde_json::from_str(arguments)
         .with_context(|| format!("Arguments for tool {name} are not valid JSON"))?;
@@ -260,7 +287,12 @@ fn prepare_tool(name: &str, arguments: &str) -> Result<(ToolDefinition, Value)> 
         bail!("Arguments for tool {name} must be a JSON object");
     }
     validate_argument_keys(name, &args)?;
-    Ok((definition, args))
+    Ok(PreparedTool {
+        presentation: tool_presentation(ctx.tool_call_id, name, &args, ctx.cwd),
+        audit_args: truncate(safe_args(name, &args), 8_192),
+        definition,
+        args,
+    })
 }
 
 fn authorize_tool(
@@ -305,6 +337,28 @@ fn normalize_result(result: &mut Result<ToolResult>, max_output_bytes: usize) {
     }
 }
 
+fn finalize_result(
+    call_id: &str,
+    name: &str,
+    args: &Value,
+    cwd: &Path,
+    result: &mut Result<ToolResult>,
+    duration_ms: u64,
+) {
+    if let Ok(value) = result {
+        let mut presentation = tool_presentation(call_id, name, args, cwd);
+        presentation["status"] = Value::String("completed".into());
+        presentation["duration_ms"] = Value::Number(duration_ms.into());
+        if let Some(exit_code) = value.exit_code {
+            presentation["exit_code"] = Value::Number(exit_code.into());
+        }
+        if let Some(summary) = &value.completion_summary {
+            presentation["summary"] = Value::String(one_line(summary));
+        }
+        value.presentation = Some(presentation);
+    }
+}
+
 fn observe_tool(
     call_id: &str,
     name: &str,
@@ -328,10 +382,12 @@ fn observe_tool(
                     name,
                     &summary,
                     elapsed,
-                    Some(json!({
-                        "tool_call_id": call_id,
-                        "status": "completed",
-                        "exit_code": value.exit_code,
+                    Some(value.presentation.clone().unwrap_or_else(|| {
+                        json!({
+                            "tool_call_id": call_id,
+                            "status": "completed",
+                            "exit_code": value.exit_code,
+                        })
                     })),
                 )?;
             }
@@ -431,7 +487,11 @@ fn validate_argument_keys(name: &str, args: &Value) -> Result<()> {
 fn list_directory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_existing(ctx.cwd, string(args, "path")?)?;
     approve_external_access(ctx, &path, "List directory")?;
-    let mut entries = fs::read_dir(&path)?
+    list_directory_at(&path)
+}
+
+fn list_directory_at(path: &Path) -> Result<ToolResult> {
+    let mut entries = fs::read_dir(path)?
         .take(1000)
         .map(|entry| {
             let entry = entry?;
@@ -460,7 +520,11 @@ fn read_file(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         .as_u64()
         .unwrap_or(ctx.config.permissions.max_output_bytes as u64)
         .min(ctx.config.permissions.max_output_bytes as u64);
-    let metadata = fs::metadata(&path)?;
+    read_file_at(&path, max)
+}
+
+fn read_file_at(path: &Path, max: u64) -> Result<ToolResult> {
+    let metadata = fs::metadata(path)?;
     if !metadata.is_file() {
         bail!("Not a regular file: {}", path.display())
     }
@@ -472,7 +536,7 @@ fn read_file(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         )
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    open_read_no_follow(&path)?
+    open_read_no_follow(path)?
         .take(max.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
@@ -484,7 +548,11 @@ fn read_file(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
 fn stat_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let path = resolve_existing(ctx.cwd, string(args, "path")?)?;
     approve_external_access(ctx, &path, "Inspect path")?;
-    let md = fs::symlink_metadata(&path)?;
+    stat_path_at(&path)
+}
+
+fn stat_path_at(path: &Path) -> Result<ToolResult> {
+    let md = fs::symlink_metadata(path)?;
     text_result(format!(
         "path={}\ntype={}\nbytes={}\nreadonly={}",
         path.display(),
@@ -500,6 +568,100 @@ fn stat_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         md.len(),
         md.permissions().readonly()
     ))
+}
+
+/// Returns true only for local, read-only calls that do not need shared
+/// approval or state. The caller still rechecks this condition inside the
+/// worker before touching the filesystem.
+pub fn is_parallel_read_only(name: &str, arguments: &str, config: &Config, cwd: &Path) -> bool {
+    if config.permissions.approval == "always"
+        || !matches!(name, "list_directory" | "read_file" | "stat_path")
+    {
+        return false;
+    }
+    let Ok(args) = serde_json::from_str::<Value>(arguments) else {
+        return false;
+    };
+    if !args.is_object() || validate_argument_keys(name, &args).is_err() {
+        return false;
+    }
+    let Ok(path) = resolve_existing(cwd, args["path"].as_str().unwrap_or_default()) else {
+        return false;
+    };
+    !is_external_path(cwd, &path)
+}
+
+/// Executes one previously classified local read-only call without touching
+/// the shared StateStore or EventSink. It is intentionally synchronous so the
+/// agent can run it on Tokio's blocking pool and obtain real filesystem
+/// overlap rather than merely interleaving async futures.
+pub fn execute_parallel_read_only(
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    config: &Config,
+    cwd: &Path,
+) -> Result<ToolResult> {
+    if !is_parallel_read_only(name, arguments, config, cwd) {
+        bail!("Tool {name} is not eligible for parallel read-only execution");
+    }
+    let args: Value = serde_json::from_str(arguments)?;
+    let path = resolve_existing(cwd, string(&args, "path")?)?;
+    let result = match name {
+        "list_directory" => list_directory_at(&path),
+        "read_file" => {
+            let max = args["max_bytes"]
+                .as_u64()
+                .unwrap_or(config.permissions.max_output_bytes as u64)
+                .min(config.permissions.max_output_bytes as u64);
+            read_file_at(&path, max)
+        }
+        "stat_path" => stat_path_at(&path),
+        _ => unreachable!("parallel eligibility checked above"),
+    }?;
+    let mut finalized = Ok(result);
+    normalize_result(&mut finalized, config.permissions.max_output_bytes);
+    finalize_result(call_id, name, &args, cwd, &mut finalized, 0);
+    finalized
+}
+
+pub fn presentation_for_call(
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    cwd: &Path,
+) -> Result<Value> {
+    let args: Value = serde_json::from_str(arguments)
+        .with_context(|| format!("Arguments for tool {name} are not valid JSON"))?;
+    validate_argument_keys(name, &args)?;
+    Ok(tool_presentation(call_id, name, &args, cwd))
+}
+
+pub struct ParallelAudit<'a> {
+    pub store: &'a mut StateStore,
+    pub session_id: &'a str,
+    pub call_id: &'a str,
+    pub name: &'a str,
+    pub arguments: &'a str,
+    pub result_text: &'a str,
+    pub status: &'a str,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+}
+
+pub fn record_parallel_audit(audit: ParallelAudit<'_>) -> Result<()> {
+    let args = serde_json::from_str(audit.arguments).unwrap_or_else(|_| json!({}));
+    audit.store.audit_tool(
+        audit.session_id,
+        audit.call_id,
+        audit.name,
+        &truncate(safe_args(audit.name, &args), 8_192),
+        &truncate(redact(audit.result_text), 8_192),
+        audit.status,
+        risk_for(audit.name, &args),
+        audit.exit_code,
+        audit.duration_ms,
+    )
 }
 
 fn create_directory(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
@@ -777,12 +939,17 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
             )?;
         }
     }
-    let interactive_terminal = (elevated || invokes_elevation) && io::stdin().is_terminal();
+    // The child always inherits stdin below. Even commands that are not
+    // elevated may pause for a username, password, confirmation, or another
+    // interactive answer, so qin must not rewrite that terminal line.
+    let child_can_prompt = io::stdin().is_terminal();
+    let interactive_terminal = (elevated || invokes_elevation) && child_can_prompt;
     ctx.events.command_started_with_data(
         ctx.cwd,
         elevated || invokes_elevation,
         timeout,
         interactive_terminal,
+        child_can_prompt,
         Some(json!({
             "tool_call_id": ctx.tool_call_id,
             "card": "terminal",
@@ -881,7 +1048,9 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                 }
                 None => break,
             },
-            _ = heartbeat.tick(), if !interactive_terminal => {
+            // Do not emit a heartbeat while the child has an interactive
+            // stdin: a prompt may be waiting on the current terminal line.
+            _ = heartbeat.tick(), if !interactive_terminal && !child_can_prompt => {
                 ctx.events.command_heartbeat_with_data(
                     started.elapsed().as_secs(),
                     Some(json!({"tool_call_id": ctx.tool_call_id})),
@@ -927,6 +1096,7 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         content: redact(&truncate(output, ctx.config.permissions.max_output_bytes)),
         exit_code: status.code(),
         completion_summary: None,
+        presentation: None,
     })
 }
 
@@ -1141,6 +1311,7 @@ async fn web_search(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
                     content: value.content,
                     exit_code: None,
                     completion_summary: Some(web_result_summary(value.result_count)),
+                    presentation: None,
                 });
             }
             Err(error) => errors.push(format!("{provider}: {error}")),
@@ -2662,6 +2833,7 @@ fn text(content: String) -> ToolResult {
         content,
         exit_code: None,
         completion_summary: None,
+        presentation: None,
     }
 }
 fn text_result(content: String) -> Result<ToolResult> {

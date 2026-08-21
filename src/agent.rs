@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,7 +12,10 @@ use uuid::Uuid;
 use crate::config::{COMPACT_TARGET_RATIO, Config, ModelConfig};
 use crate::event::EventSink;
 use crate::knowledge;
-use crate::state::{StateStore, StoredMessage, SummaryUpdate, ToolResultMetadata};
+use crate::state::{
+    RequestSnapshot, SessionEvent, StateStore, StoredMessage, SummaryUpdate, ToolResultMetadata,
+    request_snapshot_hash,
+};
 use crate::tools::{self, ToolContext};
 
 const SYSTEM_PROMPT: &str = r#"You are qin, a local agent running in the user's command-line environment. You share the user's current working directory.
@@ -64,6 +68,94 @@ struct ChatRequest<'a> {
 struct ChatResponse {
     choices: Vec<Choice>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ReplayLine {
+    #[serde(rename = "meta")]
+    Meta {
+        prompt: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        max_iterations: Option<u32>,
+    },
+    #[serde(rename = "assistant")]
+    Assistant {
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        tool_calls: Option<Vec<ToolCall>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayFixture {
+    pub prompt: String,
+    pub model: String,
+    pub max_iterations: Option<u32>,
+    pub responses: Vec<Message>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReplayReport {
+    pub session_id: String,
+    pub answer: String,
+    pub request_hashes: Vec<String>,
+    pub events: Vec<SessionEvent>,
+}
+
+pub fn load_replay_fixture(path: &Path) -> Result<ReplayFixture> {
+    let input = fs::read_to_string(path)
+        .with_context(|| format!("Unable to read replay fixture {}", path.display()))?;
+    let mut meta = None;
+    let mut responses = Vec::new();
+    for (line_number, line) in input.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ReplayLine>(line).with_context(|| {
+            format!("Replay fixture line {} is not valid JSONL", line_number + 1)
+        })? {
+            ReplayLine::Meta {
+                prompt,
+                model,
+                max_iterations,
+            } => {
+                if meta.is_some() {
+                    bail!("Replay fixture contains more than one meta record");
+                }
+                meta = Some((prompt, model, max_iterations));
+            }
+            ReplayLine::Assistant {
+                content,
+                tool_calls,
+            } => {
+                if meta.is_none() {
+                    bail!("Replay fixture must begin with a meta record");
+                }
+                let message = Message {
+                    role: "assistant".into(),
+                    content,
+                    tool_calls,
+                    tool_call_id: None,
+                };
+                validate_assistant_message(&message)?;
+                responses.push(message);
+            }
+        }
+    }
+    let (prompt, model, max_iterations) = meta.context("Replay fixture has no meta record")?;
+    if responses.is_empty() {
+        bail!("Replay fixture contains no assistant responses");
+    }
+    Ok(ReplayFixture {
+        prompt,
+        model: model.unwrap_or_else(|| "replay".into()),
+        max_iterations,
+        responses,
+    })
+}
 #[derive(Deserialize)]
 struct Choice {
     message: Message,
@@ -75,6 +167,56 @@ pub struct RunOptions<'a> {
     pub assume_yes: bool,
     pub dry_run: bool,
     pub agents_md: Option<&'a str>,
+}
+
+enum ModelResponder<'a> {
+    Live(&'a reqwest::Client),
+    Replay {
+        responses: Vec<Message>,
+        request_hashes: Vec<String>,
+    },
+}
+
+impl ModelResponder<'_> {
+    async fn request(
+        &mut self,
+        model: &ModelConfig,
+        messages: &[Message],
+        tools: &[Value],
+        expected_hash: &str,
+    ) -> Result<Message> {
+        match self {
+            Self::Live(client) => {
+                request_model(client, model, messages, tools, Some(expected_hash)).await
+            }
+            Self::Replay {
+                responses,
+                request_hashes,
+            } => {
+                let actual_hash = request_fingerprint(model, messages, tools)?;
+                if actual_hash != expected_hash {
+                    bail!(
+                        "Replay request changed after its durable snapshot (expected {expected_hash}, got {actual_hash})"
+                    );
+                }
+                request_hashes.push(actual_hash);
+                let message = if responses.is_empty() {
+                    bail!("Replay fixture ran out of assistant responses")
+                } else {
+                    responses.remove(0)
+                };
+                validate_assistant_message(&message)?;
+                Ok(message)
+            }
+        }
+    }
+
+    fn request_hashes(&self) -> Vec<String> {
+        match self {
+            Self::Live(_) => Vec::new(),
+            Self::Replay { request_hashes, .. } => request_hashes.clone(),
+        }
+    }
 }
 
 pub async fn execute(
@@ -150,9 +292,11 @@ pub async fn execute(
             &recalled,
             prompt,
         );
+        let mut responder = ModelResponder::Live(&client);
         run_loop(
             config,
             &client,
+            &mut responder,
             store,
             session_id,
             events,
@@ -195,10 +339,114 @@ pub async fn execute(
     Ok(answer)
 }
 
+/// Replays a JSONL fixture through the same durable turn and tool pipeline as
+/// a live model run. Only the model transport is replaced; tool authorization,
+/// result normalization, event persistence, and recovery invariants stay
+/// identical.
+pub async fn execute_replay(
+    config: &Config,
+    store: &mut StateStore,
+    session_id: &str,
+    fixture_path: &Path,
+    events: &EventSink,
+    assume_yes: bool,
+    dry_run: bool,
+) -> Result<ReplayReport> {
+    let fixture = load_replay_fixture(fixture_path)?;
+    let mut replay_config = config.clone();
+    if let Some(max_iterations) = fixture.max_iterations {
+        replay_config.agent.max_iterations = max_iterations;
+    }
+    let configured_model = replay_config.primary_model()?.model.clone();
+    if configured_model != fixture.model {
+        bail!(
+            "Replay fixture expects model {}, but the active configuration uses {}",
+            fixture.model,
+            configured_model
+        );
+    }
+    let started = tokio::time::Instant::now();
+    let cwd = std::env::current_dir()?;
+    let user_message = StoredMessage {
+        role: "user".into(),
+        content: Some(fixture.prompt.clone()),
+        tool_calls: None,
+        tool_call_id: None,
+    };
+    let history = store
+        .load_context_messages(session_id)?
+        .into_iter()
+        .map(|entry| {
+            Ok(ContextMessage {
+                seq: entry.seq,
+                message: from_stored(entry.message)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let summary = store.summary(session_id)?.unwrap_or_default();
+    let turn_id = Uuid::new_v4().to_string();
+    store.start_turn(session_id, &turn_id, &user_message, &cwd)?;
+    let result = async {
+        let schemas = if replay_config.primary_model()?.supports_tools {
+            tools::definitions(&replay_config)
+        } else {
+            Vec::new()
+        };
+        let system = system_prompt(&replay_config, None);
+        let runtime = runtime_context("replay", Some(fixture_path))?;
+        let mut messages =
+            compose_messages(&system, &summary, &history, &runtime, "", &fixture.prompt);
+        let client = http_client()?;
+        let mut responder = ModelResponder::Replay {
+            responses: fixture.responses,
+            request_hashes: Vec::new(),
+        };
+        let options = RunOptions {
+            source: "replay",
+            source_path: Some(fixture_path),
+            assume_yes,
+            dry_run,
+            agents_md: None,
+        };
+        let answer = run_loop(
+            &replay_config,
+            &client,
+            &mut responder,
+            store,
+            session_id,
+            events,
+            &options,
+            &cwd,
+            &schemas,
+            &mut messages,
+            &turn_id,
+            started,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>((answer, responder.request_hashes()))
+    }
+    .await;
+    let (status, error) = match &result {
+        Ok(_) => ("completed", None),
+        Err(error) => ("failed", Some(error.to_string())),
+    };
+    store.finish_turn(session_id, &turn_id, status, error.as_deref())?;
+    store.append_messages_with_summary(session_id, &[], &cwd, None)?;
+    store.validate_session(session_id)?;
+    let (answer, request_hashes) = result?;
+    Ok(ReplayReport {
+        session_id: session_id.into(),
+        answer,
+        request_hashes,
+        events: store.load_events(session_id)?,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     config: &Config,
     client: &reqwest::Client,
+    responder: &mut ModelResponder<'_>,
     store: &mut StateStore,
     session_id: &str,
     events: &EventSink,
@@ -223,6 +471,10 @@ async fn run_loop(
         }
         ensure_within_hard_limit(config, messages, schemas)?;
         let remaining = remaining_time(config, started)?;
+        let model = config.primary_model()?;
+        let snapshot = build_request_snapshot(model, messages, schemas, iteration)?;
+        let request_hash = snapshot.input_sha256.clone();
+        store.append_request_snapshot(session_id, turn_id, &snapshot)?;
         events.phase(&format!(
             "Requesting the model (round {})...",
             iteration + 1
@@ -230,7 +482,7 @@ async fn run_loop(
         let outcome = tokio::select! {
             result = tokio::time::timeout(
                 remaining,
-                request_model(client, config.primary_model()?, messages, schemas),
+                responder.request(model, messages, schemas, &request_hash),
             ) => result
                 .context("The agent reached its total runtime limit")??,
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
@@ -266,6 +518,23 @@ async fn run_loop(
                 "the per-run tool-call limit was reached",
             )?;
             bail!("The agent reached its tool-call limit");
+        }
+        let parallel = config.primary_model()?.supports_parallel_tools
+            && calls.len() > 1
+            && calls.iter().all(|call| {
+                tools::is_parallel_read_only(
+                    &call.function.name,
+                    &call.function.arguments,
+                    config,
+                    cwd,
+                )
+            });
+        if parallel {
+            execute_parallel_tools(
+                config, store, session_id, turn_id, events, cwd, &calls, messages, started,
+            )
+            .await?;
+            continue;
         }
         for (index, call) in calls.iter().enumerate() {
             let remaining = match remaining_time(config, started) {
@@ -314,13 +583,20 @@ async fn run_loop(
                 )
                 .await
                 {
-                    Ok(Ok(result)) => (result.content, false, "completed", result.exit_code),
+                    Ok(Ok(result)) => (
+                        result.content,
+                        false,
+                        "completed",
+                        result.exit_code,
+                        result.presentation,
+                    ),
                     Ok(Err(error)) => {
                         let canceled = error.to_string() == "Command canceled by the user";
                         (
                             format!("Tool execution failed: {error:#}"),
                             canceled,
                             "failed",
+                            None,
                             None,
                         )
                     }
@@ -335,11 +611,11 @@ async fn run_loop(
                             error,
                             tool_started.elapsed().as_millis() as u64,
                         )?;
-                        (error.into(), true, "interrupted", None)
+                        (error.into(), true, "interrupted", None, None)
                     }
                 }
             };
-            let (result, canceled, status, exit_code) = tool_outcome;
+            let (result, canceled, status, exit_code, presentation) = tool_outcome;
             let bounded = truncate_tool_result(&result, config.context.tool_result_max_tokens);
             let message = Message::tool(&call.id, bounded);
             let stored = to_stored(&message)?;
@@ -352,6 +628,7 @@ async fn run_loop(
                     status,
                     exit_code,
                     duration_ms: tool_started.elapsed().as_millis() as u64,
+                    presentation: presentation.as_ref(),
                 },
             )?;
             messages.push(message);
@@ -373,6 +650,225 @@ async fn run_loop(
         }
     }
     bail!("The agent reached its maximum iteration count without producing a final answer")
+}
+
+struct ParallelToolOutcome {
+    index: usize,
+    result: Result<tools::ToolResult, String>,
+    interrupted: bool,
+    duration_ms: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_parallel_tools(
+    config: &Config,
+    store: &mut StateStore,
+    session_id: &str,
+    turn_id: &str,
+    events: &EventSink,
+    cwd: &Path,
+    calls: &[ToolCall],
+    messages: &mut Vec<Message>,
+    started: tokio::time::Instant,
+) -> Result<()> {
+    let remaining = match remaining_time(config, started) {
+        Ok(remaining) => remaining,
+        Err(error) => {
+            record_unexecuted_tool_calls(
+                store,
+                session_id,
+                turn_id,
+                calls,
+                "the agent reached its total runtime limit",
+            )?;
+            return Err(error);
+        }
+    };
+    let deadline = tokio::time::Instant::now() + remaining;
+    let mut futures = futures_util::stream::FuturesUnordered::new();
+    for (index, call) in calls.iter().enumerate() {
+        store.append_tool_call(
+            session_id,
+            turn_id,
+            &call.id,
+            &call.function.name,
+            &call.function.arguments,
+        )?;
+        let presentation = tools::presentation_for_call(
+            &call.id,
+            &call.function.name,
+            &call.function.arguments,
+            cwd,
+        )?;
+        events.tool_started_with_data(
+            &call.function.name,
+            &format!("parallel call {}", call.id),
+            Some(presentation),
+        )?;
+        let call_id = call.id.clone();
+        let name = call.function.name.clone();
+        let arguments = call.function.arguments.clone();
+        let config = config.clone();
+        let cwd = cwd.to_path_buf();
+        let call_started = tokio::time::Instant::now();
+        futures.push(async move {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let worker = tokio::task::spawn_blocking(move || {
+                tools::execute_parallel_read_only(&call_id, &name, &arguments, &config, &cwd)
+            });
+            let (result, interrupted) = match tokio::time::timeout(remaining, worker).await {
+                Ok(Ok(result)) => (result.map_err(|error| format!("{error:#}")), false),
+                Ok(Err(error)) => (
+                    Err(format!("Parallel read-only worker failed: {error}")),
+                    false,
+                ),
+                Err(_) => (
+                    Err(
+                        "The agent reached its total runtime limit during parallel read-only execution"
+                            .into(),
+                    ),
+                    true,
+                ),
+            };
+            ParallelToolOutcome {
+                index,
+                result,
+                interrupted,
+                duration_ms: call_started.elapsed().as_millis() as u64,
+            }
+        });
+    }
+
+    let mut outcomes = BTreeMap::new();
+    let mut canceled = false;
+    while !futures.is_empty() {
+        tokio::select! {
+            outcome = futures.next() => {
+                match outcome {
+                    Some(outcome) => {
+                        outcomes.insert(outcome.index, outcome);
+                    }
+                    None => break,
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                canceled = true;
+                break;
+            }
+        }
+    }
+
+    let mut interrupted = canceled;
+    for (index, call) in calls.iter().enumerate() {
+        // A call whose worker never reported (canceled while still running)
+        // gets an explicit interrupted record, keeping the turn balanced.
+        let outcome = outcomes
+            .remove(&index)
+            .unwrap_or_else(|| ParallelToolOutcome {
+                index,
+                result: Err("The agent was canceled during parallel read-only execution".into()),
+                interrupted: true,
+                duration_ms: 0,
+            });
+        let (content, status, exit_code, presentation) = match outcome.result {
+            Ok(result) => {
+                let summary = result.completion_summary.clone().unwrap_or_else(|| {
+                    result
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(160)
+                        .collect()
+                });
+                let mut presentation = result.presentation.clone();
+                if let Some(object) = presentation.as_mut().and_then(Value::as_object_mut) {
+                    object.insert(
+                        "duration_ms".into(),
+                        Value::Number(outcome.duration_ms.into()),
+                    );
+                }
+                events.tool_finished_with_data(
+                    &call.function.name,
+                    &summary,
+                    outcome.duration_ms as u128,
+                    presentation.clone(),
+                )?;
+                tools::record_parallel_audit(tools::ParallelAudit {
+                    store,
+                    session_id,
+                    call_id: &call.id,
+                    name: &call.function.name,
+                    arguments: &call.function.arguments,
+                    result_text: &result.content,
+                    status: "completed",
+                    exit_code: result.exit_code,
+                    duration_ms: outcome.duration_ms,
+                })?;
+                (result.content, "completed", result.exit_code, presentation)
+            }
+            Err(error) => {
+                let is_interrupted = outcome.interrupted;
+                interrupted |= is_interrupted;
+                events.tool_failed_with_data(
+                    &call.function.name,
+                    &error,
+                    outcome.duration_ms as u128,
+                    Some(serde_json::json!({
+                        "tool_call_id": call.id,
+                        "status": if is_interrupted { "interrupted" } else { "failed" },
+                        "parallel": true,
+                    })),
+                )?;
+                tools::record_parallel_audit(tools::ParallelAudit {
+                    store,
+                    session_id,
+                    call_id: &call.id,
+                    name: &call.function.name,
+                    arguments: &call.function.arguments,
+                    result_text: &error,
+                    status: if is_interrupted {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    },
+                    exit_code: None,
+                    duration_ms: outcome.duration_ms,
+                })?;
+                (
+                    format!("Tool execution failed: {error}"),
+                    if is_interrupted {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    },
+                    None,
+                    None,
+                )
+            }
+        };
+        let bounded = truncate_tool_result(&content, config.context.tool_result_max_tokens);
+        let message = Message::tool(&call.id, bounded);
+        let stored = to_stored(&message)?;
+        store.append_tool_result(
+            session_id,
+            turn_id,
+            &call.id,
+            &stored,
+            ToolResultMetadata {
+                status,
+                exit_code,
+                duration_ms: outcome.duration_ms,
+                presentation: presentation.as_ref(),
+            },
+        )?;
+        messages.push(message);
+    }
+    if interrupted {
+        bail!("Agent canceled or timed out during parallel tool execution");
+    }
+    Ok(())
 }
 
 /// Persists explicit "not executed" records for tool calls the agent never
@@ -405,6 +901,7 @@ fn record_unexecuted_tool_calls(
                 status: "failed",
                 exit_code: None,
                 duration_ms: 0,
+                presentation: None,
             },
         )?;
     }
@@ -429,6 +926,7 @@ async fn request_model(
     model: &ModelConfig,
     messages: &[Message],
     tools: &[Value],
+    expected_hash: Option<&str>,
 ) -> Result<Message> {
     let api_key = model.resolve_api_key()?;
     let endpoint = chat_endpoint(&model.base_url);
@@ -443,6 +941,14 @@ async fn request_model(
             max_tokens: model.max_output_tokens,
             stream: model.stream,
         };
+        if let Some(expected_hash) = expected_hash {
+            let actual_hash = request_fingerprint(model, messages, tools)?;
+            if actual_hash != expected_hash {
+                bail!(
+                    "Model request changed after its durable snapshot (expected {expected_hash}, got {actual_hash})"
+                );
+            }
+        }
         let response = client
             .post(&endpoint)
             .bearer_auth(&api_key)
@@ -806,7 +1312,7 @@ async fn generate_summary(
         ),
         Message::user(source),
     ];
-    request_model(client, model, &messages, &[])
+    request_model(client, model, &messages, &[], None)
         .await
         .ok()
         .and_then(|message| message.content)
@@ -936,6 +1442,53 @@ fn estimate_schemas(schemas: &[Value]) -> u64 {
     serde_json::to_string(schemas)
         .map(|json| (json.len() as u64).div_ceil(4))
         .unwrap_or(0)
+}
+
+fn request_fingerprint(
+    model: &ModelConfig,
+    messages: &[Message],
+    tools: &[Value],
+) -> Result<String> {
+    Ok(build_request_snapshot(model, messages, tools, 0)?.input_sha256)
+}
+
+fn build_request_snapshot(
+    model: &ModelConfig,
+    messages: &[Message],
+    tools: &[Value],
+    iteration: u32,
+) -> Result<RequestSnapshot> {
+    let request = ChatRequest {
+        model: &model.model,
+        messages,
+        tools: (!tools.is_empty()).then_some(tools),
+        tool_choice: (!tools.is_empty()).then_some("auto"),
+        max_tokens: model.max_output_tokens,
+        stream: model.stream,
+    };
+    let value = serde_json::to_value(&request)?;
+    let mut snapshot = RequestSnapshot {
+        iteration,
+        model: value["model"]
+            .as_str()
+            .context("The model request did not contain a model name")?
+            .into(),
+        max_tokens: value["max_tokens"]
+            .as_u64()
+            .context("The model request did not contain max_tokens")?,
+        stream: value["stream"]
+            .as_bool()
+            .context("The model request did not contain stream")?,
+        tool_choice: value["tool_choice"].as_str().map(str::to_owned),
+        messages: value["messages"].clone(),
+        tools: value
+            .get("tools")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        input_sha256: String::new(),
+    };
+    snapshot.input_sha256 = request_snapshot_hash(&snapshot)?;
+    Ok(snapshot)
 }
 fn truncate_tool_result(value: &str, max_tokens: usize) -> String {
     let max = max_tokens * 3;
@@ -1367,21 +1920,80 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             .load_events(&session)
             .unwrap()
             .into_iter()
-            .map(|event| event.kind)
+            .map(|event| event.kind.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
             event_kinds,
             vec![
                 "turn/start",
                 "user/message",
+                "request/header",
                 "assistant/message",
                 "tool/call",
                 "tool/result",
+                "request/header",
                 "assistant/message",
                 "turn/end"
             ]
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn replays_jsonl_fixture_through_the_real_tool_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.storage.database = "replay.db".into();
+        config.knowledge.enabled = false;
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                api_style: "chat_completions".into(),
+                model: "replay-model".into(),
+                summary_model: String::new(),
+                api_key_env: None,
+                api_key: Some("replay-only".into()),
+                context_window: 16_384,
+                max_output_tokens: 1_024,
+                stream: false,
+                supports_tools: true,
+                supports_parallel_tools: true,
+                supports_native_search: false,
+            },
+        );
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("replay")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/replay/basic.jsonl");
+        let report = execute_replay(
+            &config,
+            &mut store,
+            &session,
+            &fixture,
+            &EventSink::new(true, false, false),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.answer, "Replay complete.");
+        assert_eq!(report.request_hashes.len(), 2);
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| event.kind == crate::state::EventKind::RequestHeader)
+        );
+        store.validate_session(&session).unwrap();
+        let result = report
+            .events
+            .iter()
+            .find(|event| event.kind == crate::state::EventKind::ToolResult)
+            .unwrap();
+        assert_eq!(result.data["presentation"]["kind"], "read");
     }
 
     #[tokio::test]
@@ -1460,7 +2072,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.kind == "tool/result")
+                .filter(|event| event.kind == crate::state::EventKind::ToolResult)
                 .count(),
             2
         );
@@ -1468,6 +2080,87 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             events.last().map(|event| event.kind.as_str()),
             Some("turn/end")
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_with_exhausted_clock_keeps_the_conversation_balanced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.knowledge.enabled = false;
+        config.storage.database = "parallel.db".into();
+        config.agent.wall_time_seconds = 1;
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("parallel")).unwrap();
+        let turn_id = "turn-parallel-exhausted";
+        store
+            .start_turn(
+                &session,
+                turn_id,
+                &StoredMessage {
+                    role: "user".into(),
+                    content: Some("go".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                dir.path(),
+            )
+            .unwrap();
+        let assistant = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "p1".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "list_directory".into(),
+                        arguments: "{\"path\":\".\"}".into(),
+                    },
+                },
+                ToolCall {
+                    id: "p2".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "stat_path".into(),
+                        arguments: "{\"path\":\".\"}".into(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+        };
+        store
+            .append_assistant_message(&session, turn_id, &to_stored(&assistant).unwrap())
+            .unwrap();
+        let calls = assistant.tool_calls.clone().unwrap();
+        let mut messages = vec![assistant];
+        let started = tokio::time::Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap();
+        let result = execute_parallel_tools(
+            &config,
+            &mut store,
+            &session,
+            turn_id,
+            &EventSink::new(true, false, false),
+            dir.path(),
+            &calls,
+            &mut messages,
+            started,
+        )
+        .await;
+        assert!(result.is_err());
+
+        let stored = store.load_messages(&session).unwrap();
+        assert_eq!(stored.len(), 4);
+        assert_eq!(stored[2].tool_call_id.as_deref(), Some("p1"));
+        assert_eq!(stored[3].tool_call_id.as_deref(), Some("p2"));
+        store
+            .finish_turn(&session, turn_id, "failed", None)
+            .unwrap();
+        store.validate_session(&session).unwrap();
     }
 
     #[tokio::test]
@@ -1495,7 +2188,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             supports_native_search: false,
         };
         let client = http_client().unwrap();
-        let message = request_model(&client, &model, &[Message::user("hello")], &[])
+        let message = request_model(&client, &model, &[Message::user("hello")], &[], None)
             .await
             .unwrap();
         assert_eq!(message.content.as_deref(), Some("Hello"));

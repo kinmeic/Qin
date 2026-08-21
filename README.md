@@ -133,6 +133,8 @@ api_key_env = "QIN_API_KEY"
 context_window = 128000
 max_output_tokens = 4096
 supports_native_search = false
+# Set true only when the provider/model can emit independent tool calls.
+supports_parallel_tools = false
 
 [context]
 compact_trigger_ratio = 0.9
@@ -208,6 +210,17 @@ qin fromfile ./task.md
 ```
 
 The file must be a non-empty UTF-8 text file and must fit within the configured input-size limit. Its contents become the user prompt for the current task.
+
+### Replay a deterministic JSONL fixture
+
+Use `replay` to exercise the real tool, persistence, approval, and rendering paths without contacting a model API:
+
+```bash
+qin --config ./replay-config.toml --yes replay ./fixtures/replay/basic.jsonl
+./scripts/replay-smoke.sh
+```
+
+The first JSONL record is `{"type":"meta","prompt":"...","model":"..."}`; following `assistant` records contain the pre-recorded model messages. Request snapshots are persisted with the session event log, and `supports_parallel_tools = true` enables concurrency only for independent local read-only calls; writes, approvals, external paths, and shell commands remain serialized.
 
 ### Use administrator privileges
 

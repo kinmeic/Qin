@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
@@ -88,11 +89,302 @@ pub struct SequencedMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionEvent {
     pub seq: i64,
-    pub kind: String,
+    pub kind: EventKind,
     pub turn_id: String,
     pub tool_call_id: Option<String>,
     pub data: Value,
     pub created_at: String,
+}
+
+/// Stable event vocabulary for the append-only session log.
+///
+/// The database keeps the slash-separated names for backwards-compatible
+/// inspection and JSON export, while Rust code can no longer silently ignore a
+/// misspelled event kind.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    #[serde(rename = "turn/start")]
+    TurnStart,
+    #[serde(rename = "turn/end")]
+    TurnEnd,
+    #[serde(rename = "user/message")]
+    UserMessage,
+    #[serde(rename = "assistant/message")]
+    AssistantMessage,
+    #[serde(rename = "request/header")]
+    RequestHeader,
+    #[serde(rename = "tool/call")]
+    ToolCall,
+    #[serde(rename = "tool/result")]
+    ToolResult,
+    #[serde(rename = "approval/asked")]
+    ApprovalAsked,
+    #[serde(rename = "approval/decided")]
+    ApprovalDecided,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnStart => "turn/start",
+            Self::TurnEnd => "turn/end",
+            Self::UserMessage => "user/message",
+            Self::AssistantMessage => "assistant/message",
+            Self::RequestHeader => "request/header",
+            Self::ToolCall => "tool/call",
+            Self::ToolResult => "tool/result",
+            Self::ApprovalAsked => "approval/asked",
+            Self::ApprovalDecided => "approval/decided",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "turn/start" => Ok(Self::TurnStart),
+            "turn/end" => Ok(Self::TurnEnd),
+            "user/message" => Ok(Self::UserMessage),
+            "assistant/message" => Ok(Self::AssistantMessage),
+            "request/header" => Ok(Self::RequestHeader),
+            "tool/call" => Ok(Self::ToolCall),
+            "tool/result" => Ok(Self::ToolResult),
+            "approval/asked" => Ok(Self::ApprovalAsked),
+            "approval/decided" => Ok(Self::ApprovalDecided),
+            other => bail!("Unknown session event kind: {other}"),
+        }
+    }
+}
+
+/// Exact model-facing request envelope persisted before each model call.
+/// `messages` and `tools` are JSON values rather than agent types so the
+/// durable state layer stays independent from the model transport module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestSnapshot {
+    pub iteration: u32,
+    pub model: String,
+    pub max_tokens: u64,
+    pub stream: bool,
+    pub tool_choice: Option<String>,
+    pub messages: Value,
+    pub tools: Value,
+    pub input_sha256: String,
+}
+
+#[derive(Serialize)]
+struct RequestFingerprint<'a> {
+    model: &'a str,
+    messages: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a str>,
+    max_tokens: u64,
+    stream: bool,
+}
+
+pub fn request_snapshot_hash(snapshot: &RequestSnapshot) -> Result<String> {
+    let tools = (!snapshot.tools.as_array().is_some_and(Vec::is_empty)).then_some(&snapshot.tools);
+    let fingerprint = RequestFingerprint {
+        model: &snapshot.model,
+        messages: &snapshot.messages,
+        tools,
+        tool_choice: snapshot.tool_choice.as_deref(),
+        max_tokens: snapshot.max_tokens,
+        stream: snapshot.stream,
+    };
+    Ok(sha256(&serde_json::to_string(&fingerprint)?))
+}
+
+struct TurnInvariant {
+    user_message: bool,
+    last_request_iteration: Option<u32>,
+    request_pending: bool,
+    assistant_call_ids: HashMap<String, ()>,
+    call_ids: HashMap<String, ()>,
+    result_ids: HashMap<String, ()>,
+}
+
+/// Checks the durable event state machine without mutating it.
+///
+/// An unfinished turn is allowed at the end of the log because a process can
+/// die between two durable writes; `recover_session` closes that gap with
+/// explicit interrupted results. A closed turn, however, must be balanced and
+/// every request header must contain a complete model-visible envelope.
+pub fn validate_session_events(events: &[SessionEvent]) -> Result<()> {
+    let mut turns = HashMap::<String, TurnInvariant>::new();
+    for (index, event) in events.iter().enumerate() {
+        let expected_seq = index as i64 + 1;
+        if event.seq != expected_seq {
+            bail!(
+                "Session event sequence is not contiguous: expected {expected_seq}, got {}",
+                event.seq
+            );
+        }
+        if event.turn_id.trim().is_empty() {
+            bail!("Session event {} has an empty turn id", event.seq);
+        }
+        match event.kind {
+            EventKind::TurnStart => {
+                if turns
+                    .insert(
+                        event.turn_id.clone(),
+                        TurnInvariant {
+                            user_message: false,
+                            last_request_iteration: None,
+                            request_pending: false,
+                            assistant_call_ids: HashMap::new(),
+                            call_ids: HashMap::new(),
+                            result_ids: HashMap::new(),
+                        },
+                    )
+                    .is_some()
+                {
+                    bail!("Turn {} started more than once", event.turn_id);
+                }
+            }
+            EventKind::TurnEnd => {
+                let turn = turns
+                    .remove(&event.turn_id)
+                    .with_context(|| format!("Turn {} ended without a start", event.turn_id))?;
+                if !turn.user_message {
+                    bail!("Turn {} ended without a user message", event.turn_id);
+                }
+                for call_id in turn.assistant_call_ids.keys() {
+                    if !turn.call_ids.contains_key(call_id) {
+                        bail!(
+                            "Turn {} ended without a durable tool/call for {call_id}",
+                            event.turn_id
+                        );
+                    }
+                }
+                for call_id in turn.call_ids.keys() {
+                    if !turn.result_ids.contains_key(call_id) {
+                        bail!(
+                            "Turn {} ended without a durable tool/result for {call_id}",
+                            event.turn_id
+                        );
+                    }
+                }
+            }
+            _ => {
+                let turn = turns.get_mut(&event.turn_id).with_context(|| {
+                    format!(
+                        "Event {} ({}) belongs to a turn that is not open",
+                        event.seq,
+                        event.kind.as_str()
+                    )
+                })?;
+                match event.kind {
+                    EventKind::UserMessage => {
+                        if turn.user_message {
+                            bail!("Turn {} has multiple user messages", event.turn_id);
+                        }
+                        turn.user_message = true;
+                    }
+                    EventKind::AssistantMessage => {
+                        if turn.last_request_iteration.is_some() {
+                            if !turn.request_pending {
+                                bail!(
+                                    "Turn {} has an assistant response without a request header",
+                                    event.turn_id
+                                );
+                            }
+                            turn.request_pending = false;
+                        }
+                        if let Some(message) = stored_message_from_event(&event.data) {
+                            for call in tool_calls_from_message(&message) {
+                                if turn
+                                    .assistant_call_ids
+                                    .insert(call.id.clone(), ())
+                                    .is_some()
+                                {
+                                    bail!("Turn {} reused tool-call id {}", event.turn_id, call.id);
+                                }
+                            }
+                        } else {
+                            bail!("Assistant event {} has no valid message", event.seq);
+                        }
+                    }
+                    EventKind::RequestHeader => {
+                        let snapshot: RequestSnapshot = serde_json::from_value(event.data.clone())
+                            .with_context(|| {
+                                format!("Request header event {} is malformed", event.seq)
+                            })?;
+                        if !snapshot.messages.is_array() || !snapshot.tools.is_array() {
+                            bail!(
+                                "Request header event {} has invalid envelope arrays",
+                                event.seq
+                            );
+                        }
+                        if turn
+                            .last_request_iteration
+                            .is_some_and(|last| snapshot.iteration <= last)
+                        {
+                            bail!(
+                                "Turn {} has non-increasing request iterations",
+                                event.turn_id
+                            );
+                        }
+                        turn.last_request_iteration = Some(snapshot.iteration);
+                        turn.request_pending = true;
+                        if snapshot.input_sha256.len() != 64
+                            || !snapshot
+                                .input_sha256
+                                .bytes()
+                                .all(|byte| byte.is_ascii_hexdigit())
+                        {
+                            bail!(
+                                "Request header event {} has an invalid input hash",
+                                event.seq
+                            );
+                        }
+                        let expected_hash = request_snapshot_hash(&snapshot)?;
+                        if snapshot.input_sha256 != expected_hash {
+                            bail!("Request header event {} has a stale input hash", event.seq);
+                        }
+                    }
+                    EventKind::ToolCall => {
+                        let call_id = event
+                            .tool_call_id
+                            .as_deref()
+                            .context("Tool-call event has no tool-call id")?;
+                        if turn.call_ids.insert(call_id.to_owned(), ()).is_some() {
+                            bail!("Turn {} recorded tool call {call_id} twice", event.turn_id);
+                        }
+                    }
+                    EventKind::ToolResult => {
+                        let call_id = event
+                            .tool_call_id
+                            .as_deref()
+                            .context("Tool-result event has no tool-call id")?;
+                        if !turn.call_ids.contains_key(call_id) {
+                            bail!(
+                                "Turn {} recorded a result before tool call {call_id}",
+                                event.turn_id
+                            );
+                        }
+                        if turn.result_ids.insert(call_id.to_owned(), ()).is_some() {
+                            bail!(
+                                "Turn {} recorded tool result {call_id} twice",
+                                event.turn_id
+                            );
+                        }
+                    }
+                    EventKind::ApprovalAsked | EventKind::ApprovalDecided => {
+                        if let Some(call_id) = event.tool_call_id.as_deref()
+                            && !turn.call_ids.contains_key(call_id)
+                        {
+                            bail!(
+                                "Approval event {} references unknown tool call {call_id}",
+                                event.seq
+                            );
+                        }
+                    }
+                    EventKind::TurnStart | EventKind::TurnEnd => unreachable!(),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +392,7 @@ pub struct ToolResultMetadata<'a> {
     pub status: &'a str,
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
+    pub presentation: Option<&'a Value>,
 }
 
 pub struct SummaryUpdate {
@@ -398,11 +691,28 @@ struct PendingAudit {
 }
 
 const MAX_EVENT_DATA_BYTES: usize = 1024 * 1024;
+/// Request envelopes carry the full model-visible context, which is
+/// legitimately far larger than any single message: context_window may be
+/// configured up to two million tokens. Unlike message events, a snapshot
+/// must stay byte-exact so its input hash keeps matching on reload, so it is
+/// never truncated and gets its own ceiling.
+const MAX_SNAPSHOT_EVENT_DATA_BYTES: usize = 64 * 1024 * 1024;
 
-fn encode_event_data(data: &Value) -> Result<String> {
+fn event_data_limit(kind: EventKind) -> usize {
+    if kind == EventKind::RequestHeader {
+        MAX_SNAPSHOT_EVENT_DATA_BYTES
+    } else {
+        MAX_EVENT_DATA_BYTES
+    }
+}
+
+fn encode_event_data(data: &Value, max_bytes: usize) -> Result<String> {
     let encoded = serde_json::to_string(data)?;
-    if encoded.len() > MAX_EVENT_DATA_BYTES {
-        bail!("Session event data exceeds the 1 MiB size limit");
+    if encoded.len() > max_bytes {
+        bail!(
+            "Session event data exceeds the size limit ({} > {max_bytes} bytes)",
+            encoded.len()
+        );
     }
     Ok(encoded)
 }
@@ -410,18 +720,18 @@ fn encode_event_data(data: &Value) -> Result<String> {
 /// Bounds an event payload to the size limit. Oversized message content is
 /// truncated only in the event copy; the materialized messages table always
 /// keeps the full content, so recovery never depends on the truncated text.
-fn bound_event_data(mut data: Value) -> Result<Value> {
-    if serde_json::to_string(&data)?.len() <= MAX_EVENT_DATA_BYTES {
+fn bound_event_data(mut data: Value, max_bytes: usize) -> Result<Value> {
+    if serde_json::to_string(&data)?.len() <= max_bytes {
         return Ok(data);
     }
     if let Some(message) = data.get_mut("message").and_then(Value::as_object_mut) {
         if let Some(Value::String(content)) = message.get_mut("content") {
-            content.truncate(char_boundary(content, MAX_EVENT_DATA_BYTES / 2));
+            content.truncate(char_boundary(content, max_bytes / 2));
             content.push_str("\n[content truncated in the event log]");
             message.insert("event_content_truncated".into(), Value::Bool(true));
         }
     }
-    encode_event_data(&data)?;
+    encode_event_data(&data, max_bytes)?;
     Ok(data)
 }
 
@@ -439,7 +749,7 @@ fn char_boundary(value: &str, max_bytes: usize) -> usize {
 fn append_event_tx(
     transaction: &rusqlite::Transaction<'_>,
     session_id: &str,
-    kind: &str,
+    kind: EventKind,
     turn_id: &str,
     tool_call_id: Option<&str>,
     data: &Value,
@@ -449,10 +759,10 @@ fn append_event_tx(
         [session_id],
         |row| row.get(0),
     )?;
-    let encoded = encode_event_data(data)?;
+    let encoded = encode_event_data(data, event_data_limit(kind))?;
     transaction.execute(
         "INSERT INTO session_events(session_id,seq,kind,turn_id,tool_call_id,data) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![session_id, seq, kind, turn_id, tool_call_id, encoded],
+        params![session_id, seq, kind.as_str(), turn_id, tool_call_id, encoded],
     )?;
     Ok(seq)
 }
@@ -483,7 +793,7 @@ fn append_message_tx(
 
 fn append_memory_event(
     session: &mut MemorySession,
-    kind: &str,
+    kind: EventKind,
     turn_id: &str,
     tool_call_id: Option<&str>,
     data: Value,
@@ -491,7 +801,7 @@ fn append_memory_event(
     let seq = session.events.last().map_or(0, |event| event.seq) + 1;
     session.events.push(SessionEvent {
         seq,
-        kind: kind.into(),
+        kind,
         turn_id: turn_id.into(),
         tool_call_id: tool_call_id.map(str::to_owned),
         data,
@@ -1433,7 +1743,7 @@ impl StateStore {
             .map(|(seq, kind, turn_id, tool_call_id, data, created_at)| {
                 Ok(SessionEvent {
                     seq,
-                    kind,
+                    kind: EventKind::parse(&kind)?,
                     turn_id,
                     tool_call_id,
                     data: serde_json::from_str(&data)
@@ -1442,6 +1752,37 @@ impl StateStore {
                 })
             })
             .collect()
+    }
+
+    pub fn validate_session(&self, session_id: &str) -> Result<()> {
+        validate_session_events(&self.load_events(session_id)?)
+    }
+
+    /// Persists the exact request envelope immediately before it is handed to
+    /// the model transport. This is intentionally a separate event from the
+    /// materialized message history: compaction and runtime context can change
+    /// the request without changing the durable conversation view.
+    pub fn append_request_snapshot(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        snapshot: &RequestSnapshot,
+    ) -> Result<()> {
+        let expected_hash = request_snapshot_hash(snapshot)?;
+        if snapshot.input_sha256 != expected_hash {
+            bail!(
+                "Request snapshot hash does not match its request envelope (stored {}, expected {})",
+                snapshot.input_sha256,
+                expected_hash
+            );
+        }
+        self.append_durable_event(
+            session_id,
+            EventKind::RequestHeader,
+            turn_id,
+            None,
+            serde_json::to_value(snapshot)?,
+        )
     }
 
     /// Records the start of one approval request without duplicating tool
@@ -1453,7 +1794,7 @@ impl StateStore {
         ));
         self.append_durable_event(
             request.session_id,
-            "approval/asked",
+            EventKind::ApprovalAsked,
             request.turn_id,
             Some(request.tool_call_id),
             json!({
@@ -1478,7 +1819,7 @@ impl StateStore {
     ) -> Result<()> {
         self.append_durable_event(
             session_id,
-            "approval/decided",
+            EventKind::ApprovalDecided,
             turn_id,
             Some(tool_call_id),
             json!({
@@ -1491,12 +1832,12 @@ impl StateStore {
     fn append_durable_event(
         &mut self,
         session_id: &str,
-        kind: &str,
+        kind: EventKind,
         turn_id: &str,
         tool_call_id: Option<&str>,
         data: Value,
     ) -> Result<()> {
-        let data = bound_event_data(data)?;
+        let data = bound_event_data(data, event_data_limit(kind))?;
         if matches!(self.backend, Backend::Memory(_)) {
             {
                 let Backend::Memory(memory) = &mut self.backend else {
@@ -1535,8 +1876,9 @@ impl StateStore {
         message: &StoredMessage,
         cwd: &Path,
     ) -> Result<()> {
-        let start_data = bound_event_data(json!({"cwd": cwd.to_string_lossy()}))?;
-        let message_data = bound_event_data(json!({"message": message}))?;
+        let start_data =
+            bound_event_data(json!({"cwd": cwd.to_string_lossy()}), MAX_EVENT_DATA_BYTES)?;
+        let message_data = bound_event_data(json!({"message": message}), MAX_EVENT_DATA_BYTES)?;
         if matches!(self.backend, Backend::Memory(_)) {
             {
                 let Backend::Memory(memory) = &mut self.backend else {
@@ -1549,8 +1891,8 @@ impl StateStore {
                 else {
                     bail!("Session does not exist: {session_id}");
                 };
-                append_memory_event(session, "turn/start", turn_id, None, start_data);
-                append_memory_event(session, "user/message", turn_id, None, message_data);
+                append_memory_event(session, EventKind::TurnStart, turn_id, None, start_data);
+                append_memory_event(session, EventKind::UserMessage, turn_id, None, message_data);
                 append_memory_message(session, message);
                 session.last_cwd = cwd.to_string_lossy().into_owned();
                 session.updated_at = now_timestamp();
@@ -1562,7 +1904,7 @@ impl StateStore {
         append_event_tx(
             &transaction,
             session_id,
-            "turn/start",
+            EventKind::TurnStart,
             turn_id,
             None,
             &start_data,
@@ -1570,7 +1912,7 @@ impl StateStore {
         append_event_tx(
             &transaction,
             session_id,
-            "user/message",
+            EventKind::UserMessage,
             turn_id,
             None,
             &message_data,
@@ -1592,18 +1934,27 @@ impl StateStore {
         turn_id: &str,
         message: &StoredMessage,
     ) -> Result<()> {
-        self.append_turn_message(session_id, turn_id, "assistant/message", None, message)
+        self.append_turn_message(
+            session_id,
+            turn_id,
+            EventKind::AssistantMessage,
+            None,
+            message,
+        )
     }
 
     fn append_turn_message(
         &mut self,
         session_id: &str,
         turn_id: &str,
-        kind: &str,
+        kind: EventKind,
         tool_call_id: Option<&str>,
         message: &StoredMessage,
     ) -> Result<()> {
-        let data = bound_event_data(json!({"message": event_message(message)}))?;
+        let data = bound_event_data(
+            json!({"message": event_message(message)}),
+            MAX_EVENT_DATA_BYTES,
+        )?;
         if matches!(self.backend, Backend::Memory(_)) {
             {
                 let Backend::Memory(memory) = &mut self.backend else {
@@ -1645,11 +1996,14 @@ impl StateStore {
         name: &str,
         arguments: &str,
     ) -> Result<()> {
-        let data = bound_event_data(json!({
-            "name": name,
-            "arguments_sha256": sha256(arguments),
-            "arguments_bytes": arguments.len(),
-        }))?;
+        let data = bound_event_data(
+            json!({
+                "name": name,
+                "arguments_sha256": sha256(arguments),
+                "arguments_bytes": arguments.len(),
+            }),
+            MAX_EVENT_DATA_BYTES,
+        )?;
         if matches!(self.backend, Backend::Memory(_)) {
             {
                 let Backend::Memory(memory) = &mut self.backend else {
@@ -1662,7 +2016,7 @@ impl StateStore {
                 else {
                     bail!("Session does not exist: {session_id}");
                 };
-                append_memory_event(session, "tool/call", turn_id, Some(call_id), data);
+                append_memory_event(session, EventKind::ToolCall, turn_id, Some(call_id), data);
                 session.updated_at = now_timestamp();
             }
             self.save_memory_state()?;
@@ -1672,7 +2026,7 @@ impl StateStore {
         append_event_tx(
             &transaction,
             session_id,
-            "tool/call",
+            EventKind::ToolCall,
             turn_id,
             Some(call_id),
             &data,
@@ -1697,12 +2051,16 @@ impl StateStore {
         message: &StoredMessage,
         metadata: ToolResultMetadata<'_>,
     ) -> Result<()> {
-        let data = bound_event_data(json!({
-            "message": message,
-            "status": metadata.status,
-            "exit_code": metadata.exit_code,
-            "duration_ms": metadata.duration_ms,
-        }))?;
+        let data = bound_event_data(
+            json!({
+                "message": message,
+                "status": metadata.status,
+                "exit_code": metadata.exit_code,
+                "duration_ms": metadata.duration_ms,
+                "presentation": metadata.presentation,
+            }),
+            MAX_EVENT_DATA_BYTES,
+        )?;
         if matches!(self.backend, Backend::Memory(_)) {
             {
                 let Backend::Memory(memory) = &mut self.backend else {
@@ -1715,7 +2073,7 @@ impl StateStore {
                 else {
                     bail!("Session does not exist: {session_id}");
                 };
-                append_memory_event(session, "tool/result", turn_id, Some(call_id), data);
+                append_memory_event(session, EventKind::ToolResult, turn_id, Some(call_id), data);
                 append_memory_message(session, message);
                 session.updated_at = now_timestamp();
             }
@@ -1726,7 +2084,7 @@ impl StateStore {
         append_event_tx(
             &transaction,
             session_id,
-            "tool/result",
+            EventKind::ToolResult,
             turn_id,
             Some(call_id),
             &data,
@@ -1751,7 +2109,10 @@ impl StateStore {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        let data = bound_event_data(json!({"status": status, "error": error}))?;
+        let data = bound_event_data(
+            json!({"status": status, "error": error}),
+            MAX_EVENT_DATA_BYTES,
+        )?;
         if matches!(self.backend, Backend::Memory(_)) {
             {
                 let Backend::Memory(memory) = &mut self.backend else {
@@ -1764,14 +2125,21 @@ impl StateStore {
                 else {
                     bail!("Session does not exist: {session_id}");
                 };
-                append_memory_event(session, "turn/end", turn_id, None, data);
+                append_memory_event(session, EventKind::TurnEnd, turn_id, None, data);
                 session.updated_at = now_timestamp();
             }
             self.save_memory_state()?;
             return Ok(());
         }
         let transaction = self.connection_mut().transaction()?;
-        append_event_tx(&transaction, session_id, "turn/end", turn_id, None, &data)?;
+        append_event_tx(
+            &transaction,
+            session_id,
+            EventKind::TurnEnd,
+            turn_id,
+            None,
+            &data,
+        )?;
         transaction.execute(
             "UPDATE sessions SET status=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?1",
             params![session_id, status],
@@ -1798,8 +2166,8 @@ impl StateStore {
             .collect::<BTreeMap<_, _>>();
         let mut open_turns = BTreeMap::<String, OpenTurn>::new();
         for event in &events {
-            match event.kind.as_str() {
-                "turn/start" => {
+            match event.kind {
+                EventKind::TurnStart => {
                     open_turns.entry(event.turn_id.clone()).or_insert(OpenTurn {
                         turn_id: event.turn_id.clone(),
                         calls: BTreeMap::new(),
@@ -1807,7 +2175,7 @@ impl StateStore {
                         result_events: BTreeMap::new(),
                     });
                 }
-                "assistant/message" => {
+                EventKind::AssistantMessage => {
                     if let Some(turn) = open_turns.get_mut(&event.turn_id)
                         && let Some(message) = stored_message_from_event(&event.data)
                     {
@@ -1816,21 +2184,21 @@ impl StateStore {
                         }
                     }
                 }
-                "tool/call" => {
+                EventKind::ToolCall => {
                     if let Some(turn) = open_turns.get_mut(&event.turn_id)
                         && let Some(call_id) = event.tool_call_id.as_deref()
                     {
                         turn.call_events.insert(call_id.to_owned(), ());
                     }
                 }
-                "tool/result" => {
+                EventKind::ToolResult => {
                     if let Some(turn) = open_turns.get_mut(&event.turn_id)
                         && let Some(call_id) = event.tool_call_id.as_deref()
                     {
                         turn.result_events.insert(call_id.to_owned(), ());
                     }
                 }
-                "turn/end" => {
+                EventKind::TurnEnd => {
                     open_turns.remove(&event.turn_id);
                 }
                 _ => {}
@@ -1871,6 +2239,7 @@ impl StateStore {
                         status: "interrupted",
                         exit_code: None,
                         duration_ms: 0,
+                        presentation: None,
                     },
                 )?;
                 repaired += 1;
@@ -1883,6 +2252,7 @@ impl StateStore {
             )?;
             repaired += 1;
         }
+        self.validate_session(session_id)?;
         Ok(repaired)
     }
 
@@ -2523,6 +2893,98 @@ mod tests {
     }
 
     #[test]
+    fn request_snapshots_are_typed_and_session_invariants_are_rebuilt() {
+        let (_dir, mut store) = store();
+        let session = store
+            .new_session(Path::new("/tmp"), Some("request-snapshot"))
+            .unwrap();
+        let turn = "turn-request-snapshot";
+        store
+            .start_turn(&session, turn, &user_message("inspect"), Path::new("/tmp"))
+            .unwrap();
+        let mut snapshot = RequestSnapshot {
+            iteration: 0,
+            model: "test-model".into(),
+            max_tokens: 256,
+            stream: false,
+            tool_choice: Some("auto".into()),
+            messages: json!([{"role":"user","content":"inspect"}]),
+            tools: json!([]),
+            input_sha256: String::new(),
+        };
+        snapshot.input_sha256 = request_snapshot_hash(&snapshot).unwrap();
+        store
+            .append_request_snapshot(&session, turn, &snapshot)
+            .unwrap();
+        store
+            .append_assistant_message(
+                &session,
+                turn,
+                &StoredMessage {
+                    role: "assistant".into(),
+                    content: Some("done".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            )
+            .unwrap();
+        store
+            .finish_turn(&session, turn, "completed", None)
+            .unwrap();
+        store.validate_session(&session).unwrap();
+        let events = store.load_events(&session).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::RequestHeader)
+        );
+        assert_eq!(events[2].kind, EventKind::RequestHeader);
+    }
+
+    #[test]
+    fn oversized_request_snapshots_stay_byte_exact() {
+        let (_dir, mut store) = store();
+        let session = store
+            .new_session(Path::new("/tmp"), Some("snapshot"))
+            .unwrap();
+        let turn = "turn-big-snapshot";
+        store
+            .start_turn(&session, turn, &user_message("inspect"), Path::new("/tmp"))
+            .unwrap();
+        let big_content = "x".repeat(MAX_EVENT_DATA_BYTES + 1);
+        let mut snapshot = RequestSnapshot {
+            iteration: 0,
+            model: "test-model".into(),
+            max_tokens: 256,
+            stream: false,
+            tool_choice: Some("auto".into()),
+            messages: json!([{"role":"user","content":big_content.clone()}]),
+            tools: json!([]),
+            input_sha256: String::new(),
+        };
+        snapshot.input_sha256 = request_snapshot_hash(&snapshot).unwrap();
+        store
+            .append_request_snapshot(&session, turn, &snapshot)
+            .unwrap();
+        let events = store.load_events(&session).unwrap();
+        let header = events
+            .iter()
+            .find(|event| event.kind == EventKind::RequestHeader)
+            .unwrap();
+        // The envelope is neither truncated nor rejected past 1 MiB, so its
+        // input hash keeps matching on reload.
+        assert!(header.data.get("event_content_truncated").is_none());
+        assert_eq!(
+            header.data["messages"][0]["content"].as_str().map(str::len),
+            Some(big_content.len())
+        );
+        store
+            .finish_turn(&session, turn, "completed", None)
+            .unwrap();
+        store.validate_session(&session).unwrap();
+    }
+
+    #[test]
     fn approval_events_are_paired_and_linked_to_the_tool_call() {
         let (_dir, mut store) = store();
         let session = store
@@ -2559,8 +3021,8 @@ mod tests {
             .unwrap();
 
         let events = store.load_events(&session).unwrap();
-        assert_eq!(events[2].kind, "approval/asked");
-        assert_eq!(events[3].kind, "approval/decided");
+        assert_eq!(events[2].kind, EventKind::ApprovalAsked);
+        assert_eq!(events[3].kind, EventKind::ApprovalDecided);
         assert_eq!(events[2].tool_call_id.as_deref(), Some("call-approval"));
         assert_eq!(events[3].tool_call_id.as_deref(), Some("call-approval"));
         assert_eq!(events[2].data["approval_id"], "approval-1");
@@ -2605,7 +3067,7 @@ mod tests {
 
         let (_dir, reopened) = reopen_memory_store(dir);
         let events = reopened.load_events(&session).unwrap();
-        assert_eq!(events[2].kind, "approval/asked");
+        assert_eq!(events[2].kind, EventKind::ApprovalAsked);
         assert_eq!(events[3].data["outcome"], "rejected");
     }
 
@@ -2640,7 +3102,7 @@ mod tests {
         let events = store.load_events(&session).unwrap();
         let kinds = events
             .iter()
-            .map(|event| event.kind.clone())
+            .map(|event| event.kind.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
@@ -2701,6 +3163,7 @@ mod tests {
                     status: "completed",
                     exit_code: Some(0),
                     duration_ms: 1,
+                    presentation: None,
                 },
             )
             .unwrap();
@@ -2715,7 +3178,7 @@ mod tests {
         let events = store.load_events(&session).unwrap();
         let event = events
             .iter()
-            .find(|event| event.kind == "tool/result")
+            .find(|event| event.kind == EventKind::ToolResult)
             .unwrap();
         let content = event.data["message"]["content"].as_str().unwrap();
         assert!(content.len() < big.len());
@@ -2745,7 +3208,7 @@ mod tests {
         let events = store.load_events(&session).unwrap();
         let call_event = events
             .iter()
-            .find(|event| event.kind == "tool/call")
+            .find(|event| event.kind == EventKind::ToolCall)
             .unwrap();
         let real_arguments = r#"{"path":"note.txt","content":"hello"}"#;
         assert_eq!(

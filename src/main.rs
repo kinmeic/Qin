@@ -101,6 +101,9 @@ async fn run() -> Result<()> {
         Command::Fromfile { path } => {
             execute_from_file(&path, &explicit_config, &events, assume_yes, dry_run).await?
         }
+        Command::Replay { fixture } => {
+            execute_replay_command(&fixture, &explicit_config, &events, assume_yes, dry_run).await?
+        }
         Command::Run { prompt } => {
             let prompt = prompt.join(" ");
             if prompt.trim().is_empty() {
@@ -393,6 +396,32 @@ async fn execute_from_file(
     .await
 }
 
+async fn execute_replay_command(
+    fixture: &Path,
+    explicit: &Option<PathBuf>,
+    events: &EventSink,
+    yes: bool,
+    dry_run: bool,
+) -> Result<()> {
+    agent::load_replay_fixture(fixture)?;
+    let (config, _resolver, mut store) = open(explicit, events)?;
+    // The lightweight backends hold a single session: starting the replay
+    // session replaces whatever conversation is currently active.
+    if store.backend_label() != "sqlite"
+        && let Some(current) = store.current_session()?
+        && !store.load_messages(&current)?.is_empty()
+    {
+        events.warning(
+            "Replay starts a fresh session; with the lightweight session backend this replaces the current session",
+        )?;
+    }
+    let cwd = std::env::current_dir()?;
+    let session = store.new_session(&cwd, Some("Replay"))?;
+    let report =
+        agent::execute_replay(&config, &mut store, &session, fixture, events, yes, dry_run).await?;
+    events.final_answer(&report.answer)
+}
+
 async fn execute_prompt(
     prompt: String,
     source: &str,
@@ -472,7 +501,9 @@ async fn execute_with(
             agents_md,
         },
     )
-    .await?;
+    .await;
+    store.validate_session(id)?;
+    let response = response?;
     events.final_answer(&response)
 }
 

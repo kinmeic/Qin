@@ -22,6 +22,10 @@ pub struct EventSink {
     /// ANSI colors for system event lines (disabled by NO_COLOR).
     color: bool,
     status_line_open: Cell<bool>,
+    /// Whether the current command may safely use a transient status line.
+    /// Interactive child prompts must never compete with a line rewritten by
+    /// qin's heartbeat renderer.
+    transient_command_status_enabled: Cell<bool>,
 }
 
 #[derive(Serialize)]
@@ -49,6 +53,7 @@ impl EventSink {
             approval_inline,
             color,
             status_line_open: Cell::new(false),
+            transient_command_status_enabled: Cell::new(true),
         }
     }
 
@@ -126,8 +131,15 @@ impl EventSink {
         elevated: bool,
         timeout: u64,
         interactive_terminal: bool,
+        child_can_prompt: bool,
         data: Option<Value>,
     ) -> Result<()> {
+        self.transient_command_status_enabled
+            .set(transient_command_status_allowed(
+                self.terminal,
+                interactive_terminal,
+                child_can_prompt,
+            ));
         if self.quiet || !self.show_commands.get() {
             return Ok(());
         }
@@ -143,7 +155,7 @@ impl EventSink {
             cwd.display(),
             format_elapsed(timeout as u128 * 1_000)
         );
-        if self.terminal && !interactive_terminal {
+        if transient_command_status_allowed(self.terminal, interactive_terminal, child_can_prompt) {
             // Transient status line: the heartbeat or command_finished
             // rewrites this same line instead of appending a new one.
             if self.status_line_open.replace(false) {
@@ -187,7 +199,7 @@ impl EventSink {
             "... Command still running  {}",
             format_elapsed(seconds as u128 * 1_000)
         );
-        if self.terminal {
+        if self.terminal && self.transient_command_status_enabled.get() {
             // Rewrite a single status line in place instead of appending.
             let message = sanitize_terminal(&redact(&message));
             if self.color {
@@ -207,6 +219,7 @@ impl EventSink {
         elapsed_ms: u128,
         data: Option<Value>,
     ) -> Result<()> {
+        self.transient_command_status_enabled.set(true);
         let ok = code == Some(0);
         if self.quiet || (ok && !self.show_commands.get()) {
             return Ok(());
@@ -468,6 +481,14 @@ fn approval_prompt_is_inline(json: bool, stdin_terminal: bool, stderr_terminal: 
     !json && stdin_terminal && stderr_terminal
 }
 
+fn transient_command_status_allowed(
+    terminal: bool,
+    interactive_terminal: bool,
+    child_can_prompt: bool,
+) -> bool {
+    terminal && !interactive_terminal && !child_can_prompt
+}
+
 /// ANSI color per system event kind; command output itself stays uncolored so
 /// it stands apart from qin's own messages.
 fn event_color(event: &str) -> Option<&'static str> {
@@ -668,6 +689,14 @@ mod tests {
         assert!(!approval_prompt_is_inline(false, true, false));
         assert!(!approval_prompt_is_inline(false, false, false));
         assert!(!approval_prompt_is_inline(true, true, true));
+    }
+
+    #[test]
+    fn transient_command_status_is_disabled_when_child_can_prompt() {
+        assert!(transient_command_status_allowed(true, false, false));
+        assert!(!transient_command_status_allowed(true, false, true));
+        assert!(!transient_command_status_allowed(true, true, false));
+        assert!(!transient_command_status_allowed(false, false, false));
     }
 
     #[test]

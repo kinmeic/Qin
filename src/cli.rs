@@ -62,6 +62,12 @@ pub enum Command {
         path: PathBuf,
     },
 
+    /// Replay a JSONL fixture through the real tool and persistence pipeline
+    Replay {
+        #[arg(value_name = "PATH")]
+        fixture: PathBuf,
+    },
+
     /// Create and switch to a new session, optionally with an initial prompt
     New { prompt: Vec<String> },
 
@@ -189,6 +195,7 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
     let known = [
         "init",
         "fromfile",
+        "replay",
         "new",
         "sessions",
         "use",

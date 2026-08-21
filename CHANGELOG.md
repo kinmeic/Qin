@@ -2,6 +2,12 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.4.4
+
+- Added deterministic JSONL replay through the real model-independent tool, persistence, approval, and rendering paths, with durable request snapshots and input fingerprints.
+- Added guarded concurrency for independent local read-only tool calls while keeping writes, approvals, external paths, and shell commands serialized.
+- Added typed event handling and session invariant validation, plus safer interactive shell prompt and heartbeat behavior.
+
 ## 0.4.3
 
 - Fixed approval prompts for non-TTY and JSON event consumers so the complete `[y/N]` prompt is emitted as a line instead of being hidden after the tool filename.

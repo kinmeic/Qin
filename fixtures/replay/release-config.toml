@@ -1,0 +1,13 @@
+version = 1
+default_model = "primary"
+
+[models.primary]
+base_url = "http://127.0.0.1:9/v1"
+model = "replay-model"
+api_key = "replay-only"
+stream = false
+supports_tools = true
+supports_parallel_tools = true
+
+[storage]
+enabled = false

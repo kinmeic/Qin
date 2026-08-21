@@ -777,9 +777,6 @@ impl Config {
             if candidate.model.trim().is_empty() {
                 bail!("models.{name}.model cannot be empty");
             }
-            if candidate.supports_parallel_tools {
-                bail!("models.{name}.supports_parallel_tools=true is not supported");
-            }
             validate_secret_source(
                 candidate.api_key_env.as_deref(),
                 candidate.api_key.as_deref(),
