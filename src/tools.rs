@@ -943,7 +943,12 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     // elevated may pause for a username, password, confirmation, or another
     // interactive answer, so qin must not rewrite that terminal line.
     let child_can_prompt = io::stdin().is_terminal();
-    let interactive_terminal = (elevated || invokes_elevation) && child_can_prompt;
+    // The child is always placed in its own process group below. If stdin is
+    // a TTY, every command that inherits it must become the foreground group:
+    // commands such as ssh and passwd can prompt for multiple inputs even
+    // when they are not elevated. Otherwise the first terminal read can stop
+    // the child with SIGTTIN after the user submits the first answer.
+    let interactive_terminal = child_needs_foreground_terminal(child_can_prompt);
     ctx.events.command_started_with_data(
         ctx.cwd,
         elevated || invokes_elevation,
@@ -984,13 +989,20 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         match ForegroundProcessGroupGuard::attach(interactive_terminal, child_pid) {
             Ok(guard) => guard,
             Err(error) => {
-                #[cfg(unix)]
-                if let Some(pid) = child_pid.and_then(|pid| i32::try_from(pid).ok()) {
-                    // SAFETY: pid is the freshly spawned process-group identifier.
-                    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                // A command that already exited took its process group with
+                // it; nothing remains that could read the terminal, so the
+                // missed handoff is harmless and must not fail the command.
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    ForegroundProcessGroupGuard::attach(false, None)?
+                } else {
+                    #[cfg(unix)]
+                    if let Some(pid) = child_pid.and_then(|pid| i32::try_from(pid).ok()) {
+                        // SAFETY: pid is the freshly spawned process-group identifier.
+                        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    }
+                    child.kill().await.ok();
+                    return Err(error);
                 }
-                child.kill().await.ok();
-                return Err(error);
             }
         };
     let mut process_group = ProcessGroupGuard::new(child_pid);
@@ -1074,6 +1086,13 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     terminal_mode
         .restore()
         .context("Unable to restore the terminal input mode")?;
+    // While the child held the terminal foreground, Ctrl-C reached only its
+    // process group, so qin's own SIGINT handlers stayed silent. Translate
+    // the child's SIGINT death back into the cancellation the user asked for.
+    #[cfg(unix)]
+    let canceled_by_user = sigint_death_is_user_cancel(interactive_terminal, status);
+    #[cfg(not(unix))]
+    let canceled_by_user = false;
     if output_truncated {
         append_truncation_marker(&mut output, ctx.config.permissions.max_output_bytes);
     }
@@ -1086,6 +1105,9 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
             "exit_code": status.code(),
         })),
     )?;
+    if canceled_by_user {
+        bail!("Command canceled by the user");
+    }
     let output = format!(
         "exit_code={}\n{output}",
         status
@@ -1098,6 +1120,22 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         completion_summary: None,
         presentation: None,
     })
+}
+
+fn child_needs_foreground_terminal(child_can_prompt: bool) -> bool {
+    child_can_prompt
+}
+
+// Terminal-generated SIGINT only reaches the foreground process group, so
+// while a child holds the terminal, qin never sees Ctrl-C. A foreground
+// child dying from SIGINT therefore means the user pressed Ctrl-C.
+#[cfg(unix)]
+fn sigint_death_is_user_cancel(
+    interactive_terminal: bool,
+    status: std::process::ExitStatus,
+) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    interactive_terminal && status.signal() == Some(libc::SIGINT)
 }
 
 struct ProcessGroupGuard {
@@ -3394,6 +3432,34 @@ mod tests {
         let encoded = presentation.to_string();
         assert!(!encoded.contains("secret-old"));
         assert!(!encoded.contains("secret-new"));
+    }
+
+    #[test]
+    fn any_tty_backed_child_gets_foreground_terminal_control() {
+        assert!(child_needs_foreground_terminal(true));
+        assert!(!child_needs_foreground_terminal(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_foreground_child_killed_by_ctrl_c_counts_as_user_cancellation() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let sigint = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("kill -INT $$")
+            .status()
+            .unwrap();
+        assert_eq!(sigint.signal(), Some(libc::SIGINT));
+        assert!(sigint_death_is_user_cancel(true, sigint));
+        assert!(!sigint_death_is_user_cancel(false, sigint));
+
+        // A normal exit, even with the 130 Ctrl-C convention, is a failure.
+        let exit_130 = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 130")
+            .status()
+            .unwrap();
+        assert!(!sigint_death_is_user_cancel(true, exit_130));
     }
 
     #[test]

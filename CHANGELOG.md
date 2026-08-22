@@ -2,6 +2,11 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.4.5
+
+- Fixed multi-step interactive shell prompts by transferring foreground terminal control to every TTY-backed child, not only elevated commands.
+- Preserved command lifecycle events when an interactive child is terminated by the terminal's Ctrl-C signal, and handled commands that exit during terminal handoff.
+
 ## 0.4.4
 
 - Added deterministic JSONL replay through the real model-independent tool, persistence, approval, and rendering paths, with durable request snapshots and input fingerprints.
