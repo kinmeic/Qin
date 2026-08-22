@@ -173,7 +173,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "shell",
-            description: "Run a shell command; approval is risk-based, policy denials and rejected approvals are final for this command, and workarounds are not allowed",
+            description: "Run a shell command; approval is risk-based, policy denials and rejected approvals are final for this command, and workarounds are not allowed; interactive commands must run directly, never through timeout/setsid/nohup wrappers, because qin rejects wrappers that can detach terminal input; use timeout_seconds instead",
             parameters: json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"}},"required":["command"]}),
             allowed_keys: &["command", "timeout_seconds", "elevated"],
             availability: ToolAvailability::Shell,
@@ -918,6 +918,8 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     if ctx.dry_run {
         return text_result("Dry run: command not executed".into());
     }
+    let child_can_prompt = io::stdin().is_terminal();
+    validate_interactive_shell_command(command, child_can_prompt)?;
     if let Some(reason) = forbidden_reason(command) {
         bail!("Refusing forbidden command: {reason}");
     }
@@ -942,7 +944,6 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     // The child always inherits stdin below. Even commands that are not
     // elevated may pause for a username, password, confirmation, or another
     // interactive answer, so qin must not rewrite that terminal line.
-    let child_can_prompt = io::stdin().is_terminal();
     // The child is always placed in its own process group below. If stdin is
     // a TTY, every command that inherits it must become the foreground group:
     // commands such as ssh and passwd can prompt for multiple inputs even
@@ -1124,6 +1125,91 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
 
 fn child_needs_foreground_terminal(child_can_prompt: bool) -> bool {
     child_can_prompt
+}
+
+fn validate_interactive_shell_command(command: &str, child_can_prompt: bool) -> Result<()> {
+    if child_can_prompt {
+        if let Some(reason) = interactive_shell_wrapper_reason(command) {
+            bail!(
+                "Refusing interactive shell wrapper: {reason}; run the target command directly and set timeout_seconds on the shell tool"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn interactive_shell_wrapper_reason(command: &str) -> Option<&'static str> {
+    interactive_shell_wrapper_reason_inner(command, 0)
+}
+
+fn interactive_shell_wrapper_reason_inner(command: &str, depth: usize) -> Option<&'static str> {
+    if depth > 3 {
+        return None;
+    }
+    let commands = shell_commands_for_guard(command)?;
+    for raw_tokens in commands {
+        let tokens = unwrap_interactive_command_prefixes(&raw_tokens);
+        let Some(program) = tokens.first().and_then(|value| {
+            Path::new(value)
+                .file_name()
+                .and_then(|value| value.to_str())
+        }) else {
+            continue;
+        };
+        let reason = match program {
+            "timeout" => Some("timeout can create a separate process group"),
+            "setsid" => Some("setsid creates a new session and process group"),
+            "nohup" => Some("nohup can redirect terminal input"),
+            _ => None,
+        };
+        if reason.is_some() {
+            return reason;
+        }
+        if matches!(program, "sh" | "bash" | "zsh" | "ksh" | "dash") {
+            let Some(index) = tokens.iter().position(|value| value == "-c") else {
+                continue;
+            };
+            let Some(script) = tokens.get(index + 1) else {
+                continue;
+            };
+            if let Some(reason) = interactive_shell_wrapper_reason_inner(
+                &script.replace(QUOTED_REDIRECT, ">"),
+                depth + 1,
+            ) {
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
+fn unwrap_interactive_command_prefixes(mut tokens: &[String]) -> &[String] {
+    loop {
+        let unwrapped = unwrap_command_prefixes(tokens);
+        if unwrapped.len() != tokens.len() {
+            tokens = unwrapped;
+            continue;
+        }
+        if tokens
+            .first()
+            .is_some_and(|value| is_shell_assignment(value))
+        {
+            tokens = &tokens[1..];
+            continue;
+        }
+        return tokens;
+    }
+}
+
+fn is_shell_assignment(value: &str) -> bool {
+    let Some((name, _)) = value.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    matches!(
+        characters.next(),
+        Some(first) if first == '_' || first.is_ascii_alphabetic()
+    ) && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 // Terminal-generated SIGINT only reaches the foreground process group, so
@@ -3475,6 +3561,43 @@ mod tests {
                 .contains("preserve unrelated content")
         );
         assert!(apply_patch.description.contains("verify the result"));
+    }
+
+    #[test]
+    fn shell_description_forbids_wrappers_that_detach_the_terminal() {
+        let shell = tool_registry()
+            .into_iter()
+            .find(|definition| definition.name == "shell")
+            .unwrap();
+        // Wrapping in timeout/setsid/nohup moves the command out of the
+        // terminal foreground group, so interactive prompts stop working.
+        assert!(shell.description.contains("timeout/setsid/nohup"));
+        assert!(shell.description.contains("timeout_seconds"));
+    }
+
+    #[test]
+    fn interactive_shell_guard_rejects_terminal_detaching_wrappers() {
+        for command in [
+            "timeout 20 git push origin main",
+            "/usr/bin/setsid git push origin main",
+            "nohup git push origin main",
+            "env GIT_TERMINAL_PROMPT=1 timeout 20 git push origin main",
+            "sudo -n timeout 20 git push origin main",
+            "FOO=bar /usr/bin/nohup git push origin main",
+            "sh -c 'timeout 20 git push origin main'",
+        ] {
+            let error = validate_interactive_shell_command(command, true).unwrap_err();
+            assert!(
+                error.to_string().contains("timeout_seconds"),
+                "{command}: {error}"
+            );
+        }
+
+        assert!(validate_interactive_shell_command("git push origin main", true).is_ok());
+        assert!(
+            validate_interactive_shell_command("timeout 20 git push origin main", false).is_ok()
+        );
+        assert!(validate_interactive_shell_command("echo 'timeout 20'", true).is_ok());
     }
 
     #[test]

@@ -2,6 +2,10 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.4.6
+
+- Rejected `timeout`, `setsid`, and `nohup` wrappers for TTY-backed shell commands so interactive credentials stay in qin's foreground process group; use the shell tool's `timeout_seconds` instead.
+
 ## 0.4.5
 
 - Fixed multi-step interactive shell prompts by transferring foreground terminal control to every TTY-backed child, not only elevated commands.
