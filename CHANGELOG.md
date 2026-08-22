@@ -2,6 +2,10 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.4.7
+
+- Fixed path mutation approval prompts so file and directory changes consistently show the `[y/N]` confirmation suffix.
+
 ## 0.4.6
 
 - Rejected `timeout`, `setsid`, and `nohup` wrappers for TTY-backed shell commands so interactive credentials stay in qin's foreground process group; use the shell tool's `timeout_seconds` instead.

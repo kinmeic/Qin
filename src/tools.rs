@@ -1615,7 +1615,12 @@ fn approve_path_mutation(
     if auto_approves_path_mutation(ctx.config, ctx.cwd, paths, reversible_without_overwrite) {
         return Ok(());
     }
-    approve(ctx, message, external)
+    let prompt = path_mutation_prompt(message);
+    approve(ctx, &prompt, external)
+}
+
+fn path_mutation_prompt(message: &str) -> String {
+    format!("{message}? [y/N] ")
 }
 
 fn auto_approves_path_mutation(
@@ -3495,6 +3500,14 @@ mod tests {
     #[test]
     fn redacts_tokens() {
         assert!(!redact("curl -H 'Bearer abc123'").contains("abc123"));
+    }
+
+    #[test]
+    fn path_mutation_prompts_include_confirmation_suffix() {
+        assert_eq!(
+            path_mutation_prompt("Modify file /var/www/finance/.gitignore"),
+            "Modify file /var/www/finance/.gitignore? [y/N] "
+        );
     }
 
     #[test]
