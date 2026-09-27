@@ -94,6 +94,9 @@ struct ToolDefinition {
     parameters: Value,
     allowed_keys: &'static [&'static str],
     availability: ToolAvailability,
+    /// Static scheduling capability. Runtime checks still reject approvals,
+    /// external paths, invalid arguments, and any non-read tool before work.
+    parallel_read_only: bool,
     handler: ToolHandler,
 }
 
@@ -105,6 +108,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
             allowed_keys: &["path"],
             availability: ToolAvailability::Always,
+            parallel_read_only: true,
             handler: ToolHandler::ListDirectory,
         },
         ToolDefinition {
@@ -113,6 +117,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["path"]}),
             allowed_keys: &["path", "max_bytes"],
             availability: ToolAvailability::Always,
+            parallel_read_only: true,
             handler: ToolHandler::ReadFile,
         },
         ToolDefinition {
@@ -121,6 +126,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
             allowed_keys: &["path"],
             availability: ToolAvailability::Always,
+            parallel_read_only: true,
             handler: ToolHandler::StatPath,
         },
         ToolDefinition {
@@ -129,6 +135,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
             allowed_keys: &["path"],
             availability: ToolAvailability::WorkspaceWrite,
+            parallel_read_only: false,
             handler: ToolHandler::CreateDirectory,
         },
         ToolDefinition {
@@ -137,6 +144,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
             allowed_keys: &["path", "content"],
             availability: ToolAvailability::WorkspaceWrite,
+            parallel_read_only: false,
             handler: ToolHandler::WriteFile,
         },
         ToolDefinition {
@@ -145,6 +153,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["source","destination"]}),
             allowed_keys: &["source", "destination", "overwrite"],
             availability: ToolAvailability::WorkspaceWrite,
+            parallel_read_only: false,
             handler: ToolHandler::MovePath,
         },
         ToolDefinition {
@@ -153,6 +162,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["source","destination"]}),
             allowed_keys: &["source", "destination", "overwrite"],
             availability: ToolAvailability::WorkspaceWrite,
+            parallel_read_only: false,
             handler: ToolHandler::CopyPath,
         },
         ToolDefinition {
@@ -161,6 +171,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean"}},"required":["path"]}),
             allowed_keys: &["path", "recursive"],
             availability: ToolAvailability::WorkspaceWrite,
+            parallel_read_only: false,
             handler: ToolHandler::RemovePath,
         },
         ToolDefinition {
@@ -169,6 +180,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}),
             allowed_keys: &["path", "old_text", "new_text"],
             availability: ToolAvailability::WorkspaceWrite,
+            parallel_read_only: false,
             handler: ToolHandler::ApplyPatch,
         },
         ToolDefinition {
@@ -177,6 +189,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"}},"required":["command"]}),
             allowed_keys: &["command", "timeout_seconds", "elevated"],
             availability: ToolAvailability::Shell,
+            parallel_read_only: false,
             handler: ToolHandler::Shell,
         },
         ToolDefinition {
@@ -185,6 +198,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}),
             allowed_keys: &["query", "limit"],
             availability: ToolAvailability::Knowledge,
+            parallel_read_only: false,
             handler: ToolHandler::SearchMemory,
         },
         ToolDefinition {
@@ -193,6 +207,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}),
             allowed_keys: &["content"],
             availability: ToolAvailability::KnowledgeWrite,
+            parallel_read_only: false,
             handler: ToolHandler::SaveMemory,
         },
         ToolDefinition {
@@ -201,6 +216,7 @@ fn tool_registry() -> Vec<ToolDefinition> {
             parameters: json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}),
             allowed_keys: &["query", "limit"],
             availability: ToolAvailability::WebSearch,
+            parallel_read_only: false,
             handler: ToolHandler::WebSearch,
         },
     ]
@@ -574,9 +590,10 @@ fn stat_path_at(path: &Path) -> Result<ToolResult> {
 /// approval or state. The caller still rechecks this condition inside the
 /// worker before touching the filesystem.
 pub fn is_parallel_read_only(name: &str, arguments: &str, config: &Config, cwd: &Path) -> bool {
-    if config.permissions.approval == "always"
-        || !matches!(name, "list_directory" | "read_file" | "stat_path")
-    {
+    let Some(definition) = find_tool_definition(name) else {
+        return false;
+    };
+    if config.permissions.approval == "always" || !definition.parallel_read_only {
         return false;
     }
     let Ok(args) = serde_json::from_str::<Value>(arguments) else {
@@ -3225,6 +3242,45 @@ mod tests {
                 .into_iter()
                 .any(|schema| schema["function"]["name"] == "shell")
         );
+    }
+
+    #[test]
+    fn registry_marks_only_local_read_tools_as_parallel_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let cwd = root.path();
+        for name in ["list_directory", "read_file", "stat_path"] {
+            assert!(is_parallel_read_only(
+                name,
+                &json!({"path": "."}).to_string(),
+                &config,
+                cwd
+            ));
+        }
+        for name in ["write_file", "remove_path", "shell", "web_search"] {
+            assert!(!is_parallel_read_only(
+                name,
+                &json!({"path": "."}).to_string(),
+                &config,
+                cwd
+            ));
+        }
+        assert!(!is_parallel_read_only(
+            "list_directory",
+            &json!({"path": outside.path()}).to_string(),
+            &config,
+            cwd
+        ));
+
+        let mut strict_approval = config;
+        strict_approval.permissions.approval = "always".into();
+        assert!(!is_parallel_read_only(
+            "list_directory",
+            &json!({"path": "."}).to_string(),
+            &strict_approval,
+            cwd
+        ));
     }
 
     #[test]

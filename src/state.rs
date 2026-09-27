@@ -159,7 +159,7 @@ impl EventKind {
 /// durable state layer stays independent from the model transport module.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RequestSnapshot {
-    pub iteration: u32,
+    pub iteration: u64,
     pub model: String,
     pub max_tokens: u64,
     pub stream: bool,
@@ -196,7 +196,7 @@ pub fn request_snapshot_hash(snapshot: &RequestSnapshot) -> Result<String> {
 
 struct TurnInvariant {
     user_message: bool,
-    last_request_iteration: Option<u32>,
+    last_request_iteration: Option<u64>,
     request_pending: bool,
     assistant_call_ids: HashMap<String, ()>,
     call_ids: HashMap<String, ()>,

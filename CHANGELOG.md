@@ -2,6 +2,15 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.5.0
+
+- Removed the hard model-request iteration stop from live runs. qin now warns after 24 requests and continues; the default hard tool-call ceiling is 512 and the wall-time deadline is one hour. Existing `agent.max_iterations` settings remain accepted as the soft warning threshold.
+- Added model/user diagnostics for repeated identical tool-call batches and for runs approaching the tool-call ceiling.
+- Declared read-only parallel eligibility in the tool registry while retaining runtime approval, argument, and workspace-path checks before execution.
+- Corrected the repository license text to match the Apache-2.0 metadata and existing documentation.
+- Fixed OpenWrt apk release metadata to use the version from `Cargo.toml` instead of the stale package version.
+- Updated locked `rustls` to 0.23.45 to resolve RUSTSEC-2026-0285 and replaced a yanked `chacha20` lock entry.
+
 ## 0.4.7
 
 - Fixed path mutation approval prompts so file and directory changes consistently show the `[y/N]` confirmation suffix.

@@ -426,9 +426,9 @@ batch_size = 32
 vector_encoding = "f32"            # f32 | f16；OpenWrt 推荐 f16
 
 [agent]
-max_iterations = 24
-max_tool_calls = 80
-wall_time_seconds = 900
+warn_after_iterations = 24
+max_tool_calls = 512
+wall_time_seconds = 3600
 model = "primary"
 live_reasoning = false
 
@@ -596,6 +596,8 @@ repeat until budget exhausted:
 mark stopped/interrupted/failed with recoverable state
 ```
 
+Live model requests do not have a hard iteration count. `warn_after_iterations` is a soft user/model reminder, while `max_tool_calls` and `wall_time_seconds` are hard safety and cost ceilings. Repeated identical tool-call batches trigger one diagnostic reminder; the loop continues until completion, cancellation, or a hard ceiling.
+
 必须保证工具消息的协议完整性：带 `tool_calls` 的 assistant 消息与对应 tool result 是一个原子组。压缩、中断恢复或裁剪时不能留下孤立的 `tool_call_id`。如果进程在工具调用中断，应保存 `interrupted` 状态，并在下次构建上下文时排除未完成组或补入明确的合成失败结果。
 
 ## 8. 工具系统
@@ -645,6 +647,7 @@ trait Tool {
 - 写入不同、无重叠路径的文件工具可谨慎并行。
 - 路径存在祖先/子孙重叠、移动源目标交叉、任何删除或 Shell 写操作时串行。
 - 模型声明并行不代表实际安全，最终由本地分析器决定。
+- Tool registry 显式声明哪些只读工具可以成为并行候选；执行前仍须检查审批策略、参数和路径，候选标记本身不授权执行。
 
 ## 9. 权限与安全
 

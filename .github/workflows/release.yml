@@ -152,6 +152,7 @@ jobs:
           OPENWRT_ARCH: ${{ matrix.openwrt_arch }}
           RUST_TARGET: ${{ matrix.target }}
         run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
           package_dir="$OPENWRT_SDK/package/qin"
           mkdir -p "$package_dir/files"
           cp packaging/openwrt/Makefile "$package_dir/Makefile"
@@ -159,10 +160,9 @@ jobs:
           cp target/${RUST_TARGET}/release/qin "$package_dir/files/qin"
           echo 'CONFIG_PACKAGE_qin=m' >> "$OPENWRT_SDK/.config"
           make --directory "$OPENWRT_SDK" defconfig
-          make --directory "$OPENWRT_SDK" package/qin/compile V=s
+          make --directory "$OPENWRT_SDK" package/qin/compile V=s PKG_VERSION="$version"
           apk=$(find "$OPENWRT_SDK/bin/packages" -type f -name 'qin-*.apk' -print -quit)
           test -n "$apk" && test -s "$apk"
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
           output="dist/qin-${version}-r1_openwrt-25.12.5_${OPENWRT_ARCH}.apk"
           cp "$apk" "$output"
           apk_tool=$(find "$OPENWRT_SDK/staging_dir/host/bin" -name apk -print -quit)

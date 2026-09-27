@@ -31,9 +31,9 @@ batch_size = 32
 vector_encoding = "f32"
 
 [agent]
-max_iterations = 24
-max_tool_calls = 80
-wall_time_seconds = 900
+warn_after_iterations = 24
+max_tool_calls = 512
+wall_time_seconds = 3600
 
 [context]
 compact_trigger_ratio = 0.9

@@ -27,6 +27,8 @@ For file edits, inspect the target first; apply_patch old_text must match exactl
 For shell commands, use the narrowest practical command and do not retry a denied or rejected command through a workaround.
 When the task is complete, give a concise result. If a tool fails, report the actual error."#;
 
+const REPEATED_TOOL_BATCH_WARNING_THRESHOLD: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
@@ -306,6 +308,7 @@ pub async fn execute(
             &mut messages,
             &turn_id,
             started,
+            None,
         )
         .await
     }
@@ -353,10 +356,8 @@ pub async fn execute_replay(
     dry_run: bool,
 ) -> Result<ReplayReport> {
     let fixture = load_replay_fixture(fixture_path)?;
-    let mut replay_config = config.clone();
-    if let Some(max_iterations) = fixture.max_iterations {
-        replay_config.agent.max_iterations = max_iterations;
-    }
+    let replay_config = config.clone();
+    let replay_request_limit = fixture.max_iterations.map(u64::from);
     let configured_model = replay_config.primary_model()?.model.clone();
     if configured_model != fixture.model {
         bail!(
@@ -421,6 +422,7 @@ pub async fn execute_replay(
             &mut messages,
             &turn_id,
             started,
+            replay_request_limit,
         )
         .await?;
         Ok::<_, anyhow::Error>((answer, responder.request_hashes()))
@@ -456,11 +458,32 @@ async fn run_loop(
     messages: &mut Vec<Message>,
     turn_id: &str,
     started: tokio::time::Instant,
+    replay_request_limit: Option<u64>,
 ) -> Result<String> {
     let mut tool_count = 0_u32;
     let mut approve_all_commands = false;
+    let mut iteration = 0_u64;
+    let mut warned_about_iterations = false;
+    let mut warned_about_tool_budget = false;
+    let mut previous_tool_batch = None;
+    let mut repeated_tool_batch_count = 0_u32;
+    let mut warned_about_repeated_tools = false;
 
-    for iteration in 0..config.agent.max_iterations {
+    loop {
+        if replay_request_limit.is_some_and(|limit| iteration >= limit) {
+            bail!("Replay fixture reached its maximum model-request count");
+        }
+        if !warned_about_iterations && iteration >= u64::from(config.agent.warn_after_iterations) {
+            let message = format!(
+                "This task has used {iteration} model requests. qin is continuing; this is a reminder, not a stopping limit."
+            );
+            events.warning(&message)?;
+            append_system_reminder(
+                messages,
+                "The soft model-request reminder threshold has been reached. Continue with the user's task when safe and useful. Do not stop only because of this reminder; respect the hard tool-call ceiling and wall-time deadline, and report any unfinished work accurately.",
+            )?;
+            warned_about_iterations = true;
+        }
         let remaining = remaining_time(config, started)?;
         tokio::select! {
             result = tokio::time::timeout(
@@ -488,6 +511,7 @@ async fn run_loop(
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
         };
         let assistant = outcome;
+        iteration = iteration.saturating_add(1);
         let stored_assistant = to_stored(&assistant)?;
         store.append_assistant_message(session_id, turn_id, &stored_assistant)?;
         messages.push(assistant.clone());
@@ -508,8 +532,29 @@ async fn run_loop(
             )?;
             bail!("The model returned tool calls even though supports_tools=false");
         }
-        tool_count += calls.len() as u32;
-        if tool_count > config.agent.max_tool_calls {
+        let requested_calls = u32::try_from(calls.len())
+            .context("The model returned too many tool calls in one response")?;
+        let next_tool_count = tool_count
+            .checked_add(requested_calls)
+            .context("The agent tool-call counter overflowed")?;
+        let warning_threshold = config
+            .agent
+            .max_tool_calls
+            .saturating_mul(4)
+            .saturating_add(4)
+            / 5;
+        if !warned_about_tool_budget && next_tool_count >= warning_threshold {
+            events.warning(&format!(
+                "The task is approaching its hard tool-call ceiling ({}/{}) and may need to prioritize remaining work.",
+                next_tool_count, config.agent.max_tool_calls
+            ))?;
+            append_system_reminder(
+                messages,
+                "The run is approaching its hard tool-call ceiling. Prioritize the remaining requested outcome, avoid optional exploration, and give an accurate summary if the ceiling prevents completion.",
+            )?;
+            warned_about_tool_budget = true;
+        }
+        if next_tool_count > config.agent.max_tool_calls {
             record_unexecuted_tool_calls(
                 store,
                 session_id,
@@ -518,6 +563,27 @@ async fn run_loop(
                 "the per-run tool-call limit was reached",
             )?;
             bail!("The agent reached its tool-call limit");
+        }
+        tool_count = next_tool_count;
+
+        let batch_signature = tool_batch_signature(&calls)?;
+        if previous_tool_batch.as_deref() == Some(batch_signature.as_str()) {
+            repeated_tool_batch_count = repeated_tool_batch_count.saturating_add(1);
+        } else {
+            previous_tool_batch = Some(batch_signature);
+            repeated_tool_batch_count = 1;
+        }
+        if !warned_about_repeated_tools
+            && repeated_tool_batch_count >= REPEATED_TOOL_BATCH_WARNING_THRESHOLD
+        {
+            events.warning(&format!(
+                "The model returned the same tool-call batch {repeated_tool_batch_count} consecutive times; qin will continue, but the task may be stuck."
+            ))?;
+            append_system_reminder(
+                messages,
+                "The same tool-call batch has been returned repeatedly. Do not repeat it again without a concrete reason from the tool results. Inspect the results, change approach, or report what remains unfinished.",
+            )?;
+            warned_about_repeated_tools = true;
         }
         let parallel = config.primary_model()?.supports_parallel_tools
             && calls.len() > 1
@@ -649,7 +715,6 @@ async fn run_loop(
             }
         }
     }
-    bail!("The agent reached its maximum iteration count without producing a final answer")
 }
 
 struct ParallelToolOutcome {
@@ -913,6 +978,31 @@ fn remaining_time(config: &Config, started: tokio::time::Instant) -> Result<Dura
         .checked_sub(started.elapsed())
         .filter(|remaining| !remaining.is_zero())
         .context("The agent reached its total runtime limit")
+}
+
+fn append_system_reminder(messages: &mut [Message], reminder: &str) -> Result<()> {
+    let system = messages
+        .first_mut()
+        .filter(|message| message.role == "system")
+        .context("The agent request lost its leading system message")?;
+    let content = system.content.get_or_insert_with(String::new);
+    content.push_str("\n\n<runtime_diagnostic>\n");
+    content.push_str(reminder);
+    content.push_str("\n</runtime_diagnostic>");
+    Ok(())
+}
+
+fn tool_batch_signature(calls: &[ToolCall]) -> Result<String> {
+    let normalized = calls
+        .iter()
+        .map(|call| {
+            let arguments = serde_json::from_str::<Value>(&call.function.arguments)
+                .and_then(|value| serde_json::to_string(&value))
+                .unwrap_or_else(|_| call.function.arguments.trim().to_owned());
+            (call.function.name.as_str(), arguments)
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_string(&normalized)?)
 }
 
 #[derive(Clone)]
@@ -1456,7 +1546,7 @@ fn build_request_snapshot(
     model: &ModelConfig,
     messages: &[Message],
     tools: &[Value],
-    iteration: u32,
+    iteration: u64,
 ) -> Result<RequestSnapshot> {
     let request = ChatRequest {
         model: &model.model,
@@ -1994,6 +2084,107 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             .find(|event| event.kind == crate::state::EventKind::ToolResult)
             .unwrap();
         assert_eq!(result.data["presentation"]["kind"], "read");
+    }
+
+    #[tokio::test]
+    async fn advisory_iteration_and_repeated_tool_warnings_do_not_stop_a_live_task() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for turn in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if turn == 1 {
+                    assert!(request.contains("soft model-request reminder threshold"));
+                }
+                if turn == 3 {
+                    assert!(request.contains("same tool-call batch has been returned repeatedly"));
+                }
+                let body = if turn < 3 {
+                    serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": format!("call_{turn}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": "list_directory",
+                                        "arguments": "{\"path\":\".\"}"
+                                    }
+                                }]
+                            }
+                        }]
+                    })
+                    .to_string()
+                } else {
+                    serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "Directory inspection complete"
+                            }
+                        }]
+                    })
+                    .to_string()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.storage.database = "agent-advisory.db".into();
+        config.knowledge.enabled = false;
+        config.agent.warn_after_iterations = 1;
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                base_url: format!("http://{address}/v1"),
+                api_style: "chat_completions".into(),
+                model: "test".into(),
+                summary_model: String::new(),
+                api_key_env: None,
+                api_key: Some("key".into()),
+                context_window: 16_384,
+                max_output_tokens: 1_024,
+                stream: false,
+                supports_tools: true,
+                supports_parallel_tools: false,
+                supports_native_search: false,
+            },
+        );
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("advisory")).unwrap();
+        let answer = execute(
+            &config,
+            &mut store,
+            &session,
+            "Inspect the current directory",
+            &EventSink::new(true, false, false),
+            RunOptions {
+                source: "cli",
+                source_path: None,
+                assume_yes: true,
+                dry_run: false,
+                agents_md: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "Directory inspection complete");
+        server.join().unwrap();
+        store.validate_session(&session).unwrap();
     }
 
     #[tokio::test]

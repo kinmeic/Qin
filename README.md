@@ -165,6 +165,17 @@ model = "primary"
 
 Model-native search is the final fallback. Enable it only when the selected OpenAI-compatible provider supports the Responses API web-search tool, and also set `supports_native_search = true` on that model. Exa and Brave keys should be exported as `EXA_API_KEY` and `BRAVE_API_KEY` respectively.
 
+### Agent execution budget
+
+qin does not stop a live task after a fixed number of model requests. By default it emits a reminder after 24 requests, keeps a hard ceiling of 512 tool calls as a safety and cost bound, and stops after one hour. Request-count and repeated-tool warnings are advisory; the tool-call ceiling and wall-time deadline remain hard limits. Override the defaults in `config.toml`:
+
+```toml
+[agent]
+warn_after_iterations = 24  # advisory only; legacy max_iterations is accepted as an alias
+max_tool_calls = 512         # hard ceiling; valid range is 1..=4096
+wall_time_seconds = 3600     # hard deadline; valid range is 1..=86400
+```
+
 ## Usage
 
 ### Help and version
@@ -220,7 +231,7 @@ qin --config ./replay-config.toml --yes replay ./fixtures/replay/basic.jsonl
 ./scripts/replay-smoke.sh
 ```
 
-The first JSONL record is `{"type":"meta","prompt":"...","model":"..."}`; following `assistant` records contain the pre-recorded model messages. Request snapshots are persisted with the session event log, and `supports_parallel_tools = true` enables concurrency only for independent local read-only calls; writes, approvals, external paths, and shell commands remain serialized.
+The first JSONL record is `{"type":"meta","prompt":"...","model":"..."}`; following `assistant` records contain the pre-recorded model messages. An optional fixture `max_iterations` limits replay requests only; it does not cap live tasks. Request snapshots are persisted with the session event log, and `supports_parallel_tools = true` enables concurrency only for independent local read-only calls; writes, approvals, external paths, and shell commands remain serialized.
 
 ### Use administrator privileges
 

@@ -354,7 +354,11 @@ impl Default for InputConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    pub max_iterations: u32,
+    /// Soft reminder threshold for model round trips. The legacy key remains
+    /// accepted so existing config files keep loading, but it no longer stops
+    /// a task at an arbitrary number of iterations.
+    #[serde(alias = "max_iterations")]
+    pub warn_after_iterations: u32,
     pub max_tool_calls: u32,
     pub wall_time_seconds: u64,
     pub model: String,
@@ -364,9 +368,9 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 24,
-            max_tool_calls: 80,
-            wall_time_seconds: 900,
+            warn_after_iterations: 24,
+            max_tool_calls: 512,
+            wall_time_seconds: 3_600,
             model: String::new(),
             live_reasoning: false,
         }
@@ -834,12 +838,12 @@ impl Config {
                 "context.compact_trigger_ratio leaves insufficient headroom: (1 - trigger) * (context_window - reserves) must exceed context.tool_result_max_tokens; lower the trigger or tool_result_max_tokens"
             );
         }
-        if !(1..=1_024).contains(&self.agent.max_iterations)
+        if !(1..=1_024).contains(&self.agent.warn_after_iterations)
             || !(1..=4_096).contains(&self.agent.max_tool_calls)
             || !(1..=86_400).contains(&self.agent.wall_time_seconds)
         {
             bail!(
-                "Agent iteration, tool-call, or wall-time limits are outside the supported range"
+                "Agent warning threshold, tool-call ceiling, or wall-time limit is outside the supported range"
             );
         }
         if self.agent.live_reasoning {
@@ -1688,6 +1692,28 @@ mod tests {
         config.models.insert("primary".into(), model);
         config.knowledge.enabled = false;
         assert!(config.validate(false).is_err());
+    }
+
+    #[test]
+    fn legacy_max_iterations_is_a_soft_warning_alias() {
+        let loaded = deserialize_config(
+            r#"
+            [agent]
+            max_iterations = 9
+            max_tool_calls = 2048
+            wall_time_seconds = 7200
+            "#,
+        )
+        .unwrap();
+        assert_eq!(loaded.unknown_field_count, 0);
+        assert_eq!(loaded.config.agent.warn_after_iterations, 9);
+        assert_eq!(loaded.config.agent.max_tool_calls, 2048);
+        assert_eq!(loaded.config.agent.wall_time_seconds, 7200);
+
+        let defaults = AgentConfig::default();
+        assert_eq!(defaults.warn_after_iterations, 24);
+        assert_eq!(defaults.max_tool_calls, 512);
+        assert_eq!(defaults.wall_time_seconds, 3600);
     }
 
     #[test]

@@ -59,3 +59,11 @@ This repository was audited for correctness, security, and performance in August
 - The configured model provider receives prompts, selected history, runtime context, tool output, and recalled knowledge needed for a task.
 
 For higher-assurance environments, combine `qin` with a restricted OS account, a container or VM, read-only mounts, network egress controls, and encrypted storage.
+
+## September 2026 follow-up
+
+- Compared the local ZCode CLI Agent with qin. Both identify their first-party code as Apache-2.0. ZCode is a Node.js/TypeScript workspace with separately tracked third-party notices and assets, while qin is a Rust CLI with different execution, packaging, and platform boundaries. Keep qin's implementation independent; no ZCode source, binary, asset, or dependency was copied. Adopted the useful design ideas: model-request limits are advisory for live runs, repeated tool batches and approaching tool ceilings produce diagnostics, and parallel-read eligibility is declared in tool metadata while runtime checks remain authoritative.
+- Corrected qin's root license file from BSD-3-Clause to the Apache-2.0 license already declared in Cargo metadata, README, and OpenWrt packaging. The Apache license and copyright notice are now present at the repository root.
+- Removed the hard live model-request iteration stop while retaining replay-fixture request limits. Existing `agent.max_iterations` config entries still deserialize as the new soft `agent.warn_after_iterations` threshold. Increased the default tool-call ceiling from 80 to 512 and wall-time deadline from 15 minutes to one hour; both remain configurable hard ceilings, and the run warns the model before the tool-call ceiling.
+- Fixed OpenWrt apk package metadata to use the Cargo release version. Updated locked `rustls` from 0.23.43 to 0.23.45 for RUSTSEC-2026-0285 and refreshed the yanked `chacha20` lock entry to 0.10.2.
+- Follow-up verification: `cargo fmt --all -- --check`, `git diff --check`, `cargo test --locked` (133 passed), `cargo clippy --locked --all-targets -- -D warnings`, `cargo audit` (no advisories or yanked-package warnings), and `cargo build --release --locked`.
