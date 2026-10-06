@@ -492,10 +492,11 @@ pub(crate) fn memory_state_path(config: &Config) -> Result<PathBuf> {
 fn memory_state_directory() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            if !dir.is_empty() && Path::new(&dir).is_dir() {
-                return PathBuf::from(dir).join(format!("qin-{}", effective_uid()));
-            }
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
+            && !dir.is_empty()
+            && Path::new(&dir).is_dir()
+        {
+            return PathBuf::from(dir).join(format!("qin-{}", effective_uid()));
         }
         if Path::new("/dev/shm").is_dir() {
             return PathBuf::from("/dev/shm").join(format!("qin-{}", effective_uid()));
