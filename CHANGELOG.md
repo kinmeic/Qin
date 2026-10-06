@@ -2,6 +2,11 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.1
+
+- Kept ordinary shell commands in the TUI, displaying their streamed output in the conversation instead of handing the terminal back to the shell. The TUI gives stdin to `/dev/null` for these commands so they cannot steal prompt input.
+- Retained terminal handoff for sudo, SSH, interactive shells and editors, Git operations that may prompt, package installs needing confirmation, and other recognized interactive commands. Added the shell tool's `interactive=true` option for commands that require terminal input but cannot be detected automatically.
+
 ## 0.6.0
 
 - Added `qin tui`, a persistent terminal chat interface with a branded header, restored active-session messages, streaming replies, tool activity, approval dialogs, and terminal handoff for interactive shell commands.

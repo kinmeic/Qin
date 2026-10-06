@@ -186,9 +186,9 @@ fn tool_registry() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "shell",
-            description: "Run a shell command; approval is risk-based, policy denials and rejected approvals are final for this command, and workarounds are not allowed; interactive commands must run directly, never through timeout/setsid/nohup wrappers, because qin rejects wrappers that can detach terminal input; use timeout_seconds instead",
-            parameters: json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"}},"required":["command"]}),
-            allowed_keys: &["command", "timeout_seconds", "elevated"],
+            description: "Run a shell command and stream output in the TUI. Commands needing direct terminal input such as sudo, ssh, or an editor automatically get terminal control; set interactive=true when another command must prompt or use a full-screen terminal. Run interactive commands directly, never through timeout/setsid/nohup wrappers; use timeout_seconds instead. Approval is risk-based, and denied operations are final; do not work around denials",
+            parameters: json!({"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"},"elevated":{"type":"boolean"},"interactive":{"type":"boolean"}},"required":["command"]}),
+            allowed_keys: &["command", "timeout_seconds", "elevated", "interactive"],
             availability: ToolAvailability::Shell,
             parallel_read_only: false,
             handler: ToolHandler::Shell,
@@ -492,7 +492,7 @@ fn validate_argument_keys(name: &str, args: &Value) -> Result<()> {
             bail!("Tool argument {key} must be a nonnegative integer");
         }
     }
-    for key in ["overwrite", "recursive", "elevated"] {
+    for key in ["overwrite", "recursive", "elevated", "interactive"] {
         if let Some(value) = object.get(key)
             && !value.is_boolean()
         {
@@ -958,7 +958,14 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         return text_result("Dry run: command not executed".into());
     }
     let child_can_prompt = io::stdin().is_terminal();
-    validate_interactive_shell_command(command, child_can_prompt)?;
+    let terminal_handoff_requested = args["interactive"].as_bool().unwrap_or(false);
+    let interactive_terminal = child_can_prompt
+        && if ctx.events.is_tui() {
+            elevated || terminal_handoff_requested || command_needs_terminal(command)
+        } else {
+            true
+        };
+    validate_interactive_shell_command(command, interactive_terminal)?;
     if let Some(reason) = forbidden_reason(command) {
         bail!("Refusing forbidden command: {reason}");
     }
@@ -981,21 +988,20 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
             )?;
         }
     }
-    // The child always inherits stdin below. Even commands that are not
-    // elevated may pause for a username, password, confirmation, or another
-    // interactive answer, so qin must not rewrite that terminal line.
-    // The child is always placed in its own process group below. If stdin is
-    // a TTY, every command that inherits it must become the foreground group:
+    // Ordinary TUI commands get null stdin so they cannot consume the next
+    // chat input. A command that needs the terminal inherits it, and every
+    // child that inherits a TTY must become the foreground process group:
     // commands such as ssh and passwd can prompt for multiple inputs even
     // when they are not elevated. Otherwise the first terminal read can stop
     // the child with SIGTTIN after the user submits the first answer.
-    let interactive_terminal = child_needs_foreground_terminal(child_can_prompt);
+    let child_can_use_terminal = !ctx.events.is_tui() || interactive_terminal;
+    let interactive_terminal = child_needs_foreground_terminal(interactive_terminal);
     ctx.events.command_started_with_data(
         ctx.cwd,
         elevated || invokes_elevation,
         timeout,
         interactive_terminal,
-        child_can_prompt,
+        child_can_use_terminal,
         Some(json!({
             "tool_call_id": ctx.tool_call_id,
             "card": "terminal",
@@ -1020,7 +1026,11 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     remove_shell_startup_environment(&mut process);
     let mut child = process
         .current_dir(ctx.cwd)
-        .stdin(Stdio::inherit())
+        .stdin(if child_can_use_terminal {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -1103,7 +1113,7 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
             },
             // Do not emit a heartbeat while the child has an interactive
             // stdin: a prompt may be waiting on the current terminal line.
-            _ = heartbeat.tick(), if !interactive_terminal && !child_can_prompt => {
+            _ = heartbeat.tick(), if !interactive_terminal && !child_can_use_terminal => {
                 ctx.events.command_heartbeat_with_data(
                     started.elapsed().as_secs(),
                     Some(json!({"tool_call_id": ctx.tool_call_id})),
@@ -1174,6 +1184,170 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
 
 fn child_needs_foreground_terminal(child_can_prompt: bool) -> bool {
     child_can_prompt
+}
+
+fn command_needs_terminal(command: &str) -> bool {
+    command_needs_terminal_inner(command, 0)
+}
+
+fn command_needs_terminal_inner(command: &str, depth: usize) -> bool {
+    if depth > 3 {
+        // Unknown nested shell syntax may contain a terminal prompt.
+        return true;
+    }
+    let Some(commands) = shell_commands_for_guard(command) else {
+        return true;
+    };
+    commands.into_iter().any(|raw_tokens| {
+        if shell_command_starts_with_elevation(&raw_tokens) {
+            return true;
+        }
+        let tokens = unwrap_interactive_command_prefixes(&raw_tokens);
+        let Some(program) = tokens
+            .first()
+            .and_then(|value| Path::new(value).file_name())
+            .and_then(|name| name.to_str())
+        else {
+            return false;
+        };
+        let program = program.to_ascii_lowercase();
+        let args = &tokens[1..];
+        if matches!(
+            program.as_str(),
+            "sudo"
+                | "doas"
+                | "su"
+                | "ssh"
+                | "sftp"
+                | "scp"
+                | "mosh"
+                | "telnet"
+                | "ftp"
+                | "passwd"
+                | "login"
+                | "chsh"
+                | "chfn"
+                | "newgrp"
+                | "vi"
+                | "vim"
+                | "nvim"
+                | "nano"
+                | "pico"
+                | "emacs"
+                | "less"
+                | "more"
+                | "man"
+                | "top"
+                | "htop"
+                | "btop"
+                | "watch"
+                | "tmux"
+                | "screen"
+                | "script"
+                | "read"
+                | "select"
+                | "gpg"
+                | "gpg2"
+        ) {
+            return true;
+        }
+        if matches!(program.as_str(), "sh" | "bash" | "zsh" | "ksh" | "dash") {
+            if args.iter().any(|arg| arg == "-i" || arg == "--interactive") {
+                return true;
+            }
+            if let Some(index) = args.iter().position(|arg| arg == "-c") {
+                return args
+                    .get(index + 1)
+                    .is_some_and(|script| command_needs_terminal_inner(script, depth + 1));
+            }
+            // Starting a shell without a command string opens an interactive REPL.
+            return !args.iter().any(|arg| matches!(arg.as_str(), "-c" | "-s"));
+        }
+        if program == "git" {
+            let subcommand = args
+                .iter()
+                .find(|arg| !arg.starts_with('-'))
+                .map(String::as_str);
+            return match subcommand {
+                Some("push" | "pull" | "fetch" | "clone" | "credential") => true,
+                Some("rebase") => args.iter().any(|arg| arg == "-i" || arg == "--interactive"),
+                Some("commit") => !args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-m" | "--message" | "-F" | "--file")),
+                _ => false,
+            };
+        }
+        if matches!(program.as_str(), "apt" | "apt-get" | "apk" | "dnf" | "yum")
+            && args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "install" | "remove" | "purge" | "upgrade" | "full-upgrade" | "dist-upgrade"
+                )
+            })
+        {
+            return !args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "-y" | "--yes" | "--assume-yes" | "--non-interactive"
+                )
+            });
+        }
+        match program.as_str() {
+            "docker" if args.first().is_some_and(|arg| arg == "login") => return true,
+            "gh" if args.first().is_some_and(|arg| arg == "auth")
+                && args.get(1).is_some_and(|arg| arg == "login") =>
+            {
+                return true;
+            }
+            "npm"
+                if args
+                    .first()
+                    .is_some_and(|arg| matches!(arg.as_str(), "login" | "adduser")) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        // These REPLs only need a terminal in explicit interactive mode.
+        matches!(
+            program.as_str(),
+            "python" | "python3" | "node" | "ruby" | "irb"
+        ) && args.iter().any(|arg| arg == "-i" || arg == "--interactive")
+    })
+}
+
+fn shell_command_starts_with_elevation(tokens: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(token) = tokens.get(index) {
+        let program = Path::new(token)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(token);
+        match program {
+            "sudo" | "doas" | "su" => return true,
+            "command" | "exec" => index += 1,
+            "env" => {
+                index += 1;
+                while let Some(option) = tokens.get(index) {
+                    if matches!(option.as_str(), "-i" | "--ignore-environment")
+                        || option.starts_with("--unset=")
+                        || option.starts_with("--chdir=")
+                    {
+                        index += 1;
+                    } else if matches!(option.as_str(), "-u" | "--unset" | "-C" | "--chdir") {
+                        index = index.saturating_add(2);
+                    } else if option.starts_with('-') || is_shell_assignment(option) {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ if is_shell_assignment(token) => index += 1,
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn validate_interactive_shell_command(command: &str, child_can_prompt: bool) -> Result<()> {

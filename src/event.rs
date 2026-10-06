@@ -102,6 +102,10 @@ impl EventSink {
         self.terminal_handed_off.get()
     }
 
+    pub fn is_tui(&self) -> bool {
+        self.tui_events.is_some()
+    }
+
     pub fn phase(&self, message: &str) -> Result<()> {
         if !self.quiet && self.show_tool_events.get() {
             self.stderr("phase", &format!("● {message}"))?;
@@ -237,14 +241,24 @@ impl EventSink {
         line: &str,
         data: Option<Value>,
     ) -> Result<()> {
-        if self.tui_events.is_some() && self.terminal_handed_off.get() {
-            let output = sanitize_terminal(&redact(line));
-            match stream {
-                "stderr" => eprint!("{output}"),
-                _ => print!("{output}"),
+        if self.tui_events.is_some() {
+            if self.terminal_handed_off.get() {
+                let output = sanitize_terminal(&redact(line));
+                match stream {
+                    "stderr" => eprint!("{output}"),
+                    _ => print!("{output}"),
+                }
+                std::io::Write::flush(&mut std::io::stdout())?;
+                std::io::Write::flush(&mut std::io::stderr())?;
+            } else {
+                self.emit_tui_event(
+                    "command_output",
+                    &format!("│ {stream}: {}", redact(line)),
+                    data,
+                    None,
+                    false,
+                )?;
             }
-            std::io::Write::flush(&mut std::io::stdout())?;
-            std::io::Write::flush(&mut std::io::stderr())?;
             return Ok(());
         }
         // Live command output is hidden unless --verbose; JSON consumers
