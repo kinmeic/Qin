@@ -60,6 +60,37 @@ pub fn render_for_terminal(text: &str, color: bool) -> String {
     output
 }
 
+/// Aligns Markdown pipe tables while leaving the rest of a streamed TUI answer
+/// untouched. Table cells are padded using terminal display widths.
+pub fn align_tables(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut output = String::new();
+    let mut index = 0;
+    let mut in_code_block = false;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            output.push_str(line);
+            output.push('\n');
+            index += 1;
+            continue;
+        }
+        if !in_code_block
+            && is_table_row(line)
+            && index + 1 < lines.len()
+            && is_table_separator(lines[index + 1])
+        {
+            index = render_table(&lines, index, &mut output, false);
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+        index += 1;
+    }
+    output
+}
+
 fn paint(text: &str, code: &str, color: bool) -> String {
     if color && !text.is_empty() {
         format!("{code}{text}{RESET}")

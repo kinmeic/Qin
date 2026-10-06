@@ -251,13 +251,7 @@ impl EventSink {
                 std::io::Write::flush(&mut std::io::stdout())?;
                 std::io::Write::flush(&mut std::io::stderr())?;
             } else {
-                self.emit_tui_event(
-                    "command_output",
-                    &format!("│ {stream}: {}", redact(line)),
-                    data,
-                    None,
-                    false,
-                )?;
+                self.emit_tui_event("command_output", &redact(line), data, None, false)?;
             }
             return Ok(());
         }

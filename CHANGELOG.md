@@ -2,6 +2,11 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.2
+
+- Kept streamed shell output in a single TUI block so line and table alignment survives arbitrary read chunk boundaries; expanded tab stops when rendering output.
+- Aligned Markdown pipe tables in completed TUI answers by terminal display width, including wide CJK characters, while preserving fenced code blocks.
+
 ## 0.6.1
 
 - Kept ordinary shell commands in the TUI, displaying their streamed output in the conversation instead of handing the terminal back to the shell. The TUI gives stdin to `/dev/null` for these commands so they cannot steal prompt input.

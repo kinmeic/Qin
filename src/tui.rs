@@ -123,6 +123,7 @@ struct App {
     input_history: Vec<String>,
     history_index: Option<usize>,
     scroll_from_bottom: usize,
+    active_command_output: Option<(String, usize)>,
     busy: bool,
     cancellation: Option<watch::Sender<bool>>,
     pending_approval: Option<PendingApproval>,
@@ -186,6 +187,7 @@ impl App {
             input_history: Vec::new(),
             history_index: None,
             scroll_from_bottom: 0,
+            active_command_output: None,
             busy: false,
             cancellation: None,
             pending_approval: None,
@@ -496,6 +498,12 @@ impl App {
             self.streaming_index = self
                 .streaming_index
                 .and_then(|index| index.checked_sub(remove));
+            self.active_command_output =
+                self.active_command_output
+                    .take()
+                    .and_then(|(tool_call_id, index)| {
+                        index.checked_sub(remove).map(|index| (tool_call_id, index))
+                    });
         }
     }
 
@@ -507,6 +515,43 @@ impl App {
         self.scroll_from_bottom = 0;
     }
 
+    fn append_command_output(&mut self, message: &str, data: Option<&serde_json::Value>) {
+        let Some(tool_call_id) = data
+            .and_then(|data| data.get("tool_call_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            self.push_activity(message);
+            return;
+        };
+        let index = match self.active_command_output.as_ref() {
+            Some((active_call_id, index))
+                if active_call_id == &tool_call_id && self.entries.get(*index).is_some() =>
+            {
+                *index
+            }
+            _ => {
+                self.push_entry(Entry {
+                    kind: EntryKind::Activity,
+                    text: String::new(),
+                });
+                let index = self.entries.len() - 1;
+                self.active_command_output = Some((tool_call_id, index));
+                index
+            }
+        };
+        if let Some(entry) = self.entries.get_mut(index)
+            && !entry.text.ends_with(DISPLAY_TRUNCATED)
+        {
+            entry
+                .text
+                .push_str(&qin_event::sanitize_terminal(&qin_event::redact(message)));
+            truncate_display(&mut entry.text);
+        }
+        self.prune_entries();
+        self.scroll_from_bottom = 0;
+    }
+
     fn handle_event(&mut self, event: TuiEvent, screen: &mut ScreenGuard) -> Result<()> {
         let message = event.message;
         match event.event.as_str() {
@@ -514,7 +559,7 @@ impl App {
                 if self.last_streamed_answer.as_deref() != Some(message.as_str()) {
                     self.push_entry(Entry {
                         kind: EntryKind::Assistant,
-                        text: qin_event::sanitize_terminal(&qin_event::redact(&message)),
+                        text: align_markdown_tables(&message),
                     });
                 }
                 self.streaming_index = None;
@@ -549,6 +594,8 @@ impl App {
                     if answer.is_empty() {
                         self.entries.remove(index);
                     } else {
+                        self.entries[index].text = align_markdown_tables(&answer);
+                        truncate_display(&mut self.entries[index].text);
                         self.last_streamed_answer = Some(answer);
                     }
                 }
@@ -615,6 +662,7 @@ impl App {
                 }
             }
             "terminal_handoff" | "command_started" => {
+                self.active_command_output = None;
                 if let Some(ack) = event.terminal_ack {
                     let result = screen.suspend().map_err(|error| format!("{error:#}"));
                     if result.is_ok() {
@@ -629,6 +677,7 @@ impl App {
                 }
             }
             "terminal_resume" | "command_finished" | "command_failed" => {
+                self.active_command_output = None;
                 self.resume_terminal(screen)?;
                 if event.event != "terminal_resume" && !message.is_empty() {
                     self.push_activity(&message);
@@ -636,6 +685,7 @@ impl App {
             }
             "turn_finished" => {
                 self.streaming_index = None;
+                self.active_command_output = None;
                 self.busy = false;
                 self.active_approval_mode = None;
                 self.cancellation = None;
@@ -658,6 +708,7 @@ impl App {
                 self.entries.clear();
                 self.streaming_index = None;
                 self.last_streamed_answer = None;
+                self.active_command_output = None;
                 self.status = "New session".into();
                 self.scroll_from_bottom = 0;
                 self.busy = false;
@@ -670,14 +721,16 @@ impl App {
                 self.context_tokens = None;
                 self.context_estimated = true;
             }
-            "tool_started" | "tool_finished" | "tool_failed" | "command_output"
-            | "command_heartbeat" | "phase" | "warning" | "tool_warning" | "success"
-            | "approval_decided" => {
-                if event.event == "tool_failed" && self.terminal_suspended {
+            "command_output" => self.append_command_output(&message, event.data.as_ref()),
+            "tool_failed" => {
+                self.active_command_output = None;
+                if self.terminal_suspended {
                     self.resume_terminal(screen)?;
                 }
                 self.push_activity(&message);
             }
+            "tool_started" | "tool_finished" | "command_heartbeat" | "phase" | "warning"
+            | "tool_warning" | "success" | "approval_decided" => self.push_activity(&message),
             _ => {
                 if !message.is_empty() {
                     self.push_activity(&message);
@@ -1176,6 +1229,12 @@ fn truncate_display(text: &mut String) {
     text.push_str(DISPLAY_TRUNCATED);
 }
 
+fn align_markdown_tables(text: &str) -> String {
+    crate::markdown::align_tables(text)
+        .trim_end_matches('\n')
+        .to_string()
+}
+
 fn wrapped_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
     let mut output = Vec::new();
@@ -1183,6 +1242,23 @@ fn wrapped_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut occupied = 0;
         for grapheme in line.styled_graphemes(Style::default()) {
+            if grapheme.symbol == "\t" {
+                let tab_width = 8 - occupied % 8;
+                for _ in 0..tab_width {
+                    if occupied == width {
+                        output.push(Line::from(std::mem::take(&mut spans)));
+                        occupied = 0;
+                    }
+                    if let Some(last) = spans.last_mut().filter(|span| span.style == grapheme.style)
+                    {
+                        last.content.to_mut().push(' ');
+                    } else {
+                        spans.push(Span::styled(" ".to_string(), grapheme.style));
+                    }
+                    occupied += 1;
+                }
+                continue;
+            }
             let size = UnicodeWidthStr::width(grapheme.symbol);
             if size > width {
                 continue;
