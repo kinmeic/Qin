@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use std::cell::Cell;
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 
 use crate::config::{ConfigPathResolver, InitOutcome, UiConfig};
 use crate::prompt_file::LoadedPrompt;
@@ -26,6 +27,22 @@ pub struct EventSink {
     /// Interactive child prompts must never compete with a line rewritten by
     /// qin's heartbeat renderer.
     transient_command_status_enabled: Cell<bool>,
+    /// True while a child shell command temporarily owns terminal input.
+    terminal_handed_off: Cell<bool>,
+    /// Structured events are routed to the interactive renderer instead of
+    /// stdout/stderr when qin is running in TUI mode.
+    tui_events: Option<Sender<TuiEvent>>,
+}
+
+pub struct TuiEvent {
+    pub event: String,
+    pub message: String,
+    pub data: Option<Value>,
+    /// The renderer replies to an approval prompt while the agent worker waits.
+    pub approval_reply: Option<SyncSender<String>>,
+    /// Shell tools wait for the renderer to release the terminal before they
+    /// start a child process that inherits terminal input.
+    pub terminal_ack: Option<SyncSender<std::result::Result<(), String>>>,
 }
 
 #[derive(Serialize)]
@@ -54,7 +71,20 @@ impl EventSink {
             color,
             status_line_open: Cell::new(false),
             transient_command_status_enabled: Cell::new(true),
+            terminal_handed_off: Cell::new(false),
+            tui_events: None,
         }
+    }
+
+    pub fn new_tui(quiet: bool, verbose: bool) -> (Self, Receiver<TuiEvent>) {
+        let (sender, receiver) = mpsc::channel();
+        let mut sink = Self::new(quiet, false, verbose);
+        sink.tui_events = Some(sender);
+        (sink, receiver)
+    }
+
+    pub fn tui_sender(&self) -> Option<Sender<TuiEvent>> {
+        self.tui_events.clone()
     }
 
     pub fn configure(&self, ui: &UiConfig) {
@@ -66,6 +96,10 @@ impl EventSink {
     /// refer to "this command" instead of repeating the full command line.
     pub fn shows_command_details(&self) -> bool {
         !self.quiet && self.show_commands.get()
+    }
+
+    pub fn terminal_handed_off(&self) -> bool {
+        self.terminal_handed_off.get()
     }
 
     pub fn phase(&self, message: &str) -> Result<()> {
@@ -118,6 +152,7 @@ impl EventSink {
         elapsed_ms: u128,
         data: Option<Value>,
     ) -> Result<()> {
+        self.terminal_handed_off.set(false);
         self.stderr_with_data(
             "tool_failed",
             &format!("✗ {name}  {error}  {}", format_elapsed(elapsed_ms)),
@@ -140,11 +175,6 @@ impl EventSink {
                 interactive_terminal,
                 child_can_prompt,
             ));
-        if self.quiet || !self.show_commands.get() {
-            return Ok(());
-        }
-        // The command itself was already shown by tool_started; here we
-        // only report the execution context as the run begins.
         let level = if elevated {
             "sudo/root"
         } else {
@@ -155,6 +185,34 @@ impl EventSink {
             cwd.display(),
             format_elapsed(timeout as u128 * 1_000)
         );
+        if self.tui_events.is_some() {
+            if child_can_prompt {
+                self.terminal_handed_off.set(true);
+            }
+            let result = if !self.quiet && self.show_commands.get() {
+                self.emit_tui_event(
+                    "command_started",
+                    &message,
+                    data.clone(),
+                    None,
+                    child_can_prompt,
+                )
+            } else if child_can_prompt {
+                self.emit_tui_event("terminal_handoff", "", data.clone(), None, true)
+            } else {
+                Ok(())
+            };
+            if result.is_err() {
+                self.terminal_handed_off.set(false);
+            }
+            result?;
+            return Ok(());
+        }
+        if self.quiet || !self.show_commands.get() {
+            return Ok(());
+        }
+        // The command itself was already shown by tool_started; here we
+        // only report the execution context as the run begins.
         if transient_command_status_allowed(self.terminal, interactive_terminal, child_can_prompt) {
             // Transient status line: the heartbeat or command_finished
             // rewrites this same line instead of appending a new one.
@@ -179,6 +237,16 @@ impl EventSink {
         line: &str,
         data: Option<Value>,
     ) -> Result<()> {
+        if self.tui_events.is_some() && self.terminal_handed_off.get() {
+            let output = sanitize_terminal(&redact(line));
+            match stream {
+                "stderr" => eprint!("{output}"),
+                _ => print!("{output}"),
+            }
+            std::io::Write::flush(&mut std::io::stdout())?;
+            std::io::Write::flush(&mut std::io::stderr())?;
+            return Ok(());
+        }
         // Live command output is hidden unless --verbose; JSON consumers
         // always receive it as structured events.
         if self.json || (self.verbose && !self.quiet && self.show_commands.get()) {
@@ -220,7 +288,12 @@ impl EventSink {
         data: Option<Value>,
     ) -> Result<()> {
         self.transient_command_status_enabled.set(true);
+        self.terminal_handed_off.set(false);
         let ok = code == Some(0);
+        if self.tui_events.is_some() && (self.quiet || (ok && !self.show_commands.get())) {
+            self.emit_tui_event("terminal_resume", "", data, None, false)?;
+            return Ok(());
+        }
         if self.quiet || (ok && !self.show_commands.get()) {
             return Ok(());
         }
@@ -249,15 +322,35 @@ impl EventSink {
     /// user's answer on the same line; event-stream and JSON output use a
     /// complete line so consumers can render the whole prompt.
     pub fn approval_prompt(&self, message: &str) -> Result<()> {
-        self.approval_prompt_with_data(message, None)
+        self.approval_prompt_with_data(message, None).map(|_| ())
     }
 
     /// Emits an approval prompt and, for structured consumers, the stable
     /// request metadata needed to attach it to a tool call.
-    pub fn approval_prompt_with_data(&self, message: &str, data: Option<Value>) -> Result<()> {
+    pub fn approval_prompt_with_data(
+        &self,
+        message: &str,
+        data: Option<Value>,
+    ) -> Result<Option<String>> {
         let message = format!("? {message}");
+        if self.tui_events.is_some() {
+            let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+            self.emit_tui_event(
+                "approval_required",
+                &message,
+                data,
+                Some(reply_sender),
+                false,
+            )?;
+            return Ok(Some(
+                reply_receiver
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("The TUI closed during approval"))?,
+            ));
+        }
         if !self.approval_inline {
-            return self.stderr_with_data("approval_required", &message, data);
+            self.stderr_with_data("approval_required", &message, data)?;
+            return Ok(None);
         }
         if self.status_line_open.replace(false) {
             eprint!("\r\x1b[2K");
@@ -269,7 +362,7 @@ impl EventSink {
             eprint!("{INDENT}{message}");
         }
         std::io::Write::flush(&mut std::io::stderr())?;
-        Ok(())
+        Ok(None)
     }
 
     /// Notifies structured/non-interactive consumers that an approval request
@@ -313,6 +406,9 @@ impl EventSink {
 
     pub fn final_answer(&self, answer: &str) -> Result<()> {
         let answer = redact(answer);
+        if self.tui_events.is_some() {
+            return self.emit_tui_event("final_answer", &answer, None, None, false);
+        }
         if self.json {
             println!(
                 "{}",
@@ -333,6 +429,69 @@ impl EventSink {
             } else {
                 println!("{answer}");
             }
+        }
+        Ok(())
+    }
+
+    pub fn assistant_stream_start(&self) -> Result<()> {
+        if self.tui_events.is_some() {
+            self.emit_tui_event("assistant_stream_start", "", None, None, false)?;
+        }
+        Ok(())
+    }
+
+    pub fn assistant_delta(&self, text: &str) -> Result<()> {
+        if self.tui_events.is_some() && !text.is_empty() {
+            self.emit_tui_event("assistant_delta", text, None, None, false)?;
+        }
+        Ok(())
+    }
+
+    pub fn assistant_stream_complete(&self) -> Result<()> {
+        if self.tui_events.is_some() {
+            self.emit_tui_event("assistant_stream_complete", "", None, None, false)?;
+        }
+        Ok(())
+    }
+
+    pub fn context_progress(&self, used_tokens: u64, context_window: u64) -> Result<()> {
+        if self.tui_events.is_some() {
+            self.emit_tui_event(
+                "context_progress",
+                "",
+                Some(serde_json::json!({
+                    "used_tokens": used_tokens,
+                    "context_window": context_window,
+                    "estimated": true,
+                })),
+                None,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn model_usage(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        context_window: u64,
+        estimated: bool,
+    ) -> Result<()> {
+        if self.tui_events.is_some() {
+            self.emit_tui_event(
+                "model_usage",
+                "",
+                Some(serde_json::json!({
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "used_tokens": input_tokens.saturating_add(output_tokens),
+                    "context_window": context_window,
+                    "estimated": estimated,
+                })),
+                None,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -420,6 +579,9 @@ impl EventSink {
 
     fn stderr_with_data(&self, event: &str, message: &str, data: Option<Value>) -> Result<()> {
         let message = redact(message);
+        if self.tui_events.is_some() {
+            return self.emit_tui_event(event, &message, data, None, false);
+        }
         if self.json {
             eprintln!(
                 "{}",
@@ -440,6 +602,41 @@ impl EventSink {
                 Some(code) => eprintln!("\x1b[{code}m{indent}{message}\x1b[0m"),
                 None => eprintln!("{indent}{message}"),
             }
+        }
+        Ok(())
+    }
+
+    fn emit_tui_event(
+        &self,
+        event: &str,
+        message: &str,
+        data: Option<Value>,
+        approval_reply: Option<SyncSender<String>>,
+        wait_for_terminal_ack: bool,
+    ) -> Result<()> {
+        let Some(sender) = &self.tui_events else {
+            return Ok(());
+        };
+        let (terminal_ack, ack_receiver) = if wait_for_terminal_ack {
+            let (ack_sender, ack_receiver) = mpsc::sync_channel(1);
+            (Some(ack_sender), Some(ack_receiver))
+        } else {
+            (None, None)
+        };
+        sender
+            .send(TuiEvent {
+                event: event.to_string(),
+                message: sanitize_terminal(&redact(message)),
+                data,
+                approval_reply,
+                terminal_ack,
+            })
+            .map_err(|_| anyhow::anyhow!("The TUI event receiver has closed"))?;
+        if let Some(receiver) = ack_receiver {
+            receiver
+                .recv()
+                .map_err(|_| anyhow::anyhow!("The TUI closed before releasing the terminal"))?
+                .map_err(anyhow::Error::msg)?;
         }
         Ok(())
     }
@@ -546,73 +743,252 @@ fn shell_quote(path: &std::path::Path) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub fn redact(value: &str) -> String {
-    let mut output = value.to_string();
-    for marker in [
-        "sk-",
-        "bearer ",
-        "authorization=",
-        "authorization:",
-        "token=",
-        "token:",
-        "password=",
-        "password:",
-        "api_key=",
-        "api_key:",
-        "api-key=",
-        "api-key:",
-        "qin_api_key=",
-    ] {
-        let mut offset = 0;
-        loop {
-            let lower = output.to_ascii_lowercase();
-            let Some(relative) = lower[offset..].find(marker) else {
-                break;
-            };
-            let found = offset + relative;
+const SECRET_MARKERS: &[&str] = &[
+    "sk-",
+    "bearer ",
+    "authorization=",
+    "authorization:",
+    "token=",
+    "token:",
+    "password=",
+    "password:",
+    "api_key=",
+    "api_key:",
+    "api-key=",
+    "api-key:",
+    "qin_api_key=",
+    "token\":",
+    "password\":",
+    "api_key\":",
+    "api-key\":",
+    "authorization\":",
+    "token':",
+    "password':",
+    "api_key':",
+    "api-key':",
+    "authorization':",
+];
+
+// Byte offsets always originate from ASCII markers or UTF-8 character boundaries.
+// An incomplete value is retained by the streaming redactor until it terminates.
+fn secret_ranges(value: &str) -> Vec<(usize, usize, usize, bool)> {
+    let lower = value.to_ascii_lowercase();
+    let mut ranges = Vec::new();
+    for &marker in SECRET_MARKERS {
+        for (found, _) in lower.match_indices(marker) {
             if marker == "sk-"
-                && (found > 0
-                    && output[..found]
-                        .chars()
-                        .next_back()
-                        .is_some_and(char::is_alphanumeric))
+                && found > 0
+                && value[..found]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric)
             {
-                offset = found + marker.len();
                 continue;
             }
-            let start = if marker == "sk-" {
+            let mut start = if marker == "sk-" {
                 found
             } else {
                 found + marker.len()
             };
-            let end = output[start..]
-                .find(|character: char| {
-                    character.is_whitespace()
-                        || matches!(character, '&' | '\'' | '"' | ',' | '}' | ']')
+            if marker != "sk-" {
+                start += value[start..].len() - value[start..].trim_start().len();
+                if marker.starts_with("authorization") && lower[start..].starts_with("bearer ") {
+                    start += "bearer ".len();
+                    start += value[start..].len() - value[start..].trim_start().len();
+                }
+            }
+            let quote = value[start..]
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '\'' | '"'));
+            if let Some(quote) = quote {
+                start += quote.len_utf8();
+            }
+            let end = value[start..]
+                .char_indices()
+                .find(|(index, c)| match quote {
+                    Some(quote) => {
+                        *c == quote
+                            && value[start..start + index]
+                                .bytes()
+                                .rev()
+                                .take_while(|byte| *byte == b'\\')
+                                .count()
+                                % 2
+                                == 0
+                    }
+                    None => c.is_whitespace() || matches!(c, '&' | '\'' | '"' | ',' | '}' | ']'),
                 })
-                .map(|length| start + length)
-                .unwrap_or(output.len());
-            if start == end {
-                offset = end.saturating_add(1).min(output.len());
+                .map_or(value.len(), |(index, _)| start + index);
+            let incomplete = end == value.len();
+            if marker == "sk-" && end - start < 20 && !incomplete {
                 continue;
             }
-            if marker == "sk-" && end.saturating_sub(start) < 20 {
-                offset = end;
-                continue;
-            }
-            if output[start..].starts_with("[REDACTED]") {
-                offset = start + "[REDACTED]".len();
-                continue;
-            }
-            output.replace_range(start..end, "[REDACTED]");
-            offset = start + "[REDACTED]".len();
+            ranges.push((found, start, end, incomplete));
         }
     }
+    ranges
+}
+
+pub fn redact(value: &str) -> String {
+    let mut ranges: Vec<_> = secret_ranges(value)
+        .into_iter()
+        .filter(|(found, start, end, _)| {
+            start < end
+                && !(value[*found..].to_ascii_lowercase().starts_with("sk-") && end - start < 20)
+                && !value[*start..].starts_with("[REDACTED]")
+        })
+        .map(|(_, start, end, _)| (start, end))
+        .collect();
+    ranges.sort_unstable();
+    let mut output = String::new();
+    let mut offset = 0;
+    for (start, end) in ranges {
+        if end <= offset {
+            continue;
+        }
+        if start >= offset {
+            output.push_str(&value[offset..start]);
+            output.push_str("[REDACTED]");
+        }
+        offset = end;
+    }
+    output.push_str(&value[offset..]);
     output
+}
+
+#[derive(Default)]
+pub(crate) struct StreamRedactor {
+    pending: String,
+    suppressed: bool,
+}
+
+impl StreamRedactor {
+    pub(crate) fn push(&mut self, text: &str) -> String {
+        if self.suppressed {
+            return String::new();
+        }
+        self.pending.push_str(text);
+        let lower = self.pending.to_ascii_lowercase();
+        let mut end = self.pending.len();
+        for &marker in SECRET_MARKERS {
+            for length in 1..marker.len() {
+                if lower.ends_with(&marker[..length]) {
+                    end = end.min(lower.len() - length);
+                }
+            }
+        }
+        for (found, _, _, incomplete) in secret_ranges(&self.pending) {
+            if incomplete {
+                end = end.min(found);
+            }
+        }
+        // Retain the preceding character for the sk- word-boundary check.
+        if end < self.pending.len() {
+            end = self.pending[..end]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(i, _)| i);
+        }
+        let ready = redact(&self.pending[..end]);
+        self.pending.drain(..end);
+        if self.pending.len() > 65_536 {
+            self.pending.clear();
+            self.suppressed = true;
+            return format!("{ready}[REDACTED oversized stream; further output suppressed]");
+        }
+        ready
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        let ready = redact(&self.pending);
+        self.pending.clear();
+        ready
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn redacts_spaced_quoted_and_unicode_secret_values() {
+        for text in [
+            "password: secret",
+            "token=\"secret with spaces\"",
+            r#"{"token": "secret with spaces", "password":"secret\"value"}"#,
+            "api_key:\u{3000}秘密",
+            "Authorization: Bearer secret",
+        ] {
+            let masked = redact(text);
+            assert!(
+                !masked.contains("secret") && !masked.contains("秘密"),
+                "{masked}"
+            );
+            assert!(masked.contains("[REDACTED]"));
+        }
+        assert_eq!(redact("task-123 sk-short"), "task-123 sk-short");
+    }
+
+    #[test]
+    fn streaming_redaction_is_independent_of_chunk_boundaries() {
+        for input in [
+            "hello password: secret bye",
+            "token=\"secret value\" end",
+            "Authorization: Bearer secret end",
+            "密钥 api_key:\u{3000}秘密 结束",
+            "sk-123456789012345678901234567890 end",
+        ] {
+            for boundary in input.char_indices().map(|(i, _)| i).chain([input.len()]) {
+                let mut redactor = StreamRedactor::default();
+                let mut output = redactor.push(&input[..boundary]);
+                output.push_str(&redactor.push(&input[boundary..]));
+                output.push_str(&redactor.finish());
+                assert_eq!(output, redact(input), "boundary={boundary}, input={input}");
+            }
+            let mut redactor = StreamRedactor::default();
+            let mut output = String::new();
+            for character in input.chars() {
+                output.push_str(&redactor.push(&character.to_string()));
+            }
+            output.push_str(&redactor.finish());
+            assert_eq!(output, redact(input));
+        }
+    }
+
+    #[test]
+    fn streaming_redaction_bounds_unterminated_secrets() {
+        let mut redactor = StreamRedactor::default();
+        let output = redactor.push(&format!("token={}", "s".repeat(70_000)));
+        assert!(output.contains("REDACTED") && redactor.pending.is_empty());
+        assert!(redactor.push("more secret").is_empty());
+    }
+
+    #[test]
+    fn abandoned_tui_approval_and_terminal_handoff_unblock_worker() {
+        for handoff in [false, true] {
+            let (sink, receiver) = EventSink::new_tui(true, false);
+            let (done, completion) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = if handoff {
+                    sink.emit_tui_event("terminal_handoff", "", None, None, true)
+                } else {
+                    sink.approval_prompt("Allow?").map(|_| ())
+                };
+                done.send(result.is_err()).unwrap();
+            });
+            let event = receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            drop(event);
+            drop(receiver);
+            assert!(
+                completion
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+            );
+            worker.join().unwrap();
+        }
+    }
     use super::*;
 
     #[test]

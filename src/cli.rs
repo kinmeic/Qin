@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "qin",
     version,
-    about = "A command-line AI agent that exits after each task",
+    about = "A command-line AI agent with one-shot and interactive modes",
     long_about = None
 )]
 pub struct Cli {
@@ -61,6 +61,9 @@ pub enum Command {
         #[arg(value_name = "PATH")]
         path: PathBuf,
     },
+
+    /// Start the interactive terminal chat interface
+    Tui,
 
     /// Replay a JSONL fixture through the real tool and persistence pipeline
     Replay {
@@ -195,6 +198,7 @@ fn normalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
     let known = [
         "init",
         "fromfile",
+        "tui",
         "replay",
         "new",
         "sessions",

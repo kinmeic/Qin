@@ -1,6 +1,7 @@
 mod agent;
 mod agents_md;
 mod approval;
+mod cancellation;
 mod checkpoint;
 mod cli;
 mod config;
@@ -10,6 +11,7 @@ mod markdown;
 mod prompt_file;
 mod state;
 mod tools;
+mod tui;
 mod update;
 mod wizard;
 
@@ -101,6 +103,12 @@ async fn run() -> Result<()> {
         Command::Fromfile { path } => {
             execute_from_file(&path, &explicit_config, &events, assume_yes, dry_run).await?
         }
+        Command::Tui => {
+            if cli.json {
+                bail!("qin tui cannot be combined with --json")
+            }
+            tui::run(explicit_config, assume_yes, dry_run, cli.quiet, cli.verbose).await?;
+        }
         Command::Replay { fixture } => {
             execute_replay_command(&fixture, &explicit_config, &events, assume_yes, dry_run).await?
         }
@@ -142,6 +150,7 @@ async fn run() -> Result<()> {
                     &events,
                     assume_yes,
                     dry_run,
+                    None,
                 )
                 .await?;
             }
@@ -332,7 +341,7 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn open(
+pub(crate) fn open(
     explicit: &Option<PathBuf>,
     events: &EventSink,
 ) -> Result<(config::Config, ConfigPathResolver, StateStore)> {
@@ -392,6 +401,7 @@ async fn execute_from_file(
         events,
         yes,
         dry_run,
+        None,
     )
     .await
 }
@@ -445,11 +455,12 @@ async fn execute_prompt(
         events,
         yes,
         dry_run,
+        None,
     )
     .await
 }
 
-fn load_agents_md(
+pub(crate) fn load_agents_md(
     resolver: &ConfigPathResolver,
     config: &config::Config,
     events: &EventSink,
@@ -468,7 +479,7 @@ fn load_agents_md(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_with(
+pub(crate) async fn execute_with(
     config: &config::Config,
     store: &mut StateStore,
     id: &str,
@@ -479,6 +490,7 @@ async fn execute_with(
     events: &EventSink,
     yes: bool,
     dry_run: bool,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     let _session_lock = store.lock_session(id)?;
     let recovered = store.recover_session(id)?;
@@ -499,6 +511,7 @@ async fn execute_with(
             assume_yes: yes,
             dry_run,
             agents_md,
+            cancellation,
         },
     )
     .await;

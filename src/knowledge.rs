@@ -307,7 +307,7 @@ pub async fn auto_extract(
         return Ok(0);
     }
     let model = config.primary_model()?;
-    let endpoint = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
+    let endpoint = crate::agent::chat_endpoint(&model.base_url);
     let request = serde_json::json!({
         "model": model.model,
         "stream": false,
@@ -413,6 +413,12 @@ async fn embed(config: &Config, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         {
             bail!("The embedding API returned missing or duplicate indices");
         }
+        if data
+            .iter()
+            .any(|entry| entry.embedding.iter().any(|value| !value.is_finite()))
+        {
+            bail!("The embedding API returned a non-finite vector");
+        }
         embeddings.extend(data.into_iter().map(|entry| entry.embedding));
     }
     Ok(embeddings)
@@ -458,29 +464,28 @@ fn chunk_text(content: &str, max_tokens: usize, overlap_tokens: usize) -> Vec<St
 }
 
 fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    if path.is_file() {
-        files.push(path.to_path_buf());
-        return Ok(());
-    }
-    if !path.is_dir() {
-        bail!("Knowledge import supports regular files and directories only");
-    }
-    if files.len() >= 1000 {
-        bail!("A single import is limited to 1,000 files");
-    }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_symlink() {
+    let mut pending = vec![path.to_path_buf()];
+    let mut visited = 0;
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
             continue;
         }
-        if ty.is_dir() {
-            collect_files(&entry.path(), files)?;
-        } else if ty.is_file() {
+        if metadata.is_file() {
             if files.len() >= 1000 {
                 bail!("A single import is limited to 1,000 files");
             }
-            files.push(entry.path());
+            files.push(path);
+        } else if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                visited += 1;
+                if visited > 10_000 {
+                    bail!("A knowledge import is limited to 10,000 directory entries");
+                }
+                pending.push(entry?.path());
+            }
+        } else {
+            bail!("Knowledge import supports regular files and directories only");
         }
     }
     Ok(())
@@ -488,15 +493,7 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 
 fn read_utf8_bounded(path: &Path, max_bytes: u64) -> Result<String> {
     let mut bytes = Vec::with_capacity(fs::metadata(path)?.len().min(max_bytes) as usize);
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    options
-        .open(path)?
+    crate::tools::open_read_no_follow(path)?
         .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
@@ -506,7 +503,11 @@ fn read_utf8_bounded(path: &Path, max_bytes: u64) -> Result<String> {
 }
 
 fn encode_vector(vector: &[f32], requested: &str) -> (Vec<u8>, String) {
-    if requested.eq_ignore_ascii_case("f16") {
+    if requested.eq_ignore_ascii_case("f16")
+        && vector
+            .iter()
+            .all(|value| half::f16::from_f32(*value).is_finite())
+    {
         (
             vector
                 .iter()
@@ -529,13 +530,20 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if a.iter().chain(b).any(|value| !value.is_finite()) {
+        return None;
+    }
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let na = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let nb = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
     if na == 0.0 || nb == 0.0 {
         None
     } else {
-        Some(dot / (na * nb))
+        Some((dot / (na * nb)).clamp(-1.0, 1.0) as f32)
     }
 }
 
@@ -582,6 +590,15 @@ fn estimate_tokens(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn embeddings_avoid_half_overflow_and_nan_scores() {
+        let (_, encoding) = encode_vector(&[1e30], "f16");
+        assert_eq!(encoding, "f32");
+        assert_eq!(cosine(&[1e30, 1e30], &[1e30, 1e30]), Some(1.0));
+        assert_eq!(cosine(&[f32::NAN], &[1.0]), None);
+        assert_eq!(cosine(&[f32::INFINITY], &[1.0]), None);
+    }
     use super::*;
     use crate::config::ConfigPathResolver;
     use std::io::{Read, Write};

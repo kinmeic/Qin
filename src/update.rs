@@ -184,8 +184,7 @@ pub async fn rollback(dry_run: bool, delegation_attempted: bool) -> Result<Rollb
     let parent = executable
         .parent()
         .context("The qin executable has no parent directory")?;
-    let mut source = File::open(&backup)
-        .with_context(|| format!("Unable to open update backup: {}", backup.display()))?;
+    let source = crate::tools::open_read_no_follow(&backup)?;
     let mut restored = NamedTempFile::new_in(parent)
         .with_context(|| format!("Unable to create a temporary file in {}", parent.display()))?;
     #[cfg(unix)]
@@ -196,7 +195,15 @@ pub async fn rollback(dry_run: bool, delegation_attempted: bool) -> Result<Rollb
             .as_file()
             .set_permissions(fs::Permissions::from_mode(mode))?;
     }
-    io::copy(&mut source, restored.as_file_mut()).context("Unable to read the update backup")?;
+    let copied = io::copy(
+        &mut source.take(MAX_BINARY_BYTES + 1),
+        restored.as_file_mut(),
+    )
+    .context("Unable to read the update backup")?;
+    ensure!(
+        copied > 0 && copied <= MAX_BINARY_BYTES,
+        "Update backup exceeded its size limit while being read"
+    );
     restored.as_file().sync_all()?;
     restored
         .persist(&executable)
@@ -494,7 +501,15 @@ fn github_client() -> Result<Client> {
         .user_agent(concat!("qin/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(120))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("Too many update redirects");
+            }
+            match validate_download_url(attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(error) => attempt.error(error),
+            }
+        }))
         .build()?)
 }
 
@@ -731,11 +746,14 @@ fn extract_binary(
 ) -> Result<NamedTempFile> {
     let archive_file = File::open(archive_path)
         .with_context(|| format!("Unable to open update archive: {}", archive_path.display()))?;
-    let decoder = GzDecoder::new(BufReader::new(archive_file));
+    let decoder =
+        GzDecoder::new(BufReader::new(archive_file)).take(MAX_ARCHIVE_BYTES as u64 * 2 + 1);
     let mut archive = Archive::new(decoder);
     let mut extracted = NamedTempFile::new_in(parent)
         .with_context(|| format!("Unable to create a temporary file in {}", parent.display()))?;
     let mut found = false;
+    let mut declared_total = 0_u64;
+    let mut entry_count = 0;
 
     for entry in archive
         .entries()
@@ -747,6 +765,14 @@ fn extract_binary(
             .context("The update archive contains an invalid path")?
             .into_owned();
         validate_archive_path(&path)?;
+        entry_count += 1;
+        declared_total = declared_total
+            .checked_add(entry.size())
+            .context("Update archive size overflow")?;
+        ensure!(
+            entry_count <= 1024 && declared_total <= MAX_ARCHIVE_BYTES as u64 * 2,
+            "The update archive exceeds extraction limits"
+        );
         if !entry.header().entry_type().is_file()
             || path.file_name().is_none_or(|name| name != "qin")
         {
@@ -846,6 +872,38 @@ fn sync_directory(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn update_urls_require_https_and_github_hosts() {
+        for url in [
+            "http://github.com/asset",
+            "https://github.com.attacker.test/asset",
+            "https://127.0.0.1/asset",
+        ] {
+            assert!(validate_download_url(url).is_err());
+        }
+        assert!(
+            validate_download_url("https://release-assets.githubusercontent.com/asset").is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_non_binary_entries_before_decompressing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.tar.gz");
+        let mut header = tar::Header::new_gnu();
+        header.set_path("large-data").unwrap();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(MAX_ARCHIVE_BYTES as u64 * 2 + 1);
+        header.set_mode(0o600);
+        header.set_cksum();
+        let mut encoder = GzEncoder::new(File::create(&path).unwrap(), Compression::default());
+        encoder.write_all(header.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        let error = extract_binary(&path, dir.path(), permissions).unwrap_err();
+        assert!(error.to_string().contains("extraction limits"), "{error}");
+    }
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;

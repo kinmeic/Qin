@@ -30,6 +30,7 @@ pub struct ToolContext<'a> {
     pub assume_yes: bool,
     pub approve_all_commands: &'a mut bool,
     pub dry_run: bool,
+    pub cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -385,6 +386,26 @@ fn observe_tool(
     ctx: &mut ToolContext<'_>,
 ) -> Result<()> {
     let elapsed = started.elapsed().as_millis();
+    let owned_error = result.as_ref().err().map(ToString::to_string);
+    let (status, audit_text, exit) = match result {
+        Ok(value) => ("completed", value.content.as_str(), value.exit_code),
+        Err(_) => (
+            "failed",
+            owned_error.as_deref().unwrap_or("unknown error"),
+            None,
+        ),
+    };
+    ctx.store.audit_tool(
+        ctx.session_id,
+        call_id,
+        name,
+        audit_args,
+        &truncate(redact(audit_text), 8_192),
+        status,
+        risk_for(name, args),
+        exit,
+        elapsed as u64,
+    )?;
     match result {
         Ok(value) => {
             // shell emits command_finished itself; dry runs still need the
@@ -418,26 +439,6 @@ fn observe_tool(
             })),
         )?,
     }
-    let owned_error = result.as_ref().err().map(ToString::to_string);
-    let (status, audit_text, exit) = match result {
-        Ok(value) => ("completed", value.content.as_str(), value.exit_code),
-        Err(_) => (
-            "failed",
-            owned_error.as_deref().unwrap_or("unknown error"),
-            None,
-        ),
-    };
-    ctx.store.audit_tool(
-        ctx.session_id,
-        call_id,
-        name,
-        audit_args,
-        &truncate(redact(audit_text), 8_192),
-        status,
-        risk_for(name, args),
-        exit,
-        elapsed as u64,
-    )?;
     Ok(())
 }
 
@@ -450,15 +451,6 @@ pub fn audit_interrupted(
     duration_ms: u64,
 ) -> Result<()> {
     let args = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
-    ctx.events.tool_failed_with_data(
-        name,
-        error,
-        duration_ms as u128,
-        Some(json!({
-            "tool_call_id": call_id,
-            "status": "interrupted",
-        })),
-    )?;
     ctx.store.audit_tool(
         ctx.session_id,
         call_id,
@@ -469,7 +461,17 @@ pub fn audit_interrupted(
         risk_for(name, &args),
         None,
         duration_ms,
-    )
+    )?;
+    let _ = ctx.events.tool_failed_with_data(
+        name,
+        error,
+        duration_ms as u128,
+        Some(json!({
+            "tool_call_id": call_id,
+            "status": "interrupted",
+        })),
+    );
+    Ok(())
 }
 
 fn validate_argument_keys(name: &str, args: &Value) -> Result<()> {
@@ -484,17 +486,17 @@ fn validate_argument_keys(name: &str, args: &Value) -> Result<()> {
         bail!("Tool {name} received an unsupported argument: {key}");
     }
     for key in ["max_bytes", "timeout_seconds", "limit"] {
-        if let Some(value) = object.get(key) {
-            if value.as_u64().is_none() {
-                bail!("Tool argument {key} must be a nonnegative integer");
-            }
+        if let Some(value) = object.get(key)
+            && value.as_u64().is_none()
+        {
+            bail!("Tool argument {key} must be a nonnegative integer");
         }
     }
     for key in ["overwrite", "recursive", "elevated"] {
-        if let Some(value) = object.get(key) {
-            if !value.is_boolean() {
-                bail!("Tool argument {key} must be a boolean");
-            }
+        if let Some(value) = object.get(key)
+            && !value.is_boolean()
+        {
+            bail!("Tool argument {key} must be a boolean");
         }
     }
     Ok(())
@@ -744,6 +746,9 @@ fn move_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         bail!("Source does not exist: {}", src.display());
     }
     reject_symlink_target(&dst)?;
+    if src == dst {
+        bail!("Source and destination must be different paths");
+    }
     if dst.exists() && !args["overwrite"].as_bool().unwrap_or(false) {
         bail!("Destination already exists: {}", dst.display())
     }
@@ -780,6 +785,9 @@ fn copy_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let src = resolve_existing(ctx.cwd, string(args, "source")?)?;
     let dst = resolve_target(ctx.cwd, string(args, "destination")?)?;
     reject_symlink_target(&dst)?;
+    if src == dst {
+        bail!("Source and destination must be different paths");
+    }
     if !src.is_file() {
         bail!("copy_path currently supports regular files only")
     }
@@ -796,7 +804,9 @@ fn copy_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     if !ctx.dry_run {
         let recorder = Recorder::new(ctx, "copy_path")?;
         if let Some(recorder) = &recorder {
-            if !creates_new_file {
+            if creates_new_file {
+                recorder.created(ctx.store, &dst)?;
+            } else {
                 recorder.overwrite(ctx.store, &dst)?;
             }
         }
@@ -849,6 +859,9 @@ fn remove_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                 .and_then(|value| value.to_str())
                 .unwrap_or("item");
             let destination = trash.join(format!("{}-{name}", uuid::Uuid::new_v4()));
+            if let Some(recorder) = &recorder {
+                recorder.deleted(ctx.store, &path, Some(&destination))?;
+            }
             fs::rename(&path, &destination).with_context(|| {
                 format!(
                     "Unable to move {} to the recoverable trash location {}",
@@ -856,9 +869,6 @@ fn remove_path(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                     destination.display()
                 )
             })?;
-            if let Some(recorder) = &recorder {
-                recorder.deleted(ctx.store, &path, Some(&destination))?;
-            }
         } else {
             if let Some(recorder) = &recorder {
                 // Snapshots cover regular files only; directory deletions are
@@ -892,15 +902,27 @@ fn apply_patch(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     reject_symlink_target(&path)?;
     let old = string(args, "old_text")?;
     let new = string(args, "new_text")?;
+    if old.is_empty() {
+        bail!("old_text cannot be empty");
+    }
     let metadata = fs::metadata(&path)?;
     if metadata.len() > ctx.config.permissions.max_output_bytes as u64 {
         bail!("The file is too large for apply_patch");
     }
     let mut content = String::with_capacity(metadata.len() as usize);
-    open_read_no_follow(&path)?.read_to_string(&mut content)?;
+    open_read_no_follow(&path)?
+        .take(ctx.config.permissions.max_output_bytes as u64 + 1)
+        .read_to_string(&mut content)?;
+    if content.len() > ctx.config.permissions.max_output_bytes {
+        bail!("The file grew beyond the apply_patch limit");
+    }
     let count = content.matches(old).count();
     if count != 1 {
         bail!("old_text must match exactly once; found {count} matches")
+    }
+    let replacement = content.replacen(old, new, 1);
+    if replacement.len() > ctx.config.permissions.max_output_bytes {
+        bail!("The patched file exceeds the configured size limit");
     }
     approve_path_mutation(
         ctx,
@@ -913,7 +935,7 @@ fn apply_patch(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         if let Some(recorder) = &recorder {
             recorder.overwrite(ctx.store, &path)?;
         }
-        atomic_write(&path, content.replacen(old, new, 1).as_bytes())?;
+        atomic_write(&path, replacement.as_bytes())?;
         if let Some(recorder) = &recorder {
             recorder.commit(ctx.store)?;
         }
@@ -944,17 +966,18 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let high_risk = elevated || dangerous(command) || invokes_elevation;
     let needs_approval =
         high_risk || ctx.config.permissions.approval == "always" || !is_read_only_command(command);
-    if needs_approval && !*ctx.approve_all_commands {
+    if needs_approval && (high_risk || !*ctx.approve_all_commands) {
+        let choices = if high_risk { "[y/N]" } else { "[y/N/All]" };
         let message = if ctx.events.shows_command_details() {
             // tool_started already displays the full command.
-            "Allow this command? [y/N/All] ".to_string()
+            format!("Allow this command? {choices} ")
         } else {
-            format!("Allow command `{}`? [y/N/All] ", redact(command))
+            format!("Allow command `{}`? {choices} ", redact(command))
         };
         if approve_command(ctx, &message, high_risk)? == ApprovalDecision::All {
             *ctx.approve_all_commands = true;
             ctx.events.tool_warning(
-                "All subsequent shell commands in this task are approved; forbidden commands remain blocked",
+                "Subsequent ordinary shell commands in this task are approved; high-risk commands still require confirmation",
             )?;
         }
     }
@@ -1050,7 +1073,7 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                     if append_capped(&mut output, &piece, ctx.config.permissions.max_output_bytes) {
                         output_truncated = true;
                     }
-                    if ctx.config.ui.stream_command_output {
+                    if ctx.config.ui.stream_command_output || ctx.events.terminal_handed_off() {
                         let remaining = ctx.config.ui.command_output_max_bytes.saturating_sub(streamed_bytes);
                         if remaining > 0 {
                             let visible = prefix_at_boundary(&text, remaining);
@@ -1094,9 +1117,18 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
                 child.kill().await.ok();
                 bail!("Command canceled by the user")
             }
+            _ = crate::cancellation::wait(ctx.cancellation.clone()) => {
+                child.kill().await.ok();
+                bail!("Command canceled by the user")
+            }
         }
     }
-    let status = child.wait().await?;
+    let status = tokio::select! {
+        status = child.wait() => status?,
+        _ = &mut deadline => { child.kill().await.ok(); bail!("Command timed out after {timeout}s"); }
+        _ = tokio::signal::ctrl_c() => { child.kill().await.ok(); bail!("Command canceled by the user"); }
+        _ = crate::cancellation::wait(ctx.cancellation.clone()) => { child.kill().await.ok(); bail!("Command canceled by the user"); }
+    };
     process_group.disarm();
     foreground_group
         .restore()
@@ -1145,12 +1177,10 @@ fn child_needs_foreground_terminal(child_can_prompt: bool) -> bool {
 }
 
 fn validate_interactive_shell_command(command: &str, child_can_prompt: bool) -> Result<()> {
-    if child_can_prompt {
-        if let Some(reason) = interactive_shell_wrapper_reason(command) {
-            bail!(
-                "Refusing interactive shell wrapper: {reason}; run the target command directly and set timeout_seconds on the shell tool"
-            );
-        }
+    if child_can_prompt && let Some(reason) = interactive_shell_wrapper_reason(command) {
+        bail!(
+            "Refusing interactive shell wrapper: {reason}; run the target command directly and set timeout_seconds on the shell tool"
+        );
     }
     Ok(())
 }
@@ -1675,6 +1705,9 @@ enum ApprovalAnswer {
 }
 
 fn approve(ctx: &mut ToolContext<'_>, message: &str, high_risk: bool) -> Result<()> {
+    if ctx.config.permissions.yolo {
+        return Ok(());
+    }
     if ctx.assume_yes && !high_risk {
         return Ok(());
     }
@@ -1698,13 +1731,16 @@ fn approve_command(
     message: &str,
     high_risk: bool,
 ) -> Result<ApprovalDecision> {
+    if ctx.config.permissions.yolo {
+        return Ok(ApprovalDecision::Once);
+    }
     if ctx.assume_yes && !high_risk {
         return Ok(ApprovalDecision::Once);
     }
     if ctx.config.permissions.approval == "never" && !high_risk {
         return Ok(ApprovalDecision::Once);
     }
-    match request_approval(ctx, message, high_risk, true)? {
+    match request_approval(ctx, message, high_risk, !high_risk)? {
         ApprovalAnswer::Once => Ok(ApprovalDecision::Once),
         ApprovalAnswer::All => Ok(ApprovalDecision::All),
         answer => bail!(approval_denial_message(answer)),
@@ -1736,25 +1772,30 @@ fn request_approval(
         "high_risk": high_risk,
         "allow_all": allow_all,
     });
-    if let Err(error) = ctx
+    let tui_answer = match ctx
         .events
         .approval_prompt_with_data(message, Some(prompt_data))
     {
-        let _ = ctx.store.append_approval_decided(
-            ctx.session_id,
-            ctx.turn_id,
-            ctx.tool_call_id,
-            &approval_id,
-            ApprovalOutcome::Unavailable,
-        );
-        let _ = ctx.events.approval_decided(
-            &approval_id,
-            ctx.tool_call_id,
-            ApprovalOutcome::Unavailable.as_str(),
-        );
-        return Err(error).context("Unable to render the approval prompt");
-    }
-    let answer = if !io::stdin().is_terminal() {
+        Ok(answer) => answer,
+        Err(error) => {
+            let _ = ctx.store.append_approval_decided(
+                ctx.session_id,
+                ctx.turn_id,
+                ctx.tool_call_id,
+                &approval_id,
+                ApprovalOutcome::Unavailable,
+            );
+            let _ = ctx.events.approval_decided(
+                &approval_id,
+                ctx.tool_call_id,
+                ApprovalOutcome::Unavailable.as_str(),
+            );
+            return Err(error).context("Unable to render the approval prompt");
+        }
+    };
+    let answer = if let Some(input) = tui_answer {
+        parse_approval_answer(&input, allow_all)
+    } else if !io::stdin().is_terminal() {
         ApprovalAnswer::Unavailable
     } else {
         let mut input = String::new();
@@ -1803,12 +1844,59 @@ fn parse_approval_answer(answer: &str, allow_all: bool) -> ApprovalAnswer {
     match answer.trim().to_lowercase().as_str() {
         "y" | "yes" | "\u{662f}" => ApprovalAnswer::Once,
         "a" | "all" | "\u{5168}\u{90e8}" if allow_all => ApprovalAnswer::All,
+        "cancel" | "cancelled" => ApprovalAnswer::Cancelled,
         "" | "n" | "no" | "\u{4e0d}" | "\u{5426}" => ApprovalAnswer::Rejected,
         _ => ApprovalAnswer::Rejected,
     }
 }
 
 fn dangerous(command: &str) -> bool {
+    dangerous_inner(command, 0)
+}
+
+fn dangerous_inner(command: &str, depth: usize) -> bool {
+    if depth > 3 {
+        return true;
+    }
+    let Some(commands) = shell_commands_for_guard(command) else {
+        return true;
+    };
+    for tokens in commands {
+        let tokens = unwrap_command_prefixes(&tokens);
+        let Some(program) = tokens
+            .first()
+            .and_then(|value| Path::new(value).file_name())
+            .and_then(|name| name.to_str())
+        else {
+            continue;
+        };
+        if matches!(
+            program,
+            "rm" | "unlink"
+                | "rmdir"
+                | "shred"
+                | "mkfs"
+                | "wipefs"
+                | "fdisk"
+                | "parted"
+                | "shutdown"
+                | "reboot"
+                | "poweroff"
+                | "halt"
+                | "sudo"
+                | "doas"
+        ) || program.starts_with("mkfs.")
+        {
+            return true;
+        }
+        if matches!(program, "sh" | "bash" | "zsh" | "ksh" | "dash")
+            && let Some(index) = tokens.iter().position(|value| value == "-c")
+            && let Some(script) = tokens.get(index + 1)
+            && dangerous_inner(script, depth + 1)
+        {
+            return true;
+        }
+    }
     let lower = command.to_lowercase();
     let compact: String = lower
         .chars()
@@ -2008,6 +2096,13 @@ fn unwrap_command_prefixes(mut tokens: &[String]) -> &[String] {
         let Some(program) = tokens.first().map(String::as_str) else {
             return tokens;
         };
+        if program
+            .split_once('=')
+            .is_some_and(|(name, _)| crate::config::is_env_var_name(name))
+        {
+            tokens = &tokens[1..];
+            continue;
+        }
         if matches!(program, "command" | "exec") {
             tokens = &tokens[1..];
             continue;
@@ -2086,23 +2181,17 @@ fn broad_delete_target(value: &str) -> bool {
             .as_deref()
             .is_some_and(|home| normalized.as_deref() == Some(home))
         || normalized.as_deref().is_some_and(|path| {
-            matches!(
-                path.to_str(),
-                Some(
-                    "/bin"
-                        | "/boot"
-                        | "/dev"
-                        | "/etc"
-                        | "/home"
-                        | "/lib"
-                        | "/lib64"
-                        | "/opt"
-                        | "/root"
-                        | "/sbin"
-                        | "/usr"
-                        | "/var"
-                )
-            )
+            [
+                "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/root",
+                "/sbin", "/usr", "/var",
+            ]
+            .iter()
+            .any(|root| {
+                path == Path::new(root)
+                    || Path::new(root)
+                        .canonicalize()
+                        .is_ok_and(|resolved| resolved == path)
+            })
         })
 }
 
@@ -2821,9 +2910,8 @@ fn command_exists(name: &str) -> bool {
 }
 pub(crate) fn guard_delete(path: &Path, cwd: &Path) -> Result<()> {
     let canonical = path.canonicalize()?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if canonical == Path::new("/")
-        || home.as_deref() == Some(canonical.as_path())
+    if broad_delete_target(&canonical.to_string_lossy())
+        || broad_delete_target(&path.to_string_lossy())
         || canonical == cwd.canonicalize()?
     {
         bail!(
@@ -2857,7 +2945,7 @@ fn resolve_existing(cwd: &Path, path: &str) -> Result<PathBuf> {
         .with_context(|| format!("Path does not exist or is inaccessible: {path}"))
 }
 
-fn resolve_target(cwd: &Path, path: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_target(cwd: &Path, path: &str) -> Result<PathBuf> {
     let candidate = resolve(cwd, path);
     let file_name = candidate
         .file_name()
@@ -2902,14 +2990,22 @@ pub(crate) fn open_read_no_follow(path: &Path) -> Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    options
+    let file = options
         .open(path)
-        .with_context(|| format!("Unable to open {} safely for reading", path.display()))
+        .with_context(|| format!("Unable to open {} safely for reading", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("Reading requires a regular file: {}", path.display());
+    }
+    Ok(file)
 }
 
 pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    atomic_write_with_mode(path, content, None)
+}
+
+pub(crate) fn atomic_write_with_mode(path: &Path, content: &[u8], mode: Option<u32>) -> Result<()> {
     let parent = path
         .parent()
         .context("The output path has no parent directory")?;
@@ -2918,7 +3014,20 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
         .filter(|metadata| metadata.file_type().is_file())
         .map(|metadata| metadata.permissions());
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    if let Some(permissions) = existing_permissions {
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    if let Some(mut permissions) = existing_permissions.filter(|_| mode.is_none()) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() & 0o777);
+        }
         temp.as_file().set_permissions(permissions)?;
     }
     temp.write_all(content)?;
@@ -2948,7 +3057,7 @@ pub(crate) fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     fs::File::open(path)?.sync_all()?;
     Ok(())
@@ -3088,13 +3197,13 @@ fn presentation_path(value: &str) -> String {
 
 fn safe_args(name: &str, args: &Value) -> String {
     let mut view = args.clone();
-    if matches!(name, "write_file" | "apply_patch" | "save_memory") {
-        if let Some(object) = view.as_object_mut() {
-            for key in ["content", "old_text", "new_text"] {
-                if let Some(value) = object.get_mut(key) {
-                    let len = value.as_str().map(str::len).unwrap_or(0);
-                    *value = Value::String(format!("[CONTENT {len} bytes]"));
-                }
+    if matches!(name, "write_file" | "apply_patch" | "save_memory")
+        && let Some(object) = view.as_object_mut()
+    {
+        for key in ["content", "old_text", "new_text"] {
+            if let Some(value) = object.get_mut(key) {
+                let len = value.as_str().map(str::len).unwrap_or(0);
+                *value = Value::String(format!("[CONTENT {len} bytes]"));
             }
         }
     }
@@ -3140,11 +3249,19 @@ fn spawn_chunk_reader<R>(
         let mut reader = reader;
         let mut buffer = vec![0_u8; 8_192];
         let mut pending = Vec::new();
+        let mut redactor = crate::event::StreamRedactor::default();
         loop {
             match reader.read(&mut buffer).await {
                 Ok(0) => {
                     if !pending.is_empty() {
                         let text = String::from_utf8_lossy(&pending).into_owned();
+                        let text = redactor.push(&text);
+                        if !text.is_empty() {
+                            let _ = tx.send((label, text)).await;
+                        }
+                    }
+                    let text = redactor.finish();
+                    if !text.is_empty() {
                         let _ = tx.send((label, text)).await;
                     }
                     break;
@@ -3165,6 +3282,7 @@ fn spawn_chunk_reader<R>(
                     if consumed > 0 {
                         pending.drain(..consumed);
                     }
+                    let text = redactor.push(&text);
                     if !text.is_empty() && tx.send((label, text)).await.is_err() {
                         break;
                     }
@@ -3220,6 +3338,217 @@ fn append_truncation_marker(output: &mut String, max_bytes: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interrupted_tool_audit_survives_a_closed_tui_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut store, session) = audit_store(dir.path());
+        let (events, receiver) = EventSink::new_tui(false, true);
+        drop(receiver);
+        let mut all = false;
+        let mut ctx = audit_context(&config, &mut store, &session, dir.path(), &mut all, &events);
+        audit_interrupted("call", "web_search", "{}", &mut ctx, "canceled", 1).unwrap();
+        ctx.store.checkpoint().unwrap();
+    }
+
+    #[test]
+    fn typed_delete_protects_the_same_system_roots_as_shell_delete() {
+        let cwd = tempfile::tempdir().unwrap();
+        for path in ["/", "/etc", "/usr", "/var"] {
+            assert!(guard_delete(Path::new(path), cwd.path()).is_err(), "{path}");
+        }
+        let ordinary = cwd.path().join("ordinary");
+        fs::create_dir(&ordinary).unwrap();
+        assert!(guard_delete(&ordinary, cwd.path()).is_ok());
+    }
+
+    fn audit_store(dir: &Path) -> (Config, StateStore, String) {
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.storage.database = "audit.db".into();
+        let resolver = ConfigPathResolver::new(Some(dir.join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir, None).unwrap();
+        (config, store, session)
+    }
+
+    fn audit_context<'a>(
+        config: &'a Config,
+        store: &'a mut StateStore,
+        session: &'a str,
+        dir: &'a Path,
+        all: &'a mut bool,
+        events: &'a EventSink,
+    ) -> ToolContext<'a> {
+        ToolContext {
+            config,
+            events,
+            store,
+            session_id: session,
+            turn_id: "audit-turn",
+            tool_call_id: "audit-call",
+            tool_name: "shell",
+            cwd: dir,
+            assume_yes: true,
+            approve_all_commands: all,
+            dry_run: false,
+            cancellation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_and_cancel_still_work_after_output_pipes_close() {
+        for canceled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (config, mut store, session) = audit_store(dir.path());
+            let events = EventSink::new(true, false, false);
+            let mut all = true;
+            let mut ctx =
+                audit_context(&config, &mut store, &session, dir.path(), &mut all, &events);
+            let (sender, receiver) = tokio::sync::watch::channel(false);
+            let cancel_task = if canceled {
+                ctx.cancellation = Some(receiver);
+                Some(tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    sender.send(true).unwrap();
+                }))
+            } else {
+                None
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                execute(
+                    "audit-call",
+                    "shell",
+                    r#"{"command":"exec >/dev/null 2>&1; sleep 60","timeout_seconds":1}"#,
+                    &mut ctx,
+                ),
+            )
+            .await
+            .expect("Shell ignored timeout or cancellation");
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(if canceled { "canceled" } else { "timed out" }),
+                "{error}"
+            );
+            if let Some(task) = cancel_task {
+                task.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn high_risk_shell_requires_confirmation_despite_all_and_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, mut store, session) = audit_store(dir.path());
+        config.permissions.approval = "never".into();
+        let (events, receiver) = EventSink::new_tui(true, false);
+        let approval = std::thread::spawn(move || {
+            loop {
+                let event = receiver
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                if let Some(reply) = event.approval_reply {
+                    assert_eq!(event.data.unwrap()["allow_all"], false);
+                    reply.send("n".into()).unwrap();
+                    // Keep the event channel open until execute finishes.
+                    while receiver
+                        .recv_timeout(std::time::Duration::from_millis(200))
+                        .is_ok()
+                    {}
+                    break;
+                }
+            }
+        });
+        let mut all = true;
+        let mut ctx = audit_context(&config, &mut store, &session, dir.path(), &mut all, &events);
+        let result = execute(
+            "audit-call",
+            "shell",
+            r#"{"command":"rm audit-does-not-exist"}"#,
+            &mut ctx,
+        )
+        .await;
+        assert!(result.is_err());
+        approval.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn copied_new_files_are_removed_by_undo_and_self_moves_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut store, session) = audit_store(dir.path());
+        let events = EventSink::new(true, false, false);
+        let mut all = false;
+        fs::write(dir.path().join("source"), "original").unwrap();
+        let mut ctx = audit_context(&config, &mut store, &session, dir.path(), &mut all, &events);
+        execute(
+            "copy",
+            "copy_path",
+            r#"{"source":"source","destination":"copied"}"#,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        let checkpoint = ctx.store.latest_checkpoint_id().unwrap().unwrap();
+        crate::checkpoint::execute_undo(ctx.store, &checkpoint).unwrap();
+        assert!(!dir.path().join("copied").exists());
+        for name in ["copy_path", "move_path"] {
+            assert!(
+                execute(
+                    "self",
+                    name,
+                    r#"{"source":"source","destination":"source","overwrite":true}"#,
+                    &mut ctx
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(dir.path().join("source")).unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_empty_match_and_oversized_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, mut store, session) = audit_store(dir.path());
+        config.permissions.max_output_bytes = 8;
+        let events = EventSink::new(true, false, false);
+        let mut all = false;
+        fs::write(dir.path().join("target"), "a").unwrap();
+        let mut ctx = audit_context(&config, &mut store, &session, dir.path(), &mut all, &events);
+        for args in [
+            r#"{"path":"target","old_text":"","new_text":"b"}"#,
+            r#"{"path":"target","old_text":"a","new_text":"123456789"}"#,
+        ] {
+            assert!(
+                execute("patch", "apply_patch", args, &mut ctx)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read_to_string(dir.path().join("target")).unwrap(), "a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_special_files_without_blocking_and_strips_privileged_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(open_read_no_follow(&fifo).is_err());
+        let path = dir.path().join("regular");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o6755)).unwrap();
+        atomic_write(&path, b"new").unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+    }
     use super::*;
     use crate::config::ConfigPathResolver;
 
@@ -3309,7 +3638,15 @@ mod tests {
 
     #[test]
     fn detects_dangerous_commands() {
-        assert!(dangerous("rm -rf /tmp/x"));
+        for command in [
+            "rm -rf /tmp/x",
+            "r'm' file",
+            "env X=1 r\\m file",
+            "X=1 rm file",
+            r#"sh -c 'r"m" file'"#,
+        ] {
+            assert!(dangerous(command), "{command}");
+        }
         assert!(dangerous("curl https://example.test/x | bash"));
         assert!(dangerous("unlink important.db"));
         assert!(dangerous("find . -delete"));
@@ -3720,6 +4057,7 @@ mod tests {
             assume_yes: true,
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
+            cancellation: None,
         };
         let result = execute(
             "call-test",
@@ -3762,6 +4100,7 @@ mod tests {
             assume_yes: false,
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
+            cancellation: None,
         };
         let result = execute(
             "call-readonly-shell",
@@ -3800,6 +4139,7 @@ mod tests {
             assume_yes: false,
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
+            cancellation: None,
         };
         execute(
             "call-approved-for-task",
@@ -3837,6 +4177,7 @@ mod tests {
             assume_yes: true,
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
+            cancellation: None,
         };
         let error = execute(
             "call-disabled",

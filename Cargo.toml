@@ -1,8 +1,8 @@
 [package]
 name = "qin"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Use natural language to operate Linux, macOS, and OpenWrt without memorizing commands or flags"
 license = "Apache-2.0"
 repository = "https://github.com/kinmeic/Qin"
@@ -13,6 +13,7 @@ categories = ["command-line-utilities"]
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = "0.29.0"
 clap = { version = "4.5", features = ["derive"] }
 directories = "6"
 flate2 = "1"
@@ -24,6 +25,7 @@ libc = "0.2"
 minisign-verify = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 redis = { version = "1.2.2", default-features = false, features = ["tls-rustls"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
@@ -35,7 +37,7 @@ tar = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "signal", "time"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
-unicode-width = "0.2.2"
+unicode-width = "0.2.0"
 
 [dev-dependencies]
 ed25519-dalek = "2"

@@ -306,10 +306,10 @@ fn ask_choice(label: &str, choices: &[(&str, &str)], default: &str) -> Result<St
         if let Some((value, _)) = choices.iter().find(|(value, _)| *value == answer) {
             return Ok((*value).into());
         }
-        if let Ok(number) = answer.parse::<usize>() {
-            if let Some((value, _)) = choices.get(number.saturating_sub(1)) {
-                return Ok((*value).into());
-            }
+        if let Ok(number) = answer.parse::<usize>()
+            && let Some((value, _)) = choices.get(number.saturating_sub(1))
+        {
+            return Ok((*value).into());
         }
         println!(
             "Please choose one of: {}",

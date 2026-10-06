@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=qin
-PKG_VERSION:=0.5.0
+PKG_VERSION:=0.6.0
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Qin contributors
@@ -17,7 +17,7 @@ define Package/qin
 endef
 
 define Package/qin/description
- qin is a one-shot command-line AI agent with sessions and local knowledge search.
+ qin is a command-line AI agent with interactive TUI, sessions, and local knowledge search.
 endef
 
 # The release pipeline must place the target-specific static binary here.

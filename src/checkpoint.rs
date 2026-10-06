@@ -84,12 +84,13 @@ impl Recorder {
             store,
             CheckpointEntryRow {
                 seq: 0,
-                path: path.display().to_string(),
+                path: recorded_path(path)?,
                 kind: KIND_CREATE.into(),
                 related_path: None,
                 existed_before: false,
                 snapshot_file: None,
                 original_sha256: None,
+                original_mode: None,
             },
         )
     }
@@ -101,12 +102,13 @@ impl Recorder {
             store,
             CheckpointEntryRow {
                 seq: 0,
-                path: path.display().to_string(),
+                path: recorded_path(path)?,
                 kind: KIND_OVERWRITE.into(),
                 related_path: None,
                 existed_before: true,
                 snapshot_file,
                 original_sha256,
+                original_mode: file_mode(path)?,
             },
         )
     }
@@ -117,12 +119,13 @@ impl Recorder {
             store,
             CheckpointEntryRow {
                 seq: 0,
-                path: src.display().to_string(),
+                path: recorded_path(src)?,
                 kind: KIND_MOVE.into(),
-                related_path: Some(dst.display().to_string()),
+                related_path: Some(recorded_path(dst)?),
                 existed_before: true,
                 snapshot_file: None,
                 original_sha256: None,
+                original_mode: None,
             },
         )
     }
@@ -145,12 +148,17 @@ impl Recorder {
             store,
             CheckpointEntryRow {
                 seq: 0,
-                path: path.display().to_string(),
+                path: recorded_path(path)?,
                 kind: KIND_DELETE.into(),
-                related_path: trash_dest.map(|dest| dest.display().to_string()),
+                related_path: trash_dest.map(recorded_path).transpose()?,
                 existed_before: true,
                 snapshot_file,
                 original_sha256,
+                original_mode: if trash_dest.is_some() {
+                    None
+                } else {
+                    file_mode(path)?
+                },
             },
         )
     }
@@ -194,6 +202,10 @@ impl Recorder {
         let name = self.next_seq.get().to_string();
         temp.persist(self.directory.join(&name))
             .map_err(|error| error.error)?;
+        crate::tools::sync_directory(&self.directory)?;
+        if let Some(parent) = self.directory.parent() {
+            crate::tools::sync_directory(parent)?;
+        }
         Ok((Some(name), Some(hex::encode(hasher.finalize()))))
     }
 
@@ -222,10 +234,22 @@ pub struct UndoStep {
 
 #[derive(Debug)]
 enum UndoAction {
-    RestoreSnapshot { path: PathBuf, snapshot: PathBuf },
-    RemoveCreated { path: PathBuf },
-    MoveBack { from: PathBuf, to: PathBuf },
-    Unrecoverable { reason: String },
+    RestoreSnapshot {
+        path: PathBuf,
+        snapshot: PathBuf,
+        expected_hash: Option<String>,
+        original_mode: Option<u32>,
+    },
+    RemoveCreated {
+        path: PathBuf,
+    },
+    MoveBack {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Unrecoverable {
+        reason: String,
+    },
 }
 
 /// Builds the ordered undo steps for a checkpoint, newest entry first.
@@ -234,6 +258,9 @@ pub fn plan_undo(store: &StateStore, checkpoint_id: &str) -> Result<Vec<UndoStep
     if entries.is_empty() {
         bail!("The checkpoint contains no restorable entries");
     }
+    if uuid::Uuid::parse_str(checkpoint_id).is_err() {
+        bail!("Invalid checkpoint identifier");
+    }
     let root = store
         .checkpoints_dir()
         .context("Checkpoints require the SQLite storage backend")?
@@ -241,6 +268,12 @@ pub fn plan_undo(store: &StateStore, checkpoint_id: &str) -> Result<Vec<UndoStep
     let mut steps = Vec::new();
     for entry in entries.into_iter().rev() {
         let path = PathBuf::from(&entry.path);
+        reject_unsafe_parents(&path)?;
+        if let Some(file) = &entry.snapshot_file
+            && (file.is_empty() || !file.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            bail!("Invalid checkpoint snapshot filename");
+        }
         let step = match entry.kind.as_str() {
             KIND_OVERWRITE => match entry.snapshot_file {
                 Some(file) => UndoStep {
@@ -248,6 +281,8 @@ pub fn plan_undo(store: &StateStore, checkpoint_id: &str) -> Result<Vec<UndoStep
                     action: UndoAction::RestoreSnapshot {
                         path,
                         snapshot: root.join(file),
+                        expected_hash: entry.original_sha256,
+                        original_mode: entry.original_mode,
                     },
                 },
                 None => UndoStep {
@@ -294,6 +329,8 @@ pub fn plan_undo(store: &StateStore, checkpoint_id: &str) -> Result<Vec<UndoStep
                     action: UndoAction::RestoreSnapshot {
                         path,
                         snapshot: root.join(file),
+                        expected_hash: entry.original_sha256,
+                        original_mode: entry.original_mode,
                     },
                 },
                 (None, None) => UndoStep {
@@ -319,7 +356,12 @@ pub fn execute_undo(store: &StateStore, checkpoint_id: &str) -> Result<Vec<Strin
     let mut outcomes = Vec::new();
     for step in steps {
         match step.action {
-            UndoAction::RestoreSnapshot { path, snapshot } => {
+            UndoAction::RestoreSnapshot {
+                path,
+                snapshot,
+                expected_hash,
+                original_mode,
+            } => {
                 reject_unsafe_target(&path)?;
                 if !snapshot.is_file() {
                     bail!(
@@ -327,10 +369,24 @@ pub fn execute_undo(store: &StateStore, checkpoint_id: &str) -> Result<Vec<Strin
                         path.display()
                     );
                 }
+                let mut source = crate::tools::open_read_no_follow(&snapshot)?;
+                let mut bytes = Vec::new();
+                source
+                    .by_ref()
+                    .take(256 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > 256 * 1024 * 1024 {
+                    bail!("Checkpoint snapshot is too large");
+                }
+                if let Some(expected) = expected_hash
+                    && hex::encode(Sha256::digest(&bytes)) != expected
+                {
+                    bail!("Checkpoint snapshot checksum mismatch; refusing restore");
+                }
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                crate::tools::atomic_copy(&snapshot, &path)?;
+                crate::tools::atomic_write_with_mode(&path, &bytes, original_mode)?;
                 outcomes.push(format!("Restored {}", path.display()));
             }
             UndoAction::RemoveCreated { path } => match fs::symlink_metadata(&path) {
@@ -351,6 +407,8 @@ pub fn execute_undo(store: &StateStore, checkpoint_id: &str) -> Result<Vec<Strin
                 Err(error) => return Err(error.into()),
             },
             UndoAction::MoveBack { from, to } => {
+                reject_unsafe_parents(&from)?;
+                reject_unsafe_parents(&to)?;
                 if !from.exists() && fs::symlink_metadata(&from).is_err() {
                     outcomes.push(format!("Skipped: {} no longer exists", from.display()));
                     continue;
@@ -379,7 +437,76 @@ pub fn execute_undo(store: &StateStore, checkpoint_id: &str) -> Result<Vec<Strin
     Ok(outcomes)
 }
 
+fn recorded_path(path: &Path) -> Result<String> {
+    let path = crate::tools::resolve_target(
+        Path::new("/"),
+        path.to_str().context("Checkpoint path is not UTF-8")?,
+    )?;
+    Ok(path.display().to_string())
+}
+
+fn file_mode(path: &Path) -> Result<Option<u32>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(Some(
+            fs::symlink_metadata(path)?.permissions().mode() & 0o777,
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+// Older macOS checkpoints may contain the standard root-owned aliases.
+// Only these fixed OS aliases are accepted; user-controlled parents are rejected.
+fn trusted_system_alias(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let target = match path.to_str() {
+            Some("/var") => "/private/var",
+            Some("/tmp") => "/private/tmp",
+            Some("/etc") => "/private/etc",
+            _ => return false,
+        };
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.uid() == 0)
+            && path
+                .canonicalize()
+                .is_ok_and(|resolved| resolved == Path::new(target))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn reject_unsafe_parents(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("Checkpoint paths must be absolute and normalized");
+    }
+    for parent in path.ancestors().skip(1) {
+        if fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.file_type().is_symlink())
+            && !trusted_system_alias(parent)
+        {
+            bail!(
+                "Refusing undo through a symbolic-link parent: {}",
+                parent.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn reject_unsafe_target(path: &Path) -> Result<()> {
+    reject_unsafe_parents(path)?;
     if path.as_os_str().is_empty() || path == Path::new("/") {
         bail!("Refusing to restore to an unsafe path: {}", path.display());
     }
@@ -394,6 +521,53 @@ fn reject_unsafe_target(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_undo_restores_executable_mode_and_rejects_corruption() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, config, store) = store_with_config();
+        let target = dir.path().join("script.sh");
+        fs::write(&target, "original").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let recorder = recorder(&store, &config);
+        recorder.overwrite(&store, &target).unwrap();
+        fs::write(&target, "changed").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        execute_undo(&store, &recorder.id).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::write(recorder.directory.join("0"), "corrupted").unwrap();
+        fs::write(&target, "keep current").unwrap();
+        assert!(execute_undo(&store, &recorder.id).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_rejects_a_parent_replaced_with_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let (dir, config, store) = store_with_config();
+        let parent = dir.path().join("original");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        let target = parent.join("file");
+        fs::write(&target, "original").unwrap();
+        fs::write(elsewhere.join("file"), "untouched").unwrap();
+        let recorder = recorder(&store, &config);
+        recorder.overwrite(&store, &target).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::remove_dir(&parent).unwrap();
+        symlink(&elsewhere, &parent).unwrap();
+        assert!(execute_undo(&store, &recorder.id).is_err());
+        assert_eq!(
+            fs::read_to_string(elsewhere.join("file")).unwrap(),
+            "untouched"
+        );
+    }
     use super::*;
     use crate::config::{Config, ConfigPathResolver};
 
@@ -564,7 +738,14 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert_eq!(
             remaining[0].paths,
-            vec![dir.path().join("f2.txt").display().to_string()]
+            vec![
+                dir.path()
+                    .join("f2.txt")
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string()
+            ]
         );
     }
 }

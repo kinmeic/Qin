@@ -2,6 +2,19 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.0
+
+- Added `qin tui`, a persistent terminal chat interface with a branded header, restored active-session messages, streaming replies, tool activity, approval dialogs, and terminal handoff for interactive shell commands.
+- Added multiline input with Ctrl+J and Shift+Enter where supported, bracketed paste, prompt history, conversation scrolling, cancellation, and `/new`, `/help`, and `/exit` commands.
+- Added approval mode, model name, context-window progress, and per-turn input/output token usage below the message input. Estimated usage is marked with `~`.
+- Added Shift+Tab approval switching through `always`, `on risk`, `auto`, and `YOLO`. Changes apply to the next turn and do not modify the configuration file. YOLO skips all tool approval confirmations, including high-risk actions; disabled tools and forbidden operations remain blocked, and sudo may still require a terminal password.
+- Fixed unintended high-risk approval bypasses through task-wide `All`, `--yes`, and `approval = "never"`; explicit TUI YOLO selection is the separate opt-in override.
+- Hardened stream completion validation and secret redaction, shell timeout and cancellation handling, tool audit persistence, and TUI shutdown, history, rendering, and buffer limits.
+- Fixed session storage locking and recovery, checkpoint integrity and permission restoration, file-operation undo coverage, special-file reads, knowledge ingestion limits, and numeric validation.
+- Hardened update redirects, archive extraction, rollback reads, and release packaging arguments.
+- Updated TUI dependencies to Ratatui 0.30.2 and Crossterm 0.29.0, removed vulnerable or unmaintained transitive dependencies, and raised the minimum Rust version to 1.88.
+- Documented the full code audit and its verification results in `docs/code-audit-2026-10-06.md`.
+
 ## 0.5.0
 
 - Removed the hard model-request iteration stop from live runs. qin now warns after 24 requests and continues; the default hard tool-call ceiling is 512 and the wall-time deadline is one hour. Existing `agent.max_iterations` settings remain accepted as the soft warning threshold.

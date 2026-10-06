@@ -2,7 +2,7 @@
 
 > Use natural language to operate Linux, macOS, and OpenWrt from the command line—without memorizing commands or flags.
 
-`qin` is a Rust-powered command-line AI agent that turns plain-language requests into safe, visible actions on your computer. Ask it to inspect files, reorganize directories, edit text, run commands, search the web, or use project knowledge; `qin` plans the work, shows each tool call and command, asks for approval when needed, and returns control to your shell when the task is complete.
+`qin` is a Rust-powered command-line AI agent that turns plain-language requests into safe, visible actions on your computer. Ask it to inspect files, reorganize directories, edit text, run commands, search the web, or use project knowledge; `qin` plans the work, shows each tool call and command, asks for approval when needed, and returns control to your shell when the task is complete. Use `qin tui` to keep a chat session open in the terminal.
 
 ```console
 $ qin "Move every file from ./incoming into the current directory"
@@ -18,7 +18,7 @@ Shells are powerful, but their commands and flags are easy to forget. `qin` lets
 - **Cross-platform CLI** — designed for Linux, macOS, and resource-constrained OpenWrt systems.
 - **Visible execution** — tool calls, commands, progress, stdout, stderr, exit codes, and timeouts are shown as they happen.
 - **Approval-aware safety** — writes and commands are risk-checked; highly destructive operations always require confirmation.
-- **Persistent sessions** — each invocation exits normally, while conversation history remains available for the next invocation.
+- **Persistent sessions** — one-shot invocations exit when a task finishes; `qin tui` keeps an interactive session open, and conversation history remains available between runs.
 - **Knowledge and memory** — document ingestion, embeddings, and cosine vector search provide project-specific context.
 - **Search fallback** — Exa is tried first, then Brave, followed by model-native search when supported.
 - **OpenAI-compatible models** — configure your own base URL, model, API key, context window, and compression thresholds.
@@ -28,7 +28,7 @@ Shells are powerful, but their commands and flags are easy to forget. `qin` lets
 
 ### Build from source
 
-Rust 1.85 or later is required.
+Rust 1.88 or later is required.
 
 ```bash
 cargo build --release
@@ -196,6 +196,16 @@ qin "Create an archive directory and move all .log files older than 30 days into
 
 Each ordinary invocation continues the active session, performs the requested work, persists the conversation, and exits.
 
+### Interactive terminal session
+
+Start the chat-style terminal interface with:
+
+```bash
+qin tui
+```
+
+Type a request and press Enter. The conversation, tool activity, and approval prompts stay in the TUI; shell commands that need terminal input temporarily take control of the terminal. The area below the input shows the approval mode to the left of the configured model, context-window usage, and input/output tokens for the current turn. Press Shift+Tab to cycle `always → on risk → auto → YOLO → always`. The initial mode follows `permissions.approval`; `--yes` starts in `auto`. `Always` asks even for read-only tools, `on risk` uses the configured risk rules, and `auto` approves ordinary operations while still asking for high-risk actions. `YOLO` skips all tool approval prompts, including high-risk actions, while tool restrictions, forbidden operations, and `--dry-run` still apply; sudo may still ask for a password at the terminal. Mode changes apply to the next submitted turn, last for this TUI session, and do not change the configuration file. If the selected mode differs from the running turn, the footer marks it `(next)`; switching does not answer a pending approval. Token counts use provider-reported usage when available and show `~` when estimated. Use Ctrl+J (or Shift+Enter where supported) to add a line, Ctrl+C to cancel the active turn, `/new` to start a session, `/help` for shortcuts, or `/exit` to return to the shell. The command requires an interactive terminal. Temporary JSON/Redis session stores are locked for the lifetime of the CLI or TUI process to prevent stale concurrent writes on the same host. Redis session storage is intended for one qin host; it does not provide distributed locking.
+
 ### Start a new session
 
 ```bash
@@ -286,7 +296,7 @@ The model can request local tools for directory listing, file inspection, readin
 
 ## Safety model
 
-`qin` reduces accidental damage through path validation, risk classification, approvals, command redaction, timeouts, and conservative defaults. With `permissions.approval = "on_risk"`, read-only tools and recognized read-only shell commands such as `date`, `pwd`, `find ... -print`, `systemctl status`, `journalctl`, and `ip ... show` run without an approval prompt. Creating a new file or directory and copying to an empty destination inside the current workspace also run without a prompt. Overwrites, moves, unknown or ambiguous shell commands, external-path access, destructive commands, and privilege elevation remain subject to approval. At a command prompt, entering `All` approves subsequent shell commands for that task only; it resets on the next invocation and does not bypass Forbidden rules. Commands resolved from untrusted `PATH` directories are not auto-approved. Broad recursive deletion, raw-device destruction, fork bombs, and kill-all operations are refused even after confirmation, `All`, or `--yes`. Use `--dry-run` to allow planning and read-only inspection without performing writes or commands.
+`qin` reduces accidental damage through path validation, risk classification, approvals, command redaction, timeouts, and conservative defaults. With `permissions.approval = "on_risk"`, read-only tools and recognized read-only shell commands such as `date`, `pwd`, `find ... -print`, `systemctl status`, `journalctl`, and `ip ... show` run without an approval prompt. Creating a new file or directory and copying to an empty destination inside the current workspace also run without a prompt. Overwrites, moves, unknown or ambiguous shell commands, external-path access, destructive commands, and privilege elevation remain subject to approval. At a command prompt, entering `All` approves subsequent ordinary shell commands for that task only; high-risk commands still require separate confirmation. Explicitly selecting `YOLO` in the TUI skips those tool approvals for subsequent turns, including high-risk confirmations; Forbidden rules and tool restrictions still apply. It resets on the next invocation and does not bypass Forbidden rules. Commands resolved from untrusted `PATH` directories are not auto-approved. Broad recursive deletion, raw-device destruction, fork bombs, and kill-all operations are refused even after confirmation, `All`, or `--yes`. Use `--dry-run` to allow planning and read-only inspection without performing writes or commands.
 
 These controls are guardrails, not a complete operating-system sandbox. Review displayed commands, use normal user privileges by default, protect your configuration and database, and keep backups of important data.
 

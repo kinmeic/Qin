@@ -11,6 +11,12 @@ architecture=$2
 version=$3
 output_dir=$4
 
+case "$version" in
+  ""|*[!A-Za-z0-9.+-]*|[!0-9]*)
+    echo "version must start with a digit and contain only version characters" >&2
+    exit 2 ;;
+esac
+
 test -f "$binary"
 case "$architecture" in
   aarch64_cortex-a53|x86_64) ;;

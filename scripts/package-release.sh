@@ -10,6 +10,12 @@ binary=$1
 asset_name=$2
 output_dir=$3
 
+case "$asset_name" in
+  ""|"."|".."|*[!A-Za-z0-9._-]*)
+    echo "asset name must be a single safe filename component" >&2
+    exit 2 ;;
+esac
+
 test -f "$binary"
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM

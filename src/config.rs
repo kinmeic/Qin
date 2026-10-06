@@ -591,6 +591,9 @@ impl Default for KnowledgeConfig {
 #[serde(default)]
 pub struct PermissionsConfig {
     pub approval: String,
+    /// Runtime-only TUI override; never enabled by a configuration file.
+    #[serde(skip)]
+    pub yolo: bool,
     pub workspace_write: bool,
     pub allow_shell: bool,
     pub elevation: String,
@@ -603,6 +606,7 @@ impl Default for PermissionsConfig {
     fn default() -> Self {
         Self {
             approval: "on_risk".to_string(),
+            yolo: false,
             workspace_write: true,
             allow_shell: true,
             elevation: "auto".to_string(),
@@ -907,12 +911,11 @@ impl Config {
             if !(100..=60_000).contains(&self.storage.redis.connect_timeout_ms) {
                 bail!("storage.redis.connect_timeout_ms must be between 100 and 60000");
             }
-            if let Some(name) = self.storage.redis.url_env.as_deref() {
-                if !is_env_var_name(name)
-                    || matches!(name, "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME")
-                {
-                    bail!("storage.redis.url_env is not a safe environment-variable name");
-                }
+            if let Some(name) = self.storage.redis.url_env.as_deref()
+                && (!is_env_var_name(name)
+                    || matches!(name, "PATH" | "HOME" | "SHELL" | "USER" | "LOGNAME"))
+            {
+                bail!("storage.redis.url_env is not a safe environment-variable name");
             }
             let redis_url = if self.storage.redis.url_env.is_some() {
                 if check_secret {
@@ -1001,10 +1004,10 @@ impl Config {
         {
             bail!("search.native uses the selected model's API key and cannot define its own");
         }
-        if let Some(name) = self.search.native.model.as_deref() {
-            if !self.models.contains_key(name) {
-                bail!("search.native.model={name} does not exist in [models]");
-            }
+        if let Some(name) = self.search.native.model.as_deref()
+            && !self.models.contains_key(name)
+        {
+            bail!("search.native.model={name} does not exist in [models]");
         }
         if self.search.native.enabled {
             let native_model = self
@@ -1312,13 +1315,13 @@ pub(crate) fn write_config_content(
     }
 
     if let Err(error) = persist_template(path, parent, content) {
-        if let Some(backup) = backup_path.as_ref() {
-            if let Err(restore_error) = fs::rename(backup, path) {
-                bail!(
-                    "{error:#}; restoring the original configuration also failed: {restore_error}. The backup remains at {}",
-                    backup.display()
-                );
-            }
+        if let Some(backup) = backup_path.as_ref()
+            && let Err(restore_error) = fs::rename(backup, path)
+        {
+            bail!(
+                "{error:#}; restoring the original configuration also failed: {restore_error}. The backup remains at {}",
+                backup.display()
+            );
         }
         return Err(error);
     }
@@ -1413,18 +1416,16 @@ pub fn load_with_warnings(resolver: &ConfigPathResolver) -> Result<LoadedConfig>
             );
         }
     }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
+    let file = crate::tools::open_read_no_follow(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            bail!("The opened configuration file is accessible to other users");
+        }
     }
     let mut bytes = Vec::new();
-    options
-        .open(path)
-        .with_context(|| format!("Unable to read configuration file {}", path.display()))?
-        .take(4 * 1024 * 1024 + 1)
+    file.take(4 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("Unable to read configuration file {}", path.display()))?;
     if bytes.len() > 4 * 1024 * 1024 {

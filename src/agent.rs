@@ -69,6 +69,7 @@ struct ChatRequest<'a> {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<ProviderUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,12 +164,27 @@ struct Choice {
     message: Message,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct ProviderUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+}
+
+impl ProviderUsage {
+    fn counts(self) -> Option<(u64, u64)> {
+        Some((self.prompt_tokens?, self.completion_tokens?))
+    }
+}
+
 pub struct RunOptions<'a> {
     pub source: &'a str,
     pub source_path: Option<&'a Path>,
     pub assume_yes: bool,
     pub dry_run: bool,
     pub agents_md: Option<&'a str>,
+    pub cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 enum ModelResponder<'a> {
@@ -186,10 +202,16 @@ impl ModelResponder<'_> {
         messages: &[Message],
         tools: &[Value],
         expected_hash: &str,
+        events: Option<&EventSink>,
     ) -> Result<Message> {
+        if let Some(events) = events {
+            let estimated_tokens =
+                estimate_messages(messages).saturating_add(estimate_schemas(tools));
+            events.context_progress(estimated_tokens, model.context_window)?;
+        }
         match self {
             Self::Live(client) => {
-                request_model(client, model, messages, tools, Some(expected_hash)).await
+                request_model(client, model, messages, tools, Some(expected_hash), events).await
             }
             Self::Replay {
                 responses,
@@ -208,6 +230,14 @@ impl ModelResponder<'_> {
                     responses.remove(0)
                 };
                 validate_assistant_message(&message)?;
+                if let Some(events) = events {
+                    events.model_usage(
+                        estimate_messages(messages).saturating_add(estimate_schemas(tools)),
+                        estimate_message(&message).saturating_sub(8),
+                        model.context_window,
+                        true,
+                    )?;
+                }
                 Ok(message)
             }
         }
@@ -265,6 +295,7 @@ pub async fn execute(
                 knowledge::recall_context(store, config, prompt),
             ) => result.unwrap_or_default(),
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
+            _ = crate::cancellation::wait(options.cancellation.clone()) => bail!("Agent canceled by the user"),
         };
         let runtime = runtime_context(options.source, options.source_path)?;
         let system = system_prompt(config, options.agents_md);
@@ -285,6 +316,7 @@ pub async fn execute(
                 ),
             ) => result.context("The agent reached its total runtime limit while compacting history")??,
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
+            _ = crate::cancellation::wait(options.cancellation.clone()) => bail!("Agent canceled by the user"),
         };
         let mut messages = compose_messages(
             &system,
@@ -330,13 +362,11 @@ pub async fn execute(
     if config.knowledge_active()
         && config.knowledge.auto_extract
         && turn_count % config.knowledge.auto_extract_every_turns.max(1) == 0
+        && let Ok(remaining) = remaining_time(config, started)
     {
-        if let Ok(remaining) = remaining_time(config, started) {
-            let _ = tokio::time::timeout(
-                remaining,
-                knowledge::auto_extract(store, config, prompt, &answer),
-            )
-            .await;
+        tokio::select! {
+            _ = tokio::time::timeout(remaining, knowledge::auto_extract(store, config, prompt, &answer)) => {},
+            _ = crate::cancellation::wait(options.cancellation.clone()) => {},
         }
     }
     Ok(answer)
@@ -408,6 +438,7 @@ pub async fn execute_replay(
             assume_yes,
             dry_run,
             agents_md: None,
+            cancellation: None,
         };
         let answer = run_loop(
             &replay_config,
@@ -491,6 +522,7 @@ async fn run_loop(
                 compact_in_memory(config, client, messages, schemas),
             ) => result.context("The agent reached its total runtime limit while compacting context")??,
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
+            _ = crate::cancellation::wait(options.cancellation.clone()) => bail!("Agent canceled by the user"),
         }
         ensure_within_hard_limit(config, messages, schemas)?;
         let remaining = remaining_time(config, started)?;
@@ -505,10 +537,11 @@ async fn run_loop(
         let outcome = tokio::select! {
             result = tokio::time::timeout(
                 remaining,
-                responder.request(model, messages, schemas, &request_hash),
+                responder.request(model, messages, schemas, &request_hash, Some(events)),
             ) => result
                 .context("The agent reached its total runtime limit")??,
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
+            _ = crate::cancellation::wait(options.cancellation.clone()) => bail!("Agent canceled by the user"),
         };
         let assistant = outcome;
         iteration = iteration.saturating_add(1);
@@ -597,12 +630,35 @@ async fn run_loop(
             });
         if parallel {
             execute_parallel_tools(
-                config, store, session_id, turn_id, events, cwd, &calls, messages, started,
+                config,
+                store,
+                session_id,
+                turn_id,
+                events,
+                cwd,
+                &calls,
+                messages,
+                started,
+                options.cancellation.clone(),
             )
             .await?;
             continue;
         }
         for (index, call) in calls.iter().enumerate() {
+            if options
+                .cancellation
+                .as_ref()
+                .is_some_and(|cancellation| *cancellation.borrow())
+            {
+                record_unexecuted_tool_calls(
+                    store,
+                    session_id,
+                    turn_id,
+                    &calls[index..],
+                    "the agent was canceled",
+                )?;
+                bail!("Agent canceled by the user");
+            }
             let remaining = match remaining_time(config, started) {
                 Ok(remaining) => remaining,
                 Err(error) => {
@@ -637,27 +693,41 @@ async fn run_loop(
                     assume_yes: options.assume_yes,
                     approve_all_commands: &mut approve_all_commands,
                     dry_run: options.dry_run,
+                    cancellation: options.cancellation.clone(),
                 };
-                match tokio::time::timeout(
-                    remaining,
-                    tools::execute(
-                        &call.id,
-                        &call.function.name,
-                        &call.function.arguments,
-                        &mut tool_ctx,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(result)) => (
+                let execution = tokio::select! {
+                    result = tokio::time::timeout(remaining, tools::execute(
+                        &call.id, &call.function.name, &call.function.arguments, &mut tool_ctx
+                    )) => Some(result),
+                    _ = crate::cancellation::wait(options.cancellation.clone()) => None,
+                    _ = tokio::signal::ctrl_c() => None,
+                };
+                match execution {
+                    None => {
+                        let error = "Tool execution failed: Agent canceled by the user";
+                        tools::audit_interrupted(
+                            &call.id,
+                            &call.function.name,
+                            &call.function.arguments,
+                            &mut tool_ctx,
+                            error,
+                            tool_started.elapsed().as_millis() as u64,
+                        )?;
+                        (error.into(), true, "canceled", None, None)
+                    }
+                    Some(Ok(Ok(result))) => (
                         result.content,
                         false,
                         "completed",
                         result.exit_code,
                         result.presentation,
                     ),
-                    Ok(Err(error)) => {
-                        let canceled = error.to_string() == "Command canceled by the user";
+                    Some(Ok(Err(error))) => {
+                        let canceled = error.to_string() == "Command canceled by the user"
+                            || options
+                                .cancellation
+                                .as_ref()
+                                .is_some_and(|cancellation| *cancellation.borrow());
                         (
                             format!("Tool execution failed: {error:#}"),
                             canceled,
@@ -666,7 +736,7 @@ async fn run_loop(
                             None,
                         )
                     }
-                    Err(_) => {
+                    Some(Err(_)) => {
                         let error =
                             "Tool execution failed: the agent reached its total runtime limit";
                         tools::audit_interrupted(
@@ -711,7 +781,10 @@ async fn run_loop(
                     &calls[index + 1..],
                     reason,
                 )?;
-                bail!("Agent canceled or timed out during tool execution");
+                if status == "interrupted" {
+                    bail!("Agent reached its total runtime limit during tool execution");
+                }
+                bail!("Agent canceled by the user");
             }
         }
     }
@@ -735,6 +808,7 @@ async fn execute_parallel_tools(
     calls: &[ToolCall],
     messages: &mut Vec<Message>,
     started: tokio::time::Instant,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     let remaining = match remaining_time(config, started) {
         Ok(remaining) => remaining,
@@ -817,6 +891,10 @@ async fn execute_parallel_tools(
                 }
             }
             _ = tokio::signal::ctrl_c() => {
+                canceled = true;
+                break;
+            }
+            _ = crate::cancellation::wait(cancellation.clone()) => {
                 canceled = true;
                 break;
             }
@@ -1017,6 +1095,7 @@ async fn request_model(
     messages: &[Message],
     tools: &[Value],
     expected_hash: Option<&str>,
+    events: Option<&EventSink>,
 ) -> Result<Message> {
     let api_key = model.resolve_api_key()?;
     let endpoint = chat_endpoint(&model.base_url);
@@ -1047,15 +1126,36 @@ async fn request_model(
             .await;
         match response {
             Ok(response) if response.status().is_success() => {
-                return if model.stream {
-                    parse_stream(response, model.max_output_tokens.saturating_mul(8) as usize).await
+                let (message, usage) = if model.stream {
+                    parse_stream(
+                        response,
+                        model.max_output_tokens.saturating_mul(8) as usize,
+                        events,
+                    )
+                    .await
                 } else {
                     parse_response(
                         response,
                         model.max_output_tokens.saturating_mul(16) as usize,
                     )
                     .await
-                };
+                }?;
+                if let Some(events) = events {
+                    let estimated_input =
+                        estimate_messages(messages).saturating_add(estimate_schemas(tools));
+                    let estimated_output = estimate_message(&message).saturating_sub(8);
+                    let (input_tokens, output_tokens, estimated) = usage
+                        .and_then(ProviderUsage::counts)
+                        .map(|(input, output)| (input, output, false))
+                        .unwrap_or((estimated_input, estimated_output, true));
+                    events.model_usage(
+                        input_tokens,
+                        output_tokens,
+                        model.context_window,
+                        estimated,
+                    )?;
+                }
+                return Ok(message);
             }
             Ok(response) => {
                 let status = response.status();
@@ -1099,10 +1199,14 @@ async fn request_model(
     )
 }
 
-async fn parse_response(response: reqwest::Response, max_bytes: usize) -> Result<Message> {
+async fn parse_response(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<(Message, Option<ProviderUsage>)> {
     let body_bytes = read_response_limited(response, max_bytes).await?;
     let body = serde_json::from_slice::<ChatResponse>(&body_bytes)
         .context("The model response was not valid JSON")?;
+    let usage = body.usage;
     let mut message = body
         .choices
         .into_iter()
@@ -1111,16 +1215,26 @@ async fn parse_response(response: reqwest::Response, max_bytes: usize) -> Result
         .context("The model response did not contain choices")?;
     message.role = "assistant".into();
     validate_assistant_message(&message)?;
-    Ok(message)
+    Ok((message, usage))
 }
 
-async fn parse_stream(response: reqwest::Response, max_chars: usize) -> Result<Message> {
+async fn parse_stream(
+    response: reqwest::Response,
+    max_chars: usize,
+    events: Option<&EventSink>,
+) -> Result<(Message, Option<ProviderUsage>)> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut content = String::new();
     let mut streamed_chars = 0_usize;
     let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
+    let mut usage = None;
+    let mut stream_text = StreamingText::default();
     let mut done = false;
+    let mut finished = false;
+    if let Some(events) = events {
+        events.assistant_stream_start()?;
+    }
     while !done {
         let next = tokio::time::timeout(Duration::from_secs(120), stream.next())
             .await
@@ -1128,10 +1242,10 @@ async fn parse_stream(response: reqwest::Response, max_chars: usize) -> Result<M
         let Some(chunk) = next else { break };
         let chunk = chunk?;
         buffer.extend_from_slice(&chunk);
-        if buffer.len() > max_chars.saturating_mul(4).max(65_536) {
-            bail!("The model stream contained an oversized event");
-        }
         while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
+            if pos > max_chars.saturating_mul(4).max(65_536) {
+                bail!("The model stream contained an oversized event");
+            }
             let line = std::str::from_utf8(&buffer[..pos])
                 .context("The model stream was not valid UTF-8")?
                 .trim()
@@ -1146,10 +1260,17 @@ async fn parse_stream(response: reqwest::Response, max_chars: usize) -> Result<M
                 &mut calls,
                 &mut streamed_chars,
                 max_chars,
+                &mut stream_text,
+                &mut usage,
+                &mut finished,
+                events,
             )? {
                 done = true;
                 break;
             }
+        }
+        if buffer.len() > max_chars.saturating_mul(4).max(65_536) {
+            bail!("The model stream contained an oversized event");
         }
     }
     if !done && !buffer.is_empty() {
@@ -1157,14 +1278,21 @@ async fn parse_stream(response: reqwest::Response, max_chars: usize) -> Result<M
             .context("The model stream was not valid UTF-8")?
             .trim();
         if let Some(data) = line.strip_prefix("data:").map(str::trim_start) {
-            let _ = apply_stream_data(
+            done = apply_stream_data(
                 data,
                 &mut content,
                 &mut calls,
                 &mut streamed_chars,
                 max_chars,
+                &mut stream_text,
+                &mut usage,
+                &mut finished,
+                events,
             )?;
         }
+    }
+    if !done && !finished {
+        bail!("The model stream ended before a completion marker; incomplete response discarded");
     }
     let message = Message {
         role: "assistant".into(),
@@ -1181,15 +1309,48 @@ async fn parse_stream(response: reqwest::Response, max_chars: usize) -> Result<M
         tool_call_id: None,
     };
     validate_assistant_message(&message)?;
-    Ok(message)
+    if let Some(events) = events {
+        stream_text.finish(events)?;
+        events.assistant_stream_complete()?;
+    }
+    Ok((message, usage))
 }
 
+#[derive(Default)]
+struct StreamingText {
+    redactor: crate::event::StreamRedactor,
+}
+
+impl StreamingText {
+    fn push(&mut self, text: &str, events: Option<&EventSink>) -> Result<()> {
+        if let Some(events) = events {
+            let ready = self.redactor.push(text);
+            if !ready.is_empty() {
+                events.assistant_delta(&ready)?;
+            }
+        }
+        Ok(())
+    }
+    fn finish(&mut self, events: &EventSink) -> Result<()> {
+        let ready = self.redactor.finish();
+        if !ready.is_empty() {
+            events.assistant_delta(&ready)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_stream_data(
     data: &str,
     content: &mut String,
     calls: &mut BTreeMap<usize, ToolCall>,
     streamed_chars: &mut usize,
     max_chars: usize,
+    stream_text: &mut StreamingText,
+    usage: &mut Option<ProviderUsage>,
+    finished: &mut bool,
+    events: Option<&EventSink>,
 ) -> Result<bool> {
     if data == "[DONE]" {
         return Ok(true);
@@ -1199,14 +1360,39 @@ fn apply_stream_data(
     }
     let value: Value =
         serde_json::from_str(data).context("The model stream contained invalid JSON")?;
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        bail!(
+            "The model stream reported an error: {}",
+            crate::event::redact(&error.to_string())
+        );
+    }
+    if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
+        if matches!(reason, "stop" | "tool_calls" | "function_call") {
+            *finished = true;
+        } else {
+            bail!("The model response was incomplete: finish_reason={reason}");
+        }
+    }
+    if let Some(provider_usage) = value.get("usage").filter(|usage| usage.is_object())
+        && let Ok(provider_usage) = serde_json::from_value::<ProviderUsage>(provider_usage.clone())
+    {
+        *usage = Some(provider_usage);
+    }
     let delta = &value["choices"][0]["delta"];
     if let Some(text) = delta["content"].as_str() {
         content.push_str(text);
         *streamed_chars = streamed_chars.saturating_add(text.chars().count());
+        stream_text.push(text, events)?;
     }
     if let Some(items) = delta["tool_calls"].as_array() {
         for item in items {
-            let index = item["index"].as_u64().unwrap_or(0) as usize;
+            let index = item["index"]
+                .as_u64()
+                .context("A streamed tool call is missing its index")?;
+            if index >= 1024 {
+                bail!("The model stream exceeded the tool-call index limit");
+            }
+            let index = usize::try_from(index)?;
             let entry = calls.entry(index).or_insert_with(|| ToolCall {
                 id: String::new(),
                 kind: "function".into(),
@@ -1402,7 +1588,7 @@ async fn generate_summary(
         ),
         Message::user(source),
     ];
-    request_model(client, model, &messages, &[], None)
+    request_model(client, model, &messages, &[], None, None)
         .await
         .ok()
         .and_then(|message| message.content)
@@ -1422,10 +1608,10 @@ fn summary_source(previous: &str, messages: &[Message], max_chars: usize) -> Str
         if let Some(content) = &message.content {
             source.push_str(content);
         }
-        if let Some(calls) = &message.tool_calls {
-            if let Ok(json) = serde_json::to_string(calls) {
-                source.push_str(&json);
-            }
+        if let Some(calls) = &message.tool_calls
+            && let Ok(json) = serde_json::to_string(calls)
+        {
+            source.push_str(&json);
         }
         source.push('\n');
         if source.chars().count() >= max_chars {
@@ -1443,15 +1629,19 @@ fn fallback_summary(source: &str, max_tokens: usize) -> String {
 }
 
 fn system_prompt(config: &Config, agents_md: Option<&str>) -> String {
-    let policy = match config.permissions.approval.as_str() {
-        "always" => {
-            "Approval policy: always. Even read-only tool calls may ask for approval; do not assume a conversational yes is executor authorization."
-        }
-        "never" => {
-            "Approval policy: never for ordinary-risk operations. The executor may allow non-high-risk actions without prompting; high-risk actions still require confirmation and are never bypassed. A rejection is final; do not work around it."
-        }
-        _ => {
-            "Approval policy: on_risk. Safe read-only operations and non-overwriting workspace creations may run without a prompt; overwrites, external paths, destructive actions, and ambiguous commands may require approval."
+    let policy = if config.permissions.yolo {
+        "Approval policy: YOLO. The user explicitly enabled automatic authorization for this turn, including high-risk actions. Tool restrictions and forbidden operations still apply; executor denials remain final. Privilege elevation may still require the user's password at the terminal."
+    } else {
+        match config.permissions.approval.as_str() {
+            "always" => {
+                "Approval policy: always. Even read-only tool calls may ask for approval; do not assume a conversational yes is executor authorization."
+            }
+            "never" => {
+                "Approval policy: never for ordinary-risk operations. The executor may allow non-high-risk actions without prompting; high-risk actions still require confirmation and are never bypassed. A rejection is final; do not work around it."
+            }
+            _ => {
+                "Approval policy: on_risk. Safe read-only operations and non-overwriting workspace creations may run without a prompt; overwrites, external paths, destructive actions, and ambiguous commands may require approval."
+            }
         }
     };
     let prompt = format!("{SYSTEM_PROMPT}\n\n{policy}");
@@ -1596,7 +1786,7 @@ fn truncate_tool_result(value: &str, max_tokens: usize) -> String {
         .collect();
     format!("{head}\n[Tool output truncated]\n{tail}")
 }
-fn chat_endpoint(base_url: &str) -> String {
+pub(crate) fn chat_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.into()
@@ -1865,6 +2055,190 @@ impl Message {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn canceling_network_tool_balances_results_and_skips_remaining_calls() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.contains("/v1/responses"));
+            cancel.send(true).unwrap();
+            let _ = stream.read(&mut [0_u8; 1]);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.knowledge.enabled = false;
+        config.search.order = vec!["native".into()];
+        config.search.native.enabled = true;
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                model: "test".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: Some("test".into()),
+                supports_native_search: true,
+                ..ModelConfig::default()
+            },
+        );
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), None).unwrap();
+        let user = Message {
+            role: "user".into(),
+            content: Some("search".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        store
+            .start_turn(
+                &session,
+                "audit-turn",
+                &to_stored(&user).unwrap(),
+                dir.path(),
+            )
+            .unwrap();
+        let mut messages = vec![user];
+        let mut responder = ModelResponder::Replay {
+            request_hashes: Vec::new(),
+            responses: vec![Message {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "network".into(),
+                        kind: "function".into(),
+                        function: FunctionCall {
+                            name: "web_search".into(),
+                            arguments: r#"{"query":"test"}"#.into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "later".into(),
+                        kind: "function".into(),
+                        function: FunctionCall {
+                            name: "write_file".into(),
+                            arguments: r#"{"path":"must-not-exist","content":"x"}"#.into(),
+                        },
+                    },
+                ]),
+            }],
+        };
+        let client = reqwest::Client::new();
+        let options = RunOptions {
+            source: "audit",
+            source_path: None,
+            assume_yes: true,
+            dry_run: false,
+            agents_md: None,
+            cancellation: Some(receiver),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_loop(
+                &config,
+                &client,
+                &mut responder,
+                &mut store,
+                &session,
+                &EventSink::new(true, false, false),
+                &options,
+                dir.path(),
+                &tools::definitions(&config),
+                &mut messages,
+                "audit-turn",
+                tokio::time::Instant::now(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("canceled by the user")
+        );
+        store
+            .finish_turn(&session, "audit-turn", "failed", None)
+            .unwrap();
+        store.validate_session(&session).unwrap();
+        let results = store
+            .load_messages(&session)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].tool_call_id.as_deref(), Some("later"));
+        assert!(!dir.path().join("must-not-exist").exists());
+        server.join().unwrap();
+    }
+
+    async fn parse_test_sse(body: &str) -> Result<(Message, Option<ProviderUsage>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let result = parse_stream(response, 4096, None).await;
+        server.join().unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn rejects_incomplete_model_stream_and_tool_calls() {
+        let content = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        assert!(
+            parse_test_sse(content)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("completion marker")
+        );
+        let tool = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        assert!(parse_test_sse(tool).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn accepts_finish_reason_without_done_but_rejects_errors_and_length() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n";
+        assert_eq!(
+            parse_test_sse(body).await.unwrap().0.content.as_deref(),
+            Some("hello")
+        );
+        assert!(
+            parse_test_sse("data: {\"error\":{\"message\":\"failed\"}}\n\n")
+                .await
+                .is_err()
+        );
+        assert!(
+            parse_test_sse(&body.replace("stop", "length"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_out_of_range_streamed_tool_indices() {
+        assert!(parse_test_sse("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":18446744073709551615}]}}]}\n\ndata: [DONE]\n\n").await.is_err());
+    }
     use super::*;
     use crate::config::{ConfigPathResolver, ModelConfig};
     use crate::event::EventSink;
@@ -1999,6 +2373,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
                 assume_yes: true,
                 dry_run: false,
                 agents_md: None,
+                cancellation: None,
             },
         )
         .await
@@ -2178,6 +2553,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
                 assume_yes: true,
                 dry_run: false,
                 agents_md: None,
+                cancellation: None,
             },
         )
         .await
@@ -2239,6 +2615,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
                 assume_yes: true,
                 dry_run: false,
                 agents_md: None,
+                cancellation: None,
             },
         )
         .await;
@@ -2340,6 +2717,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             &calls,
             &mut messages,
             started,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -2379,7 +2757,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             supports_native_search: false,
         };
         let client = http_client().unwrap();
-        let message = request_model(&client, &model, &[Message::user("hello")], &[], None)
+        let message = request_model(&client, &model, &[Message::user("hello")], &[], None, None)
             .await
             .unwrap();
         assert_eq!(message.content.as_deref(), Some("Hello"));

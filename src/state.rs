@@ -54,6 +54,7 @@ pub struct CheckpointEntryRow {
     pub existed_before: bool,
     pub snapshot_file: Option<String>,
     pub original_sha256: Option<String>,
+    pub original_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -428,6 +429,7 @@ enum Backend {
 struct MemoryState {
     session: Option<MemorySession>,
     persistence: MemoryPersistence,
+    _locks: Vec<SessionLock>,
 }
 
 enum MemoryPersistence {
@@ -530,18 +532,17 @@ fn load_memory_session(path: &Path) -> Result<Option<MemorySession>> {
             );
         }
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
+    let file = crate::tools::open_read_no_follow(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let opened = file.metadata()?;
+        if opened.uid() != effective_uid() || opened.permissions().mode() & 0o077 != 0 {
+            bail!("The opened session-state file is not private to the current user");
+        }
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    options
-        .open(path)
-        .with_context(|| format!("Unable to open session state {}", path.display()))?
-        .take(MAX_MEMORY_STATE_BYTES + 1)
+    file.take(MAX_MEMORY_STATE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_MEMORY_STATE_BYTES {
         bail!("Session state exceeds the 128 MiB size limit");
@@ -724,12 +725,12 @@ fn bound_event_data(mut data: Value, max_bytes: usize) -> Result<Value> {
     if serde_json::to_string(&data)?.len() <= max_bytes {
         return Ok(data);
     }
-    if let Some(message) = data.get_mut("message").and_then(Value::as_object_mut) {
-        if let Some(Value::String(content)) = message.get_mut("content") {
-            content.truncate(char_boundary(content, max_bytes / 2));
-            content.push_str("\n[content truncated in the event log]");
-            message.insert("event_content_truncated".into(), Value::Bool(true));
-        }
+    if let Some(message) = data.get_mut("message").and_then(Value::as_object_mut)
+        && let Some(Value::String(content)) = message.get_mut("content")
+    {
+        content.truncate(char_boundary(content, max_bytes / 2));
+        content.push_str("\n[content truncated in the event log]");
+        message.insert("event_content_truncated".into(), Value::Bool(true));
     }
     encode_event_data(&data, max_bytes)?;
     Ok(data)
@@ -883,6 +884,38 @@ fn tool_calls_from_message(message: &StoredMessage) -> Vec<RecoverableToolCall> 
         .collect()
 }
 
+fn redis_lock_identity(client: &redis::Client, key: &str) -> String {
+    let info = client.get_connection_info();
+    // Authentication changes must not produce a different lock for the same store.
+    format!(
+        "redis:{:?}:{}:{key}",
+        info.addr(),
+        info.redis_settings().db()
+    )
+}
+
+fn lock_memory_store(path: &Path) -> Result<SessionLock> {
+    let parent = path
+        .parent()
+        .context("The session state has no parent directory")?;
+    ensure_private_memory_directory(parent)?;
+    let canonical = parent
+        .canonicalize()?
+        .join(path.file_name().context("The state path has no filename")?);
+    lock_identity(&format!("memory:{}", canonical.display()))
+        .context("The temporary session store is in use by another qin process")
+}
+
+fn lock_identity(identity: &str) -> Result<SessionLock> {
+    let directory = std::env::temp_dir().join(format!("qin-locks-{}", effective_uid()));
+    ensure_private_lock_directory(&directory)?;
+    let path = directory.join(format!("{}.lock", &sha256(identity)[..40]));
+    let file = open_private_lock(&path)?;
+    file.try_lock_exclusive()
+        .context("The qin state lock is held by another process")?;
+    Ok(SessionLock { _file: Some(file) })
+}
+
 impl StateStore {
     pub fn open(config: &Config, resolver: &ConfigPathResolver) -> Result<Self> {
         if !config.persistence_enabled() {
@@ -909,11 +942,13 @@ impl StateStore {
     }
 
     fn open_file_memory(path: PathBuf) -> Result<Self> {
+        let lock = lock_memory_store(&path)?;
         let session = load_memory_session(&path)?;
         Ok(Self {
             backend: Backend::Memory(Box::new(MemoryState {
                 session,
                 persistence: MemoryPersistence::File(path.clone()),
+                _locks: vec![lock],
             })),
             path,
             database_owner_uid: None,
@@ -925,8 +960,11 @@ impl StateStore {
 
     fn open_redis(config: &Config) -> Result<Self> {
         let redis_config = &config.storage.redis;
+        let local_path = memory_state_path(config)?;
+        let local_lock = lock_memory_store(&local_path)?;
         let client = redis::Client::open(redis_config.resolve_url()?)
             .context("Unable to create the Redis client")?;
+        let remote_lock = lock_identity(&redis_lock_identity(&client, &redis_config.key()))?;
         let mut connection = client
             .get_connection_with_timeout(Duration::from_millis(redis_config.connect_timeout_ms))
             .context("Unable to connect to Redis")?;
@@ -942,7 +980,6 @@ impl StateStore {
             .context("Redis did not respond to PING")?;
         let key = redis_config.key();
         let remote_session = load_redis_session(&mut connection, &key)?;
-        let local_path = memory_state_path(config)?;
         let local_session = load_memory_session(&local_path)?;
         let (session, migrate_local) = select_redis_session(remote_session, local_session);
         if migrate_local {
@@ -959,12 +996,12 @@ impl StateStore {
         }
         match fs::remove_file(&local_path) {
             Ok(()) => {
-                if let Some(parent) = local_path.parent() {
-                    if let Err(error) = sync_state_directory(parent) {
-                        return Err(anyhow::Error::new(InvalidRedisState(format!(
-                            "The obsolete JSON fallback was removed, but its directory could not be synchronized: {error:#}"
-                        ))));
-                    }
+                if let Some(parent) = local_path.parent()
+                    && let Err(error) = sync_state_directory(parent)
+                {
+                    return Err(anyhow::Error::new(InvalidRedisState(format!(
+                        "The obsolete JSON fallback was removed, but its directory could not be synchronized: {error:#}"
+                    ))));
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -978,6 +1015,7 @@ impl StateStore {
         Ok(Self {
             backend: Backend::Memory(Box::new(MemoryState {
                 session,
+                _locks: vec![local_lock, remote_lock],
                 persistence: MemoryPersistence::Redis {
                     connection: RefCell::new(connection),
                     key: key.clone(),
@@ -1029,7 +1067,7 @@ impl StateStore {
         connection.pragma_update(
             None,
             "synchronous",
-            if config.storage.write_profile == "durable" {
+            if config.storage.write_profile.eq_ignore_ascii_case("durable") {
                 "FULL"
             } else {
                 "NORMAL"
@@ -1147,18 +1185,8 @@ impl StateStore {
     }
 
     pub fn lock_session(&self, session_id: &str) -> Result<SessionLock> {
-        let identity = sha256(&format!("{}\0{session_id}", self.path.display()));
-        let directory = std::env::temp_dir().join(format!("qin-locks-{}", effective_uid()));
-        ensure_private_lock_directory(&directory)?;
-        let path = directory.join(format!("{}.lock", &identity[..40]));
-        let file = open_private_lock(&path)?;
-        file.try_lock_exclusive().with_context(|| {
-            format!(
-                "Session {session_id} is in use by another qin process; lock file: {}",
-                path.display()
-            )
-        })?;
-        Ok(SessionLock { _file: Some(file) })
+        lock_identity(&format!("{}\0{session_id}", self.path.display()))
+            .with_context(|| format!("Session {session_id} is in use by another qin process"))
     }
 
     fn migrate(&mut self) -> Result<()> {
@@ -1303,6 +1331,15 @@ impl StateStore {
             transaction.execute("INSERT INTO schema_migrations(version) VALUES (4)", [])?;
             transaction.commit()?;
         }
+        if version < 5 {
+            let transaction = self.connection_mut().transaction()?;
+            transaction.execute(
+                "ALTER TABLE checkpoint_entries ADD COLUMN original_mode INTEGER",
+                [],
+            )?;
+            transaction.execute("INSERT INTO schema_migrations(version) VALUES (5)", [])?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -1321,10 +1358,10 @@ impl StateStore {
     }
 
     pub fn ensure_current_session(&mut self, cwd: &Path) -> Result<String> {
-        if let Some(id) = self.current_session()? {
-            if self.session_exists(&id)? {
-                return Ok(id);
-            }
+        if let Some(id) = self.current_session()?
+            && self.session_exists(&id)?
+        {
+            return Ok(id);
         }
         self.new_session(cwd, None)
     }
@@ -1337,8 +1374,13 @@ impl StateStore {
             let Backend::Memory(memory) = &mut self.backend else {
                 unreachable!()
             };
-            memory.session = Some(session);
-            self.save_memory_state()?;
+            let previous = memory.session.replace(session);
+            if let Err(error) = self.save_memory_state() {
+                if let Backend::Memory(memory) = &mut self.backend {
+                    memory.session = previous;
+                }
+                return Err(error);
+            }
             return Ok(id);
         }
         let id = Uuid::new_v4().to_string();
@@ -1444,7 +1486,7 @@ impl StateStore {
             return Ok(());
         }
         self.connection().execute(
-            "INSERT INTO checkpoint_entries(checkpoint_id,seq,path,kind,related_path,existed_before,snapshot_file,original_sha256) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO checkpoint_entries(checkpoint_id,seq,path,kind,related_path,existed_before,snapshot_file,original_sha256,original_mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 checkpoint_id,
                 entry.seq,
@@ -1453,7 +1495,8 @@ impl StateStore {
                 entry.related_path,
                 entry.existed_before as i64,
                 entry.snapshot_file,
-                entry.original_sha256
+                entry.original_sha256,
+                entry.original_mode
             ],
         )?;
         Ok(())
@@ -1461,7 +1504,7 @@ impl StateStore {
 
     pub fn checkpoint_entries(&self, checkpoint_id: &str) -> Result<Vec<CheckpointEntryRow>> {
         let mut statement = self.connection().prepare(
-            "SELECT seq,path,kind,related_path,existed_before,snapshot_file,original_sha256 FROM checkpoint_entries WHERE checkpoint_id=?1 ORDER BY seq",
+            "SELECT seq,path,kind,related_path,existed_before,snapshot_file,original_sha256,original_mode FROM checkpoint_entries WHERE checkpoint_id=?1 ORDER BY seq",
         )?;
         let rows = statement.query_map([checkpoint_id], |row| {
             Ok(CheckpointEntryRow {
@@ -1472,6 +1515,7 @@ impl StateStore {
                 existed_before: row.get::<_, i64>(4)? != 0,
                 snapshot_file: row.get(5)?,
                 original_sha256: row.get(6)?,
+                original_mode: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1522,11 +1566,14 @@ impl StateStore {
     }
 
     pub fn resolve_checkpoint_id(&self, id_or_prefix: &str) -> Result<String> {
-        let like = format!("{id_or_prefix}%");
-        let mut statement = self
-            .connection()
-            .prepare("SELECT id FROM checkpoints WHERE id LIKE ?1")?;
-        let ids = statement.query_map([like], |row| row.get::<_, String>(0))?;
+        let value = id_or_prefix.trim();
+        if value.is_empty() {
+            bail!("The checkpoint identifier cannot be empty");
+        }
+        let mut statement = self.connection().prepare(
+            "SELECT id FROM checkpoints WHERE substr(id,1,length(?1))=?1 ORDER BY id LIMIT 2",
+        )?;
+        let ids = statement.query_map([value], |row| row.get::<_, String>(0))?;
         let ids = ids.collect::<rusqlite::Result<Vec<_>>>()?;
         match ids.as_slice() {
             [] => bail!("Checkpoint does not exist: {id_or_prefix}"),
@@ -2611,13 +2658,13 @@ impl Drop for StateStore {
             return;
         }
         let audits = std::mem::take(&mut self.pending_audits);
-        if !audits.is_empty() {
-            if let Ok(transaction) = self.connection_mut().transaction() {
-                for audit in audits {
-                    let _ = transaction.execute("INSERT INTO tool_executions(session_id,tool_call_id,name,args_redacted_json,result_text,status,risk,exit_code,duration_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![audit.session_id,audit.call_id,audit.name,audit.args,audit.result,audit.status,audit.risk,audit.exit_code,audit.duration_ms as i64]);
-                }
-                let _ = transaction.commit();
+        if !audits.is_empty()
+            && let Ok(transaction) = self.connection_mut().transaction()
+        {
+            for audit in audits {
+                let _ = transaction.execute("INSERT INTO tool_executions(session_id,tool_call_id,name,args_redacted_json,result_text,status,risk,exit_code,duration_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![audit.session_id,audit.call_id,audit.name,audit.args,audit.result,audit.status,audit.risk,audit.exit_code,audit.duration_ms as i64]);
             }
+            let _ = transaction.commit();
         }
         let _ = self.secure_database_files();
     }
@@ -2690,9 +2737,24 @@ fn open_private_lock(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .mode(0o600);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("Lock path must be a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != effective_uid() {
+            return Err(std::io::Error::other("Lock file has an unexpected owner"));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 fn ensure_private_lock_directory(path: &Path) -> Result<()> {
@@ -2706,7 +2768,10 @@ fn ensure_private_lock_directory(path: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != effective_uid() {
+            bail!("The session-lock directory has an unexpected owner");
+        }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -2799,6 +2864,67 @@ fn decode_vector(blob: &[u8], encoding: &str, dimensions: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redis_lock_identity_does_not_depend_on_credentials() {
+        let first = redis::Client::open("redis://alice:one@127.0.0.1/0").unwrap();
+        let second = redis::Client::open("redis://bob:two@127.0.0.1/0").unwrap();
+        let other_db = redis::Client::open("redis://bob:two@127.0.0.1/1").unwrap();
+        assert_eq!(
+            redis_lock_identity(&first, "session"),
+            redis_lock_identity(&second, "session")
+        );
+        assert_ne!(
+            redis_lock_identity(&first, "session"),
+            redis_lock_identity(&other_db, "session")
+        );
+        assert!(!redis_lock_identity(&first, "session").contains("alice"));
+    }
+
+    #[test]
+    fn memory_store_is_locked_before_loading_and_released_on_drop() {
+        let (dir, mut first) = memory_store();
+        let path = dir.path().join(MEMORY_FILE_NAME);
+        assert!(StateStore::open_file_memory(path.clone()).is_err());
+        let session = first.new_session(dir.path(), None).unwrap();
+        first
+            .append_messages(&session, &[user_message("latest")], dir.path())
+            .unwrap();
+        drop(first);
+        let reopened = StateStore::open_file_memory(path).unwrap();
+        assert_eq!(
+            reopened.load_messages(&session).unwrap()[0]
+                .content
+                .as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn checkpoint_prefixes_treat_sql_wildcards_literally() {
+        let (_dir, store) = store();
+        store
+            .insert_checkpoint("abc-def", "s", "c", "write_file")
+            .unwrap();
+        assert_eq!(store.resolve_checkpoint_id("abc").unwrap(), "abc-def");
+        assert!(store.resolve_checkpoint_id("%").is_err());
+        assert!(store.resolve_checkpoint_id("").is_err());
+    }
+
+    #[test]
+    fn durable_storage_profile_is_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.storage.write_profile = "Durable".into();
+        let store = StateStore::open(&config, &resolver).unwrap();
+        let synchronous: i64 = store
+            .connection()
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2);
+    }
     use super::*;
     use crate::config::ConfigPathResolver;
 
