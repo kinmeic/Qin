@@ -2847,17 +2847,21 @@ fn decode_vector(blob: &[u8], encoding: &str, dimensions: usize) -> Vec<f32> {
         if blob.len() != dimensions.saturating_mul(2) {
             return Vec::new();
         }
-        blob.chunks_exact(2)
+        blob.as_chunks::<2>()
+            .0
+            .iter()
             .take(dimensions)
-            .map(|bytes| half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32())
+            .map(|bytes| half::f16::from_le_bytes(*bytes).to_f32())
             .collect()
     } else {
         if encoding != "f32" || blob.len() != dimensions.saturating_mul(4) {
             return Vec::new();
         }
-        blob.chunks_exact(4)
+        blob.as_chunks::<4>()
+            .0
+            .iter()
             .take(dimensions)
-            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect()
     }
 }
