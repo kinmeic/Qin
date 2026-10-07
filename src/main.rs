@@ -10,6 +10,7 @@ mod knowledge;
 mod markdown;
 mod prompt_file;
 mod state;
+mod system_stats;
 mod tools;
 mod tui;
 mod update;

@@ -2,6 +2,13 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.4
+
+- Reduced the input footer to two rows: approval mode, model name without a label, compact context and total turn usage, and status share one line; shortcuts occupy the last row. Long model names and statuses are shortened to fit.
+- Removed conversation and message borders and gave the input a light-gray background with dark text.
+- Added CPU utilization, memory utilization/capacity, and working-directory filesystem disk usage/capacity to the title bar, sampled off the UI thread on Linux/OpenWrt and macOS. Missing readings display `--`.
+- Added regression coverage for footer layout, long model names, title metrics, native sampling, CPU counter resets, Linux guest accounting, and legacy memory statistics.
+
 ## 0.6.3
 
 - Fixed TUI terminal handoff so interactive applications receive terminal stdout and stderr with their control sequences intact. Their output is displayed directly; ordinary commands remain captured in the conversation. Git global options such as `-C` and `-c` no longer hide commands that need a terminal.

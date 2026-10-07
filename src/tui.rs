@@ -14,12 +14,13 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tokio::sync::watch;
 use unicode_width::UnicodeWidthStr;
 
 use crate::event::{self as qin_event, EventSink, TuiEvent};
 use crate::state::{StateStore, StoredMessage};
+use crate::system_stats::{Sampler, SystemStats};
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 const MAX_ENTRY_BYTES: usize = 128 * 1024;
@@ -143,6 +144,7 @@ struct App {
     token_usage_estimated: bool,
     should_exit: bool,
     terminal_suspended: bool,
+    system_stats: SystemStats,
 }
 
 impl App {
@@ -207,6 +209,7 @@ impl App {
             output_token_usage: 0,
             token_usage_available: false,
             token_usage_estimated: false,
+            system_stats: SystemStats::default(),
             should_exit: false,
             terminal_suspended: false,
         };
@@ -945,7 +948,11 @@ fn event_loop(
     requests: &Sender<WorkerRequest>,
     events: &Receiver<TuiEvent>,
 ) -> Result<()> {
+    let stats = Sampler::start();
     while !app.should_exit {
+        if let Ok(snapshot) = stats.receiver.try_recv() {
+            app.system_stats = snapshot;
+        }
         // Bound each drain so a busy producer cannot starve keys or redraws.
         for _ in 0..128 {
             match events.try_recv() {
@@ -1001,64 +1008,73 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     let (input_lines, cursor_column) =
         input_layout(&app.input, area.width.saturating_sub(2).max(1));
-    let input_height = input_lines.len().clamp(3, 7) as u16 + 2;
+    let input_height = input_lines.len().clamp(3, 7) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Min(4),
             Constraint::Length(input_height),
             Constraint::Length(2),
-            Constraint::Length(1),
         ])
         .split(area);
 
-    let header = Line::from(vec![
-        Span::styled(
-            " qin ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+    let header_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let header_inner = header_block.inner(chunks[0]);
+    frame.render_widget(header_block, chunks[0]);
+    let stats = app.system_stats.label();
+    let header_columns = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(
+            stats
+                .width()
+                .min(usize::from(header_inner.width.saturating_sub(5))) as u16,
         ),
-        Span::styled(
-            format!("  {}  ", short_id(&app.session_id)),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::raw("Interactive agent"),
-    ]);
+    ])
+    .split(header_inner);
     frame.render_widget(
-        Paragraph::new(header).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        ),
-        chunks[0],
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " qin ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}  ", short_id(&app.session_id)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw("Interactive agent"),
+        ])),
+        header_columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(stats)
+            .style(Style::default().fg(Color::DarkGray))
+            .right_aligned(),
+        header_columns[1],
     );
 
-    let conversation_block = Block::default()
-        .title(" Conversation ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = conversation_block.inner(chunks[1]);
-    let lines = wrapped_lines(conversation_lines(&app.entries), inner.width.max(1));
-    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    let conversation = chunks[1];
+    let lines = wrapped_lines(conversation_lines(&app.entries), conversation.width.max(1));
+    let max_scroll = lines.len().saturating_sub(conversation.height as usize);
     let scroll = max_scroll.saturating_sub(app.scroll_from_bottom);
     let visible: Vec<_> = lines
         .into_iter()
         .skip(scroll)
-        .take(inner.height as usize)
+        .take(conversation.height as usize)
         .collect();
-    frame.render_widget(Paragraph::new(visible).block(conversation_block), chunks[1]);
+    frame.render_widget(Paragraph::new(visible), conversation);
 
+    let input_style = Style::default()
+        .bg(Color::Rgb(235, 235, 235))
+        .fg(Color::Black);
     let input_block = Block::default()
-        .title(if app.busy {
-            " Message · agent working "
-        } else {
-            " Message "
-        })
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .padding(Padding::horizontal(1))
+        .style(input_style);
     let input_inner = input_block.inner(chunks[2]);
     let input_scroll = input_lines
         .len()
@@ -1079,100 +1095,27 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                 .skip(input_scroll)
                 .collect::<Vec<_>>(),
         )
+        .style(input_style)
         .block(input_block),
         chunks[2],
     );
     if !app.terminal_suspended && input_inner.width > 0 && input_inner.height > 0 {
-        frame.set_cursor_position(Position::new(input_inner.x + cursor_column, cursor_y));
+        frame.set_cursor_position(Position::new(
+            input_inner.x + cursor_column.min(input_inner.width.saturating_sub(1)),
+            cursor_y,
+        ));
     }
 
-    let info_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(chunks[3]);
-    let next_turn = app
-        .active_approval_mode
-        .is_some_and(|mode| mode != app.approval_mode);
-    let approval_label = format!(
-        "Approval {}{} · ",
-        app.approval_mode.label(),
-        if next_turn { " (next)" } else { "" },
-    );
-    let info_columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length((approval_label.width() as u16).min(info_rows[0].width / 3)),
-            Constraint::Fill(1),
-            Constraint::Fill(1),
-        ])
-        .split(info_rows[0]);
+    let info_rows =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(chunks[3]);
     frame.render_widget(
-        Paragraph::new(approval_label).style(Style::default().fg(app.approval_mode.color())),
-        info_columns[0],
+        Paragraph::new(info_line(app, info_rows[0].width)),
+        info_rows[0],
     );
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Model ", Style::default().fg(Color::DarkGray)),
-            Span::styled(app.model_name.clone(), Style::default().fg(Color::Cyan)),
-        ])),
-        info_columns[1],
-    );
-    let token_usage = if app.token_usage_available {
-        let estimate_marker = if app.token_usage_estimated { "~" } else { "" };
-        format!(
-            "Tokens this turn: {estimate_marker}{} in · {estimate_marker}{} out",
-            format_token_count(app.input_token_usage),
-            format_token_count(app.output_token_usage)
-        )
-    } else {
-        "Tokens this turn: waiting".into()
-    };
-    frame.render_widget(
-        Paragraph::new(token_usage).style(Style::default().fg(Color::DarkGray)),
-        info_columns[2],
-    );
-
-    let context_ratio = app
-        .context_tokens
-        .map(|tokens| tokens as f64 / app.context_window.max(1) as f64)
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
-    let context_label = if let Some(tokens) = app.context_tokens {
-        let estimate_marker = if app.context_estimated { "~" } else { "" };
-        let percent = (context_ratio * 100.0).round() as u64;
-        format!(
-            "Context {estimate_marker}{} / {} tokens ({percent}%)",
-            format_token_count(tokens),
-            format_token_count(app.context_window)
-        )
-    } else {
-        format!(
-            "Context waiting · window {} tokens",
-            format_token_count(app.context_window)
-        )
-    };
-    frame.render_widget(
-        Gauge::default()
-            .ratio(context_ratio)
-            .label(context_label)
-            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray)),
+        Paragraph::new("Shift+Tab approval · Enter send · Ctrl+J newline · ↑↓ history · PgUp/PgDn scroll · /help")
+            .style(Style::default().fg(Color::DarkGray)),
         info_rows[1],
-    );
-
-    let status_style = if app.busy {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::Green)
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {} ", app.status), status_style),
-            Span::styled(
-                "Shift+Tab approval · Enter send · Ctrl+J newline · ↑↓ history · PgUp/PgDn scroll · /help",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        chunks[4],
     );
 
     if let Some(approval) = &app.pending_approval {
@@ -1417,11 +1360,93 @@ fn short_id(value: &str) -> &str {
 fn format_token_count(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}M", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}K", value as f64 / 1_000.0)
+    } else if value == 0 {
+        "0K".into()
     } else {
-        value.to_string()
+        format!("{:.1}K", value as f64 / 1_000.0)
     }
+}
+
+fn info_line(app: &App, width: u16) -> Line<'static> {
+    let next_turn = app
+        .active_approval_mode
+        .is_some_and(|mode| mode != app.approval_mode);
+    let approval = format!(
+        "{}{}",
+        app.approval_mode.label(),
+        if next_turn { " (next)" } else { "" }
+    );
+    let context = app.context_tokens.map_or_else(
+        || "CTX:-- / --%".into(),
+        |tokens| {
+            let percent =
+                (tokens as f64 / app.context_window.max(1) as f64 * 100.0).clamp(0.0, 100.0);
+            format!(
+                "CTX:{}{} / {percent:.0}%",
+                if app.context_estimated { "~" } else { "" },
+                format_token_count(tokens)
+            )
+        },
+    );
+    let usage = if app.token_usage_available {
+        format!(
+            "USAGE:{}{}",
+            if app.token_usage_estimated { "~" } else { "" },
+            format_token_count(app.input_token_usage.saturating_add(app.output_token_usage))
+        )
+    } else {
+        "USAGE:--".into()
+    };
+    // Keep metrics on one row; long model names and status messages share the
+    // remaining space rather than pushing usage or status to another row.
+    let fixed = approval.width() + context.width() + usage.width() + 4 * " · ".width();
+    let available = usize::from(width).saturating_sub(fixed);
+    let model_name = app.model_name.replace(['\n', '\r', '\t'], " ");
+    let status_text = app.status.replace(['\n', '\r', '\t'], " ");
+    let status_width = status_text.width().min(available / 3);
+    let model = ellipsize(&model_name, available.saturating_sub(status_width));
+    let status = ellipsize(&status_text, available.saturating_sub(model.width()));
+    let divider = || Span::styled(" · ", Style::default().fg(Color::DarkGray));
+    Line::from(vec![
+        Span::styled(approval, Style::default().fg(app.approval_mode.color())),
+        divider(),
+        Span::styled(model, Style::default().fg(Color::Cyan)),
+        divider(),
+        Span::styled(context, Style::default().fg(Color::DarkGray)),
+        divider(),
+        Span::styled(usage, Style::default().fg(Color::DarkGray)),
+        divider(),
+        Span::styled(
+            status,
+            Style::default().fg(if app.busy {
+                Color::Yellow
+            } else {
+                Color::Green
+            }),
+        ),
+    ])
+}
+
+fn ellipsize(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let line = Line::raw(text);
+    let mut result = String::new();
+    let mut occupied = 0;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let next = occupied + grapheme.symbol.width();
+        if next >= width {
+            break;
+        }
+        occupied = next;
+        result.push_str(grapheme.symbol);
+    }
+    result.push('…');
+    result
 }
 
 fn remove_previous_word(input: &mut String) {
@@ -1579,8 +1604,12 @@ mod tests {
         });
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(3, 25)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let text: String = (4..16)
-            .map(|row| terminal.backend().buffer()[(1, row)].symbol())
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("END"), "{text}");
         for _ in 0..30 {
@@ -1697,10 +1726,90 @@ mod tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect();
-                assert!(text.contains("Model test"));
-                assert!(text.contains("Context"));
-                assert!(text.contains("Tokens this turn"));
+                assert!(!text.contains("Model test"));
+                assert!(!text.contains("Conversation"));
+                assert!(!text.contains("Message"));
+                let row = |y| -> String {
+                    (0..width)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect()
+                };
+                let info = row(height - 2);
+                assert!(
+                    info.contains("on risk · test · CTX:~2.0K / 12% · USAGE:-- · Ready"),
+                    "{info}"
+                );
+                let shortcuts = row(height - 1);
+                assert!(shortcuts.contains("Shift+Tab"));
+                assert!(!shortcuts.contains("Ready"));
+                // Wide-character continuation cells are reset by Ratatui; check
+                // full empty rows plus the leading Chinese glyph and padding.
+                assert_eq!(
+                    terminal.backend().buffer()[(1, height - 5)].bg,
+                    Color::Rgb(235, 235, 235)
+                );
+                assert_eq!(
+                    terminal.backend().buffer()[(0, height - 5)].bg,
+                    Color::Rgb(235, 235, 235)
+                );
+                for y in height - 4..height - 2 {
+                    for x in 0..width {
+                        assert_eq!(
+                            terminal.backend().buffer()[(x, y)].bg,
+                            Color::Rgb(235, 235, 235)
+                        );
+                    }
+                }
+                assert!(!text.contains('│'));
+                assert!(!text.contains('┌'));
             }
         }
+    }
+
+    #[test]
+    fn long_models_keep_context_usage_and_status_on_one_row() {
+        let mut app = app();
+        app.model_name = "超长模型名称-very-long-model\nwith-many-parameters".into();
+        app.context_tokens = Some(8_192);
+        app.context_estimated = false;
+        app.token_usage_available = true;
+        app.input_token_usage = 1000;
+        app.output_token_usage = 500;
+        let line = info_line(&app, 80);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.width() <= 80, "{text}");
+        assert!(
+            text.contains("CTX:8.2K / 50% · USAGE:1.5K · Ready"),
+            "{text}"
+        );
+        assert!(text.contains('…'));
+        assert!(!text.contains('\n'));
+    }
+
+    #[test]
+    fn machine_statistics_are_right_aligned_in_the_title_row() {
+        use crate::system_stats::SpaceUsage;
+        let mut app = app();
+        app.system_stats = SystemStats {
+            cpu_percent: Some(100.0),
+            memory: Some(SpaceUsage {
+                used: 1_500_000_000,
+                total: 2_000_000_000,
+            }),
+            disk: Some(SpaceUsage {
+                used: 20_000_000_000,
+                total: 40_000_000_000,
+            }),
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let row: String = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(row.starts_with(" qin "));
+        assert!(
+            row.ends_with("CPU:100% MEM:75% / 2.0GB DISK:20.0GB / 40.0GB"),
+            "{row}"
+        );
     }
 }
