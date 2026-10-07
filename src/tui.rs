@@ -169,7 +169,9 @@ impl App {
                     if let Some(content) = message.content.filter(|content| !content.is_empty()) {
                         entries.push(Entry {
                             kind: EntryKind::Assistant,
-                            text: qin_event::sanitize_terminal(&qin_event::redact(&content)),
+                            text: align_markdown_tables(&qin_event::sanitize_terminal(
+                                &qin_event::redact(&content),
+                            )),
                         });
                     }
                 }
@@ -556,7 +558,9 @@ impl App {
         let message = event.message;
         match event.event.as_str() {
             "final_answer" => {
-                if self.last_streamed_answer.as_deref() != Some(message.as_str()) {
+                let mut displayed_answer = message.clone();
+                truncate_display(&mut displayed_answer);
+                if self.last_streamed_answer.as_deref() != Some(displayed_answer.as_str()) {
                     self.push_entry(Entry {
                         kind: EntryKind::Assistant,
                         text: align_markdown_tables(&message),
@@ -684,6 +688,8 @@ impl App {
                 }
             }
             "turn_finished" => {
+                self.pending_approval = None;
+                self.resume_terminal(screen)?;
                 self.streaming_index = None;
                 self.active_command_output = None;
                 self.busy = false;
@@ -841,7 +847,7 @@ fn start_worker(
     agents_md: Option<String>,
     cwd: std::path::PathBuf,
     events: EventSink,
-    event_sender: Sender<TuiEvent>,
+    event_sender: mpsc::SyncSender<TuiEvent>,
     requests: Receiver<WorkerRequest>,
     dry_run: bool,
 ) -> Result<thread::JoinHandle<()>> {
@@ -918,7 +924,7 @@ fn start_worker(
 }
 
 fn send_ui_event(
-    sender: &Sender<TuiEvent>,
+    sender: &mpsc::SyncSender<TuiEvent>,
     event: &str,
     message: &str,
     data: Option<serde_json::Value>,
@@ -940,7 +946,8 @@ fn event_loop(
     events: &Receiver<TuiEvent>,
 ) -> Result<()> {
     while !app.should_exit {
-        loop {
+        // Bound each drain so a busy producer cannot starve keys or redraws.
+        for _ in 0..128 {
             match events.try_recv() {
                 Ok(event) => {
                     let was_active = screen.active;
@@ -1495,6 +1502,74 @@ impl Drop for ScreenGuard {
 
 #[cfg(test)]
 mod tests {
+    fn ui_event(name: &str, message: &str) -> TuiEvent {
+        TuiEvent {
+            event: name.into(),
+            message: message.into(),
+            data: None,
+            approval_reply: None,
+            terminal_ack: None,
+        }
+    }
+
+    #[test]
+    fn completed_turn_dismisses_stale_approval() {
+        let mut app = app();
+        let mut screen = ScreenGuard { active: false };
+        let (reply, _receiver) = mpsc::sync_channel(1);
+        app.pending_approval = Some(PendingApproval {
+            message: "Allow?".into(),
+            allow_all: false,
+            reply,
+        });
+        app.busy = true;
+        app.handle_event(ui_event("turn_finished", "runtime limit"), &mut screen)
+            .unwrap();
+        assert!(app.pending_approval.is_none());
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn streamed_large_answers_are_not_duplicated_at_completion() {
+        let mut app = app();
+        let mut screen = ScreenGuard { active: false };
+        let answer = "a".repeat(MAX_ENTRY_BYTES + 100);
+        for event in [
+            ui_event("assistant_stream_start", ""),
+            ui_event("assistant_delta", &answer),
+            ui_event("assistant_stream_complete", ""),
+            ui_event("final_answer", &answer),
+        ] {
+            app.handle_event(event, &mut screen).unwrap();
+        }
+        assert_eq!(app.entries.len(), 1);
+        assert!(app.entries[0].text.ends_with(DISPLAY_TRUNCATED));
+    }
+
+    #[test]
+    fn restored_answers_and_chunked_command_output_keep_alignment() {
+        let table = "| 名称 | 数量 |\n| --- | --- |\n| 中文 | 2 |";
+        let restored = App::new(
+            "session".into(),
+            "sqlite".into(),
+            "test".into(),
+            4096,
+            vec![StoredMessage {
+                role: "assistant".into(),
+                content: Some(table.into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ApprovalMode::OnRisk,
+        );
+        assert_eq!(restored.entries[0].text, align_markdown_tables(table));
+        let mut app = app();
+        let data = serde_json::json!({"tool_call_id":"command"});
+        app.append_command_output("a  ", Some(&data));
+        app.push_activity("heartbeat");
+        app.append_command_output("b\n中\t2\n", Some(&data));
+        assert_eq!(app.entries[0].text, "a  b\n中\t2\n");
+    }
     #[test]
     fn long_transcripts_render_the_latest_text_beyond_u16_scroll_limits() {
         let mut app = app();

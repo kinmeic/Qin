@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use std::cell::Cell;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 
 use crate::config::{ConfigPathResolver, InitOutcome, UiConfig};
 use crate::prompt_file::LoadedPrompt;
@@ -31,7 +31,7 @@ pub struct EventSink {
     terminal_handed_off: Cell<bool>,
     /// Structured events are routed to the interactive renderer instead of
     /// stdout/stderr when qin is running in TUI mode.
-    tui_events: Option<Sender<TuiEvent>>,
+    tui_events: Option<SyncSender<TuiEvent>>,
 }
 
 pub struct TuiEvent {
@@ -77,13 +77,13 @@ impl EventSink {
     }
 
     pub fn new_tui(quiet: bool, verbose: bool) -> (Self, Receiver<TuiEvent>) {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(128);
         let mut sink = Self::new(quiet, false, verbose);
         sink.tui_events = Some(sender);
         (sink, receiver)
     }
 
-    pub fn tui_sender(&self) -> Option<Sender<TuiEvent>> {
+    pub fn tui_sender(&self) -> Option<SyncSender<TuiEvent>> {
         self.tui_events.clone()
     }
 
@@ -340,6 +340,16 @@ impl EventSink {
         message: &str,
         data: Option<Value>,
     ) -> Result<Option<String>> {
+        self.approval_prompt_with_control(message, data, None, None)
+    }
+
+    pub fn approval_prompt_with_control(
+        &self,
+        message: &str,
+        data: Option<Value>,
+        cancellation: Option<&tokio::sync::watch::Receiver<bool>>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<String>> {
         let message = format!("? {message}");
         if self.tui_events.is_some() {
             let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
@@ -350,11 +360,38 @@ impl EventSink {
                 Some(reply_sender),
                 false,
             )?;
-            return Ok(Some(
-                reply_receiver
-                    .recv()
-                    .map_err(|_| anyhow::anyhow!("The TUI closed during approval"))?,
-            ));
+            loop {
+                if cancellation
+                    .is_some_and(|receiver| *receiver.borrow() || receiver.has_changed().is_err())
+                {
+                    anyhow::bail!("Agent canceled by the user");
+                }
+                if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                    anyhow::bail!("The agent reached its total runtime limit during approval");
+                }
+                match reply_receiver.recv_timeout(std::time::Duration::from_millis(40)) {
+                    Ok(answer) => {
+                        // Recheck after receiving: a late approval cannot authorize
+                        // execution after cancellation or the turn deadline.
+                        if cancellation.is_some_and(|receiver| {
+                            *receiver.borrow() || receiver.has_changed().is_err()
+                        }) {
+                            anyhow::bail!("Agent canceled by the user");
+                        }
+                        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            anyhow::bail!(
+                                "The agent reached its total runtime limit during approval"
+                            );
+                        }
+                        return Ok(Some(answer));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        anyhow::bail!("The TUI closed during approval")
+                    }
+                }
+            }
         }
         if !self.approval_inline {
             self.stderr_with_data("approval_required", &message, data)?;
@@ -812,12 +849,19 @@ fn secret_ranges(value: &str) -> Vec<(usize, usize, usize, bool)> {
             if let Some(quote) = quote {
                 start += quote.len_utf8();
             }
-            let end = value[start..]
+            // A placeholder is safe only when it is the entire value. Scan past
+            // its closing bracket so an appended secret is masked as well.
+            let scan_start = if value[start..].starts_with("[REDACTED]") {
+                start + "[REDACTED]".len()
+            } else {
+                start
+            };
+            let end = value[scan_start..]
                 .char_indices()
                 .find(|(index, c)| match quote {
                     Some(quote) => {
                         *c == quote
-                            && value[start..start + index]
+                            && value[start..scan_start + index]
                                 .bytes()
                                 .rev()
                                 .take_while(|byte| *byte == b'\\')
@@ -827,7 +871,7 @@ fn secret_ranges(value: &str) -> Vec<(usize, usize, usize, bool)> {
                     }
                     None => c.is_whitespace() || matches!(c, '&' | '\'' | '"' | ',' | '}' | ']'),
                 })
-                .map_or(value.len(), |(index, _)| start + index);
+                .map_or(value.len(), |(index, _)| scan_start + index);
             let incomplete = end == value.len();
             if marker == "sk-" && end - start < 20 && !incomplete {
                 continue;
@@ -844,7 +888,7 @@ pub fn redact(value: &str) -> String {
         .filter(|(found, start, end, _)| {
             start < end
                 && !(value[*found..].to_ascii_lowercase().starts_with("sk-") && end - start < 20)
-                && !value[*start..].starts_with("[REDACTED]")
+                && &value[*start..*end] != "[REDACTED]"
         })
         .map(|(_, start, end, _)| (start, end))
         .collect();
@@ -960,6 +1004,110 @@ mod tests {
             }
             output.push_str(&redactor.finish());
             assert_eq!(output, redact(input));
+        }
+    }
+
+    #[test]
+    fn placeholders_do_not_exempt_appended_secrets_and_redaction_is_idempotent() {
+        for input in [
+            "password=[REDACTED]secret end",
+            "token=\"[REDACTED]secret value\" end",
+            r#"{"api_key":"[REDACTED]secret"}"#,
+        ] {
+            let masked = redact(input);
+            assert!(!masked.contains("secret"), "{masked}");
+            assert_eq!(redact(&masked), masked);
+            for boundary in input.char_indices().map(|(i, _)| i).chain([input.len()]) {
+                let mut redactor = StreamRedactor::default();
+                let mut output = redactor.push(&input[..boundary]);
+                output.push_str(&redactor.push(&input[boundary..]));
+                output.push_str(&redactor.finish());
+                assert_eq!(output, masked, "boundary={boundary}");
+            }
+        }
+        for input in [
+            "password=[REDACTED]",
+            "token=[REDACTED]&ok=1",
+            r#"{"token":"[REDACTED]"}"#,
+        ] {
+            assert_eq!(redact(input), input);
+        }
+    }
+
+    #[test]
+    fn tui_event_queue_applies_backpressure() {
+        let (sink, receiver) = EventSink::new_tui(true, false);
+        let sender = sink.tui_sender().unwrap();
+        for _ in 0..128 {
+            sender
+                .try_send(TuiEvent {
+                    event: "test".into(),
+                    message: String::new(),
+                    data: None,
+                    approval_reply: None,
+                    terminal_ack: None,
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(TuiEvent {
+                event: "test".into(),
+                message: String::new(),
+                data: None,
+                approval_reply: None,
+                terminal_ack: None
+            }),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        receiver.recv().unwrap();
+        assert!(
+            sender
+                .try_send(TuiEvent {
+                    event: "test".into(),
+                    message: String::new(),
+                    data: None,
+                    approval_reply: None,
+                    terminal_ack: None
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn approval_wait_observes_cancel_and_deadline_without_a_ui_reply() {
+        for canceled in [false, true] {
+            let (sink, receiver) = EventSink::new_tui(true, false);
+            let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+            let (done, completion) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = sink.approval_prompt_with_control(
+                    "Allow?",
+                    None,
+                    Some(&cancel_receiver),
+                    Some(tokio::time::Instant::now() + std::time::Duration::from_millis(120)),
+                );
+                done.send(result.unwrap_err().to_string()).unwrap();
+            });
+            let event = receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            // Keep the reply channel open without answering it.
+            assert!(event.approval_reply.is_some());
+            if canceled {
+                cancel_sender.send(true).unwrap();
+            }
+            let error = completion
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                error.contains(if canceled {
+                    "canceled"
+                } else {
+                    "runtime limit"
+                }),
+                "{error}"
+            );
+            worker.join().unwrap();
         }
     }
 

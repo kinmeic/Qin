@@ -166,6 +166,33 @@ fn render_table(lines: &[&str], start: usize, output: &mut String, color: bool) 
             widths[column] = widths[column].max(UnicodeWidthStr::width(plain.as_str()));
         }
     }
+    // Alignment can multiply a sparse table's size by its largest cell width.
+    // Fall back to the original rows before allocating excessive padding.
+    let source_bytes = lines[start..index].iter().fold(0_usize, |total, line| {
+        total.saturating_add(line.len().saturating_add(1))
+    });
+    let row_width = widths
+        .iter()
+        .fold(0_usize, |total, width| total.saturating_add(*width))
+        .saturating_add(columns.saturating_sub(1).saturating_mul(2));
+    let padded_bytes = rendered_rows
+        .iter()
+        .fold(row_width.saturating_mul(3), |total, row| {
+            let cell_bytes = row
+                .iter()
+                .fold(0_usize, |sum, (_, styled)| sum.saturating_add(styled.len()));
+            total
+                .saturating_add(cell_bytes)
+                .saturating_add(row_width)
+                .saturating_add(32)
+        });
+    if padded_bytes > source_bytes.saturating_mul(4).saturating_add(4096) {
+        for line in &lines[start..index] {
+            output.push_str(line);
+            output.push('\n');
+        }
+        return index;
+    }
     for (row_index, row) in rendered_rows.iter().enumerate() {
         let mut rendered = String::new();
         for (column, width) in widths.iter().enumerate() {
@@ -257,6 +284,16 @@ fn replace_pairs(text: &str, mark: &str, code: &str, color: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_wide_tables_do_not_amplify_output_without_bound() {
+        let text = format!(
+            "| {} | b |\n| --- | --- |\n{}",
+            "x".repeat(4000),
+            "| a | b |\n".repeat(100)
+        );
+        assert_eq!(align_tables(&text), text);
+        assert_eq!(render_for_terminal(&text, false), text);
+    }
     use super::*;
 
     #[test]

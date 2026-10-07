@@ -162,6 +162,7 @@ pub fn load_replay_fixture(path: &Path) -> Result<ReplayFixture> {
 #[derive(Deserialize)]
 struct Choice {
     message: Message,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -694,6 +695,7 @@ async fn run_loop(
                     approve_all_commands: &mut approve_all_commands,
                     dry_run: options.dry_run,
                     cancellation: options.cancellation.clone(),
+                    deadline: Some(started + Duration::from_secs(config.agent.wall_time_seconds)),
                 };
                 let execution = tokio::select! {
                     result = tokio::time::timeout(remaining, tools::execute(
@@ -1207,12 +1209,15 @@ async fn parse_response(
     let body = serde_json::from_slice::<ChatResponse>(&body_bytes)
         .context("The model response was not valid JSON")?;
     let usage = body.usage;
-    let mut message = body
+    let choice = body
         .choices
         .into_iter()
         .next()
-        .map(|choice| choice.message)
         .context("The model response did not contain choices")?;
+    if let Some(reason) = choice.finish_reason.as_deref() {
+        validate_finish_reason(reason)?;
+    }
+    let mut message = choice.message;
     message.role = "assistant".into();
     validate_assistant_message(&message)?;
     Ok((message, usage))
@@ -1367,11 +1372,8 @@ fn apply_stream_data(
         );
     }
     if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
-        if matches!(reason, "stop" | "tool_calls" | "function_call") {
-            *finished = true;
-        } else {
-            bail!("The model response was incomplete: finish_reason={reason}");
-        }
+        validate_finish_reason(reason)?;
+        *finished = true;
     }
     if let Some(provider_usage) = value.get("usage").filter(|usage| usage.is_object())
         && let Ok(provider_usage) = serde_json::from_value::<ProviderUsage>(provider_usage.clone())
@@ -1446,6 +1448,13 @@ fn http_client() -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(600))
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
+}
+
+fn validate_finish_reason(reason: &str) -> Result<()> {
+    if !matches!(reason, "stop" | "tool_calls" | "function_call") {
+        bail!("The model response was incomplete: finish_reason={reason}");
+    }
+    Ok(())
 }
 
 fn validate_assistant_message(message: &Message) -> Result<()> {
@@ -2200,6 +2209,47 @@ mod tests {
         let result = parse_stream(response, 4096, None).await;
         server.join().unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn nonstreaming_responses_reject_truncation_even_with_valid_tool_arguments() {
+        for reason in [
+            Some("length"),
+            Some("content_filter"),
+            Some("unknown"),
+            Some("tool_calls"),
+            None,
+        ] {
+            let body = serde_json::json!({"choices":[{"finish_reason": reason, "message": {
+                "role":"assistant", "content":null, "tool_calls":[{"id":"call", "type":"function",
+                "function":{"name":"write_file", "arguments":r#"{"path":"file","content":"partial"}"#}}]
+            }}]}).to_string();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            });
+            let response = reqwest::Client::new()
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap();
+            let result = parse_response(response, 4096).await;
+            server.join().unwrap();
+            if matches!(reason, None | Some("tool_calls")) {
+                assert_eq!(result.unwrap().0.tool_calls.unwrap().len(), 1);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("incomplete"));
+            }
+        }
     }
 
     #[tokio::test]

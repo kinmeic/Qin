@@ -31,6 +31,7 @@ pub struct ToolContext<'a> {
     pub approve_all_commands: &'a mut bool,
     pub dry_run: bool,
     pub cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    pub deadline: Option<tokio::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -1024,6 +1025,9 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     process.process_group(0);
     remove_secret_environment(&mut process, ctx.config);
     remove_shell_startup_environment(&mut process);
+    // Full-screen applications must see real terminal output and retain their
+    // control sequences. Ordinary commands continue through the capture path.
+    let direct_terminal_output = ctx.events.is_tui() && child_can_use_terminal;
     let mut child = process
         .current_dir(ctx.cwd)
         .stdin(if child_can_use_terminal {
@@ -1031,8 +1035,16 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(if direct_terminal_output {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
+        .stderr(if direct_terminal_output {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
         .kill_on_drop(true)
         .spawn()?;
     let child_pid = child.id();
@@ -1057,13 +1069,16 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
             }
         };
     let mut process_group = ProcessGroupGuard::new(child_pid);
-    let stdout = child.stdout.take().context("Unable to capture stdout")?;
-    let stderr = child.stderr.take().context("Unable to capture stderr")?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    spawn_chunk_reader("stdout", stdout, tx.clone());
-    spawn_chunk_reader("stderr", stderr, tx.clone());
+    if let Some(stdout) = child.stdout.take() {
+        spawn_chunk_reader("stdout", stdout, tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_chunk_reader("stderr", stderr, tx.clone());
+    }
     drop(tx);
-    let mut output = String::new();
+    let mut captured_stdout = String::new();
+    let mut captured_stderr = String::new();
     let mut output_truncated = false;
     let mut streamed_bytes = 0_usize;
     let mut stream_truncated_notice = false;
@@ -1079,8 +1094,10 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         tokio::select! {
             line = rx.recv() => match line {
                 Some((label, text)) => {
-                    let piece = format!("{label}: {text}");
-                    if append_capped(&mut output, &piece, ctx.config.permissions.max_output_bytes) {
+                    let remaining = ctx.config.permissions.max_output_bytes
+                        .saturating_sub(captured_stdout.len().saturating_add(captured_stderr.len()));
+                    let output = if label == "stderr" { &mut captured_stderr } else { &mut captured_stdout };
+                    if append_capped(output, &text, output.len().saturating_add(remaining)) {
                         output_truncated = true;
                     }
                     if ctx.config.ui.stream_command_output || ctx.events.terminal_handed_off() {
@@ -1153,6 +1170,18 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let canceled_by_user = sigint_death_is_user_cancel(interactive_terminal, status);
     #[cfg(not(unix))]
     let canceled_by_user = false;
+    let mut output = String::new();
+    for (label, captured) in [("stdout", captured_stdout), ("stderr", captured_stderr)] {
+        if !captured.is_empty() {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&format!("{label}: {captured}"));
+        }
+    }
+    if direct_terminal_output {
+        output.push_str("[Interactive command output was displayed directly in the terminal]");
+    }
     if output_truncated {
         append_truncation_marker(&mut output, ctx.config.permissions.max_output_bytes);
     }
@@ -1264,16 +1293,45 @@ fn command_needs_terminal_inner(command: &str, depth: usize) -> bool {
             return !args.iter().any(|arg| matches!(arg.as_str(), "-c" | "-s"));
         }
         if program == "git" {
-            let subcommand = args
-                .iter()
-                .find(|arg| !arg.starts_with('-'))
-                .map(String::as_str);
+            let mut position = 0;
+            while let Some(arg) = args.get(position) {
+                if matches!(arg.as_str(), "-p" | "--paginate") {
+                    return true;
+                }
+                if matches!(
+                    arg.as_str(),
+                    "-C" | "-c"
+                        | "--git-dir"
+                        | "--work-tree"
+                        | "--namespace"
+                        | "--config-env"
+                        | "--super-prefix"
+                ) {
+                    position += 2;
+                } else if arg == "--" {
+                    position += 1;
+                    break;
+                } else if arg.starts_with('-') {
+                    position += 1;
+                } else {
+                    break;
+                }
+            }
+            let subcommand = args.get(position).map(String::as_str);
+            let command_args = args.get(position + 1..).unwrap_or_default();
             return match subcommand {
                 Some("push" | "pull" | "fetch" | "clone" | "credential") => true,
-                Some("rebase") => args.iter().any(|arg| arg == "-i" || arg == "--interactive"),
-                Some("commit") => !args
+                Some("rebase") => command_args
                     .iter()
-                    .any(|arg| matches!(arg.as_str(), "-m" | "--message" | "-F" | "--file")),
+                    .any(|arg| arg == "-i" || arg == "--interactive"),
+                Some("commit") => !command_args.iter().any(|arg| {
+                    arg == "--message"
+                        || arg == "--file"
+                        || arg.starts_with("--message=")
+                        || arg.starts_with("--file=")
+                        || arg.starts_with("-m")
+                        || arg.starts_with("-F")
+                }),
                 _ => false,
             };
         }
@@ -1946,25 +2004,30 @@ fn request_approval(
         "high_risk": high_risk,
         "allow_all": allow_all,
     });
-    let tui_answer = match ctx
-        .events
-        .approval_prompt_with_data(message, Some(prompt_data))
-    {
+    let tui_answer = match ctx.events.approval_prompt_with_control(
+        message,
+        Some(prompt_data),
+        ctx.cancellation.as_ref(),
+        ctx.deadline,
+    ) {
         Ok(answer) => answer,
         Err(error) => {
+            let outcome = if error.to_string() == "Agent canceled by the user" {
+                ApprovalOutcome::Cancelled
+            } else {
+                ApprovalOutcome::Unavailable
+            };
             let _ = ctx.store.append_approval_decided(
                 ctx.session_id,
                 ctx.turn_id,
                 ctx.tool_call_id,
                 &approval_id,
-                ApprovalOutcome::Unavailable,
+                outcome,
             );
-            let _ = ctx.events.approval_decided(
-                &approval_id,
-                ctx.tool_call_id,
-                ApprovalOutcome::Unavailable.as_str(),
-            );
-            return Err(error).context("Unable to render the approval prompt");
+            let _ = ctx
+                .events
+                .approval_decided(&approval_id, ctx.tool_call_id, outcome.as_str());
+            return Err(error).context("Unable to complete the approval request");
         }
     };
     let answer = if let Some(input) = tui_answer {
@@ -3566,7 +3629,52 @@ mod tests {
             approve_all_commands: all,
             dry_run: false,
             cancellation: None,
+            deadline: None,
         }
+    }
+
+    #[test]
+    fn terminal_detection_handles_git_global_options_and_explicit_prompts() {
+        for command in [
+            "ssh host",
+            "env MODE=test sudo id",
+            "git -C repo push",
+            "git -c credential.helper=store fetch",
+            "git --git-dir repo clone remote",
+            "git -C repo rebase -i HEAD~2",
+            "git -C repo commit",
+            "git --paginate status",
+            "sh -c 'read value'",
+        ] {
+            assert!(command_needs_terminal(command), "{command}");
+        }
+        for command in [
+            "printf text",
+            "git -C repo status",
+            "git -c key=value log -1",
+            "git -C repo commit -m 'message'",
+            "git commit --message=message",
+            "git commit -mmessage",
+            "sh -c 'printf text'",
+            "apt-get install -y package",
+        ] {
+            assert!(!command_needs_terminal(command), "{command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_capture_preserves_each_stream_across_separate_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut store, session) = audit_store(dir.path());
+        let events = EventSink::new(true, false, false);
+        let mut all = true;
+        let mut ctx = audit_context(&config, &mut store, &session, dir.path(), &mut all, &events);
+        let result = execute("audit-call", "shell", r#"{"command":"printf first; printf err-one >&2; sleep 0.1; printf second; printf err-two >&2"}"#, &mut ctx).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.content,
+            "exit_code=0\nstdout: firstsecond\nstderr: err-oneerr-two"
+        );
     }
 
     #[tokio::test]
@@ -4232,6 +4340,7 @@ mod tests {
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
             cancellation: None,
+            deadline: None,
         };
         let result = execute(
             "call-test",
@@ -4275,6 +4384,7 @@ mod tests {
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
             cancellation: None,
+            deadline: None,
         };
         let result = execute(
             "call-readonly-shell",
@@ -4314,6 +4424,7 @@ mod tests {
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
             cancellation: None,
+            deadline: None,
         };
         execute(
             "call-approved-for-task",
@@ -4352,6 +4463,7 @@ mod tests {
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
             cancellation: None,
+            deadline: None,
         };
         let error = execute(
             "call-disabled",

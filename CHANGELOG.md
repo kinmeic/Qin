@@ -2,6 +2,17 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.3
+
+- Fixed TUI terminal handoff so interactive applications receive terminal stdout and stderr with their control sequences intact. Their output is displayed directly; ordinary commands remain captured in the conversation. Git global options such as `-C` and `-c` no longer hide commands that need a terminal.
+- Rejected incomplete non-streaming model responses before any tool execution, matching streaming response validation.
+- Fixed secret redaction when a value starts with `[REDACTED]` but appends a secret; repeated redaction remains stable.
+- Applied cancellation and the agent deadline while waiting for TUI approval, rejected late answers, and dismissed expired approval dialogs when the turn ends.
+- Bounded the TUI event queue and event drain to keep streaming output from exhausting memory or starving keyboard input.
+- Preserved captured stdout/stderr across arbitrary read chunks, bounded sparse-table alignment expansion, and avoided duplicate truncated streamed answers. Restored history also aligns tables.
+- Added ten regression tests and a local-model pseudo-terminal smoke test covering terminal stdio, ANSI output, cancellation, approval deadlines, result pairing, and shutdown; runs on Linux and macOS in CI.
+- Documented the follow-up audit in `docs/code-audit-2026-10-07.md`.
+
 ## 0.6.2
 
 - Kept streamed shell output in a single TUI block so line and table alignment survives arbitrary read chunk boundaries; expanded tab stops when rendering output.

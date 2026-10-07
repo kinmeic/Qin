@@ -1,5 +1,7 @@
 # Code audit
 
+Latest follow-up: [2026-10-07 audit and fixes](docs/code-audit-2026-10-07.md), covering changes from v0.5.0 through v0.6.2 and the v0.6.3 corrections. Earlier audit records are retained below.
+
 This repository was audited for correctness, security, and performance in August 2026. The audit covered configuration loading and the interactive wizard, model and search HTTP clients, the agent loop, context compression, local tools and approval classification, privilege elevation, SQLite/Redis/tmpfs persistence, session locking, runtime host context, self-update, knowledge ingestion, embedding search, terminal output, installation, packaging, dependencies, and CI.
 
 ## Fixed findings
