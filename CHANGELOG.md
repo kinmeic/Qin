@@ -2,6 +2,12 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.5
+
+- Matched the TUI message input to the compact prompt style: `#313131` background, `#7D8185` placeholder, and `#C8D1D9` input text; added top/bottom padding and a leading `> ` prompt with text beginning in column three.
+- Started with one editable content row and grew the input for newlines and wrapping, retaining scrolling for long messages.
+- Replaced the session ID beside qin with the running package version, and changed MEM to available / total memory instead of utilization percentage.
+
 ## 0.6.4
 
 - Reduced the input footer to two rows: approval mode, model name without a label, compact context and total turn usage, and status share one line; shortcuts occupy the last row. Long model names and statuses are shortened to fit.

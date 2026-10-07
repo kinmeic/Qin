@@ -24,8 +24,8 @@ impl SystemStats {
             || "-- / --".into(),
             |m| {
                 format!(
-                    "{:.0}% / {}",
-                    m.used as f64 / m.total.max(1) as f64 * 100.0,
+                    "{} / {}",
+                    capacity(m.total.saturating_sub(m.used)),
                     capacity(m.total)
                 )
             },

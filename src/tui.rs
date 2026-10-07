@@ -26,6 +26,9 @@ type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 const MAX_ENTRY_BYTES: usize = 128 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 2 * 1024 * 1024;
 const DISPLAY_TRUNCATED: &str = "\n[Display truncated]";
+const INPUT_BACKGROUND: Color = Color::Rgb(0x31, 0x31, 0x31);
+const INPUT_FOREGROUND: Color = Color::Rgb(0xC8, 0xD1, 0xD9);
+const INPUT_PLACEHOLDER: Color = Color::Rgb(0x7D, 0x81, 0x85);
 
 enum WorkerRequest {
     Prompt {
@@ -1007,8 +1010,9 @@ fn event_loop(
 fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
     let (input_lines, cursor_column) =
-        input_layout(&app.input, area.width.saturating_sub(2).max(1));
-    let input_height = input_lines.len().clamp(3, 7) as u16;
+        input_layout(&app.input, area.width.saturating_sub(3).max(1));
+    // One content row by default, plus one blank padding row on each side.
+    let input_height = input_lines.len().clamp(1, 7) as u16 + 2;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1044,7 +1048,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  {}  ", short_id(&app.session_id)),
+                format!("  v{}  ", env!("CARGO_PKG_VERSION")),
                 Style::default().fg(Color::Cyan),
             ),
             Span::raw("Interactive agent"),
@@ -1069,11 +1073,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .collect();
     frame.render_widget(Paragraph::new(visible), conversation);
 
-    let input_style = Style::default()
-        .bg(Color::Rgb(235, 235, 235))
-        .fg(Color::Black);
+    let input_style = Style::default().bg(INPUT_BACKGROUND).fg(INPUT_FOREGROUND);
     let input_block = Block::default()
-        .padding(Padding::horizontal(1))
+        // Reserve the first two columns for "> ", with right/top/bottom padding.
+        .padding(Padding::new(2, 1, 1, 1))
         .style(input_style);
     let input_inner = input_block.inner(chunks[2]);
     let input_scroll = input_lines
@@ -1088,7 +1091,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                 .saturating_sub(1) as u16,
         )
         .min(input_inner.bottom().saturating_sub(1));
-    frame.render_widget(
+    frame.render_widget(input_block, chunks[2]);
+    let input = if app.input.is_empty() {
+        Paragraph::new("Ask qin to do anything").style(input_style.fg(INPUT_PLACEHOLDER))
+    } else {
         Paragraph::new(
             input_lines
                 .into_iter()
@@ -1096,9 +1102,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                 .collect::<Vec<_>>(),
         )
         .style(input_style)
-        .block(input_block),
-        chunks[2],
-    );
+    };
+    frame.render_widget(input, input_inner);
+    if input_inner.height > 0 && chunks[2].width > 0 {
+        frame.render_widget(
+            Paragraph::new("> ").style(input_style),
+            Rect::new(chunks[2].x, input_inner.y, chunks[2].width.min(2), 1),
+        );
+    }
     if !app.terminal_suspended && input_inner.width > 0 && input_inner.height > 0 {
         frame.set_cursor_position(Position::new(
             input_inner.x + cursor_column.min(input_inner.width.saturating_sub(1)),
@@ -1351,10 +1362,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
-}
-
-fn short_id(value: &str) -> &str {
-    value.get(..8).unwrap_or(value)
 }
 
 fn format_token_count(value: u64) -> String {
@@ -1745,19 +1752,16 @@ mod tests {
                 // Wide-character continuation cells are reset by Ratatui; check
                 // full empty rows plus the leading Chinese glyph and padding.
                 assert_eq!(
-                    terminal.backend().buffer()[(1, height - 5)].bg,
-                    Color::Rgb(235, 235, 235)
+                    terminal.backend().buffer()[(2, height - 5)].bg,
+                    INPUT_BACKGROUND
                 );
                 assert_eq!(
                     terminal.backend().buffer()[(0, height - 5)].bg,
-                    Color::Rgb(235, 235, 235)
+                    INPUT_BACKGROUND
                 );
-                for y in height - 4..height - 2 {
+                for y in [height - 6, height - 4, height - 3] {
                     for x in 0..width {
-                        assert_eq!(
-                            terminal.backend().buffer()[(x, y)].bg,
-                            Color::Rgb(235, 235, 235)
-                        );
+                        assert_eq!(terminal.backend().buffer()[(x, y)].bg, INPUT_BACKGROUND);
                     }
                 }
                 assert!(!text.contains('│'));
@@ -1807,9 +1811,79 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
             .collect();
         assert!(row.starts_with(" qin "));
+        assert!(row.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+        assert!(!row.contains("session"));
         assert!(
-            row.ends_with("CPU:100% MEM:75% / 2.0GB DISK:20.0GB / 40.0GB"),
+            row.ends_with("CPU:100% MEM:500.0MB / 2.0GB DISK:20.0GB / 40.0GB"),
             "{row}"
+        );
+    }
+
+    #[test]
+    fn prompt_padding_placeholder_and_cursor_follow_single_and_multiline_input() {
+        let mut app = app();
+        let (requests, _) = mpsc::channel();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        // One content row, with blank background rows above and below.
+        let buffer = terminal.backend().buffer();
+        for y in [19, 21] {
+            for x in 0..80 {
+                assert_eq!(buffer[(x, y)].symbol(), " ");
+                assert_eq!(buffer[(x, y)].bg, INPUT_BACKGROUND);
+            }
+        }
+        assert_eq!(buffer[(0, 20)].symbol(), ">");
+        assert_eq!(buffer[(1, 20)].symbol(), " ");
+        assert_eq!(buffer[(2, 20)].symbol(), "A");
+        assert_eq!(buffer[(2, 20)].fg, INPUT_PLACEHOLDER);
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(2, 20)
+        );
+
+        app.input = "你好".into();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &requests,
+        );
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 19)].symbol(), ">");
+        assert_eq!(buffer[(2, 19)].symbol(), "你");
+        assert_eq!(buffer[(2, 19)].fg, INPUT_FOREGROUND);
+        assert_eq!(buffer[(2, 19)].bg, INPUT_BACKGROUND);
+        assert_eq!(buffer[(2, 20)].symbol(), " ");
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(2, 20)
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &requests,
+        );
+        assert_eq!(app.input, "你好\n\n");
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 18)].symbol(), ">");
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(2, 20)
+        );
+
+        app.input = (0..12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Seven visible content rows keep the final row/cursor in view.
+        assert_eq!(buffer[(0, 14)].symbol(), ">");
+        let last: String = (2..9).map(|x| buffer[(x, 20)].symbol()).collect();
+        assert_eq!(last, "line 11");
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(9, 20)
         );
     }
 }
