@@ -1,0 +1,121 @@
+name: attach Windows x64 to latest release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 for latest release
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Resolve latest published release
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $release = gh release view --json tagName,isDraft,isPrerelease | ConvertFrom-Json
+          if ($release.isDraft -or $release.isPrerelease) {
+            throw 'The latest release must be a published stable release.'
+          }
+          $tag = $release.tagName
+          if (-not $tag.StartsWith('v')) {
+            throw "Unexpected release tag: $tag"
+          }
+          $version = $tag.Substring(1)
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building Windows x64 for $tag"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33e8a3fc893c # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+      - name: Build Windows x64 executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Package executable
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/qin.exe "dist/qin-v${env:VERSION}-windows-x86_64.exe"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qin-windows-x86_64-release
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+  attach:
+    name: Attach executable and refresh release checksums
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: qin-windows-x86_64-release
+          path: windows-asset
+      - name: Download release assets and prepare checksums
+        run: |
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" --dir release-assets
+          windows_asset="qin-v${RELEASE_VERSION}-windows-x86_64.exe"
+          cp "windows-asset/$windows_asset" "release-assets/$windows_asset"
+          rm -f release-assets/SHA256SUMS release-assets/SHA256SUMS.minisig
+          expected=$(find release-assets -maxdepth 1 -type f \( -name 'qin-*' -o -name 'qin_*' \) | wc -l)
+          test "$expected" -ge 12
+          find release-assets -maxdepth 1 -type f \( -name 'qin-*' -o -name 'qin_*' \) -print0 \
+            | sort --zero-terminated \
+            | xargs --null sha256sum \
+            | sed 's#  release-assets/#  #' > release-assets/SHA256SUMS
+          test "$(wc -l < release-assets/SHA256SUMS)" -eq "$expected"
+          cat release-assets/SHA256SUMS
+      - name: Sign SHA256SUMS with minisign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          sudo apt-get update && sudo apt-get install --yes minisign
+          test -n "$MINISIGN_SECRET_KEY"
+          install -m 0600 /dev/null "$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          cd release-assets
+          printf '%s\n' "$MINISIGN_PASSWORD" \
+            | minisign -S -s "$RUNNER_TEMP/minisign.key" -m SHA256SUMS -x SHA256SUMS.minisig \
+                -t "qin $RELEASE_TAG SHA256SUMS"
+          rm -f "$RUNNER_TEMP/minisign.key"
+          test -s SHA256SUMS.minisig
+          grep -q '^trusted comment: ' SHA256SUMS.minisig
+      - name: Attach Windows executable and refreshed checksums to the latest release
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "release-assets/qin-v${RELEASE_VERSION}-windows-x86_64.exe" \
+            release-assets/SHA256SUMS \
+            release-assets/SHA256SUMS.minisig \
+            --clobber
