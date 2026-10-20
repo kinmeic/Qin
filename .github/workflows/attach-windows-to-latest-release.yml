@@ -53,13 +53,15 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Build Windows x64 executable
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
-      - name: Package executable
+      - name: Package Windows x64 archive
         shell: pwsh
         env:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/qin.exe "dist/qin-v${env:VERSION}-windows-x86_64.exe"
+          & ./scripts/package-windows-release.ps1 `
+            -BinaryPath "target/x86_64-pc-windows-msvc/release/qin.exe" `
+            -Version $env:VERSION `
+            -OutputDirectory "dist"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qin-windows-x86_64-release
@@ -73,7 +75,7 @@ jobs:
           subject-path: dist/*
 
   attach:
-    name: Attach executable and refresh release checksums
+    name: Attach Windows archive and refresh release checksums
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -92,8 +94,9 @@ jobs:
         run: |
           mkdir release-assets
           gh release download "$RELEASE_TAG" --dir release-assets
-          windows_asset="qin-v${RELEASE_VERSION}-windows-x86_64.exe"
+          windows_asset="qin-v${RELEASE_VERSION}-windows-x86_64.zip"
           cp "windows-asset/$windows_asset" "release-assets/$windows_asset"
+          rm -f "release-assets/qin-v${RELEASE_VERSION}-windows-x86_64.exe"
           rm -f release-assets/SHA256SUMS release-assets/SHA256SUMS.minisig
           expected=$(find release-assets -maxdepth 1 -type f \( -name 'qin-*' -o -name 'qin_*' \) | wc -l)
           test "$expected" -ge 12
@@ -119,10 +122,14 @@ jobs:
           rm -f "$RUNNER_TEMP/minisign.key"
           test -s SHA256SUMS.minisig
           grep -q '^trusted comment: ' SHA256SUMS.minisig
-      - name: Attach Windows executable and refreshed checksums to the latest release
+      - name: Attach Windows archive and refreshed checksums to the latest release
         run: |
           gh release upload "$RELEASE_TAG" \
-            "release-assets/qin-v${RELEASE_VERSION}-windows-x86_64.exe" \
+            "release-assets/qin-v${RELEASE_VERSION}-windows-x86_64.zip" \
             release-assets/SHA256SUMS \
             release-assets/SHA256SUMS.minisig \
             --clobber
+          legacy_windows_asset="qin-v${RELEASE_VERSION}-windows-x86_64.exe"
+          if gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -Fxq "$legacy_windows_asset"; then
+            gh release delete-asset "$RELEASE_TAG" "$legacy_windows_asset" --yes
+          fi
