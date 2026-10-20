@@ -1011,14 +1011,26 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     )?;
     let started = Instant::now();
     let mut terminal_mode = TerminalModeGuard::capture(interactive_terminal);
-    let shell = "/bin/sh";
-    let mut process = if elevated && unsafe { libc::geteuid() } != 0 {
-        let mut p = Command::new(elevation_program(&ctx.config.permissions.elevation)?);
-        p.arg(shell).arg("-c").arg(command);
-        p
-    } else {
-        let mut p = Command::new(shell);
-        p.arg("-c").arg(command);
+    #[cfg(unix)]
+    let mut process = {
+        let shell = "/bin/sh";
+        if elevated && unsafe { libc::geteuid() } != 0 {
+            let mut p = Command::new(elevation_program(&ctx.config.permissions.elevation)?);
+            p.arg(shell).arg("-c").arg(command);
+            p
+        } else {
+            let mut p = Command::new(shell);
+            p.arg("-c").arg(command);
+            p
+        }
+    };
+    #[cfg(windows)]
+    let mut process = {
+        if elevated {
+            bail!("Elevated shell commands are not supported on Windows");
+        }
+        let mut p = Command::new("cmd.exe");
+        p.arg("/C").arg(command);
         p
     };
     #[cfg(unix)]
@@ -3120,7 +3132,8 @@ fn is_shell_injection_variable(name: &str) -> bool {
         || name.starts_with("DYLD_")
 }
 
-fn elevation_program(configured: &str) -> Result<&str> {
+#[cfg(unix)]
+fn elevation_program(configured: &str) -> Result<&'static str> {
     if configured == "disabled" {
         bail!("Privilege elevation is disabled by configuration")
     }
@@ -3140,6 +3153,7 @@ fn elevation_program(configured: &str) -> Result<&str> {
         )
     }
 }
+#[cfg(unix)]
 fn command_exists(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())

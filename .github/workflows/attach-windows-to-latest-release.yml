@@ -38,8 +38,15 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           Write-Host "Building Windows x64 for $tag"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.release.outputs.tag }}
+      - name: Verify source version matches the latest release
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value
+          if ($version -ne $env:RELEASE_VERSION) {
+            throw "Source version $version does not match latest release version $env:RELEASE_VERSION"
+          }
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
