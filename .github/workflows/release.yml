@@ -239,12 +239,14 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Build Windows x64 executable
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
-      - name: Package executable
+      - name: Package Windows x64 archive
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/qin.exe "dist/qin-v${version}-windows-x86_64.exe"
+          & ./scripts/package-windows-release.ps1 `
+            -BinaryPath "target/x86_64-pc-windows-msvc/release/qin.exe" `
+            -Version $version `
+            -OutputDirectory "dist"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qin-windows-x86_64
@@ -287,7 +289,7 @@ jobs:
           test "v${version}" = "$GITHUB_REF_NAME"
           cd release-assets
           expected=$(find . -maxdepth 1 -type f \( -name 'qin-*' -o -name 'qin_*' \) | wc -l)
-          # 6 portable archives + 2 legacy ipk + 2 apk + 1 SBOM + Windows x64 executable; grow this floor with new assets.
+          # 6 portable archives + 2 legacy ipk + 2 apk + 1 SBOM + Windows x64 ZIP; grow this floor with new assets.
           test "$expected" -ge 12
           find . -maxdepth 1 -type f \( -name 'qin-*' -o -name 'qin_*' \) -print0 \
             | sort --zero-terminated \
@@ -315,7 +317,7 @@ jobs:
         run: |
           version=${GITHUB_REF_NAME#v}
           {
-            echo "Prebuilt qin ${version} executables for Linux, macOS, Windows x64, and OpenWrt."
+            echo "Prebuilt qin ${version} executables for Linux, macOS, Windows x64, and OpenWrt. Windows x64 is distributed as a portable ZIP archive."
             echo
             echo "OpenWrt assets include a portable archive, a legacy opkg-compatible .ipk package, and an OpenWrt 25.12.5 SDK-built apk v3 package. Linux and OpenWrt executables are statically linked with musl. Verify downloads with SHA256SUMS, which is minisign-signed (SHA256SUMS.minisig); every asset also carries a GitHub build-provenance attestation, and a CycloneDX SBOM is attached."
             echo
