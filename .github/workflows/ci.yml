@@ -16,11 +16,20 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Build Windows x64 executable
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Package Windows x64 archive
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value
+          & ./scripts/package-windows-release.ps1 `
+            -BinaryPath "target/x86_64-pc-windows-msvc/release/qin.exe" `
+            -Version $version `
+            -OutputDirectory "dist"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qin-windows-x86_64
-          path: target/x86_64-pc-windows-msvc/release/qin.exe
+          path: dist/*.zip
           if-no-files-found: error
+          compression-level: 0
           retention-days: 30
 
   test:
