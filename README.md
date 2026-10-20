@@ -53,9 +53,9 @@ OpenWrt devices vary by CPU architecture, libc, and ABI. Cross-compile for the e
 
 ### Prebuilt releases
 
-Tagged releases publish checksummed archives for Linux (`x86_64`, `arm64`), macOS (`x86_64`, Apple Silicon `arm64`), and OpenWrt (`x86_64`, `aarch64_cortex-a53`), plus a Windows x64 executable (`qin-vVERSION-windows-x86_64.exe`). OpenWrt releases include native OpenWrt 25.12.5 `apk` v3 packages and legacy `.ipk` packages.
+Tagged releases publish checksummed archives for Linux (`x86_64`, `arm64`), macOS (`x86_64`, Apple Silicon `arm64`), OpenWrt (`x86_64`, `aarch64_cortex-a53`), and Windows x64 (`qin-vVERSION-windows-x86_64.zip`). The Windows ZIP contains `qin.exe`, the README, license, security policy, and an example configuration. OpenWrt releases include native OpenWrt 25.12.5 `apk` v3 packages and legacy `.ipk` packages.
 
-GitHub Actions also builds a Windows x64 executable on CI runs. Download `qin-windows-x86_64` from the run's **Artifacts** section; the artifact is retained for 30 days. To add the executable to the current latest release without creating a new release, manually run the `attach Windows x64 to latest release` workflow. It refreshes the release checksums and signature as well.
+GitHub Actions also builds the Windows x64 ZIP on CI runs. Download `qin-windows-x86_64` from the run's **Artifacts** section; the artifact is retained for 30 days. To add the archive to the current latest release without creating a new release, manually run the `attach Windows x64 to latest release` workflow. It removes the previous Windows executable and refreshes the release checksums and signature as well.
 
 OpenWrt 25.12.5:
 
