@@ -137,6 +137,9 @@ async fn run() -> Result<()> {
                 .map(|_| prompt.join(" "))
                 .map(|v| v.chars().take(60).collect::<String>());
             let id = store.new_session(&cwd, title.as_deref())?;
+            if let Some(notice) = store.take_notice() {
+                events.warning(&notice)?;
+            }
             events.success(&format!("Created and switched to a new session: {id}"))?;
             if !prompt.is_empty() {
                 let agents_md = load_agents_md(&resolver, &config, &events);
@@ -202,6 +205,9 @@ async fn run() -> Result<()> {
                 confirm_session_delete(&events, &id, assume_yes)?;
                 let cwd = std::env::current_dir()?;
                 let (_, new_current) = store.delete_session(&id, &cwd)?;
+                if let Some(notice) = store.take_notice() {
+                    events.warning(&notice)?;
+                }
                 let suffix = new_current.map_or_else(String::new, |active| {
                     format!("; created and switched to a new session: {active}")
                 });
@@ -349,9 +355,9 @@ pub(crate) fn open(
     let resolver = ConfigPathResolver::new(explicit.clone(), false)?;
     let config = load_config(&resolver, events)?;
     config.validate(false)?;
-    let store = StateStore::open(&config, &resolver)?;
-    if let Some(notice) = store.notice() {
-        events.warning(notice)?;
+    let mut store = StateStore::open(&config, &resolver)?;
+    if let Some(notice) = store.take_notice() {
+        events.warning(&notice)?;
     }
     Ok((config, resolver, store))
 }
@@ -517,6 +523,9 @@ pub(crate) async fn execute_with(
     )
     .await;
     store.validate_session(id)?;
+    if let Some(notice) = store.take_notice() {
+        events.warning(&notice)?;
+    }
     let response = response?;
     events.final_answer(&response)
 }

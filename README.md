@@ -116,7 +116,7 @@ key_prefix = "qin"
 export QIN_REDIS_URL='redis://:password@127.0.0.1:6379/0'
 ```
 
-qin verifies the URL and sends `PING` during startup. Both `redis://` and certificate-verified `rediss://` connections are supported. When Redis is reachable, no `qin-session.json` is written. If Redis is unavailable, qin falls back to the tmpfs JSON session store and prints the reason in a warning. Redis session storage is intentionally only used when `storage.enabled = false`; enabling SQLite and Redis together is rejected to avoid ambiguous storage semantics. Long-term memory and embeddings still require SQLite storage to be enabled.
+qin verifies the URL and sends `PING` during startup. Both `redis://` and certificate-verified `rediss://` connections are supported. When Redis is reachable, no `qin-session.json` is written. If Redis is unavailable at startup or rejects a session write (for example, because it reached `maxmemory`), qin saves the latest session to the private JSON fallback and continues with it, printing a warning. Redis session storage is intentionally only used when `storage.enabled = false`; enabling SQLite and Redis together is rejected to avoid ambiguous storage semantics. Long-term memory and embeddings still require SQLite storage to be enabled.
 
 The session contains conversation content, so use a private Redis instance with authentication/ACLs and TLS or a protected local network as appropriate. When Redis becomes available, qin compares any outage-time JSON session with the Redis session, migrates the newer state, and removes the obsolete JSON file after Redis accepts it. Invalid or unsupported session data in Redis is reported as an error instead of silently replacing it with a fallback.
 

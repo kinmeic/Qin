@@ -914,6 +914,9 @@ fn start_worker(
                             Ok(id) => {
                                 session_id = id.clone();
                                 send_ui_event(&event_sender, "session_changed", &id, None);
+                                if let Some(notice) = store.take_notice() {
+                                    send_ui_event(&event_sender, "warning", &notice, None);
+                                }
                             }
                             Err(error) => send_ui_event(
                                 &event_sender,

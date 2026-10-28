@@ -437,6 +437,7 @@ enum MemoryPersistence {
     Redis {
         connection: RefCell<redis::Connection>,
         key: String,
+        fallback_path: PathBuf,
     },
 }
 
@@ -601,6 +602,45 @@ fn decode_redis_session(bytes: &[u8]) -> Result<Option<MemorySession>> {
             "Redis contains invalid qin session state: {error:#}"
         )))
     })
+}
+
+fn persist_memory_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("The memory state path has no parent directory")?;
+    ensure_private_memory_directory(parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!(
+                "Refusing to replace a non-regular session-state path: {}",
+                path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Unable to create temporary session state in {}",
+            parent.display()
+        )
+    })?;
+    temporary.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Unable to persist session state to {}", path.display()))?;
+    sync_state_directory(parent)?;
+    Ok(())
 }
 
 fn select_redis_session(
@@ -1020,6 +1060,7 @@ impl StateStore {
                 persistence: MemoryPersistence::Redis {
                     connection: RefCell::new(connection),
                     key: key.clone(),
+                    fallback_path: local_path,
                 },
             })),
             path: PathBuf::from(format!("redis:{key}")),
@@ -1101,8 +1142,8 @@ impl StateStore {
         }
     }
 
-    pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
     }
 
     fn connection(&self) -> &Connection {
@@ -1119,8 +1160,10 @@ impl StateStore {
         }
     }
 
-    /// Atomically persists the tmpfs session file (memory backend only).
-    fn save_memory_state(&self) -> Result<()> {
+    /// Persist the lightweight session, falling back to its private JSON file
+    /// if a live Redis write is rejected (for example, because Redis hit
+    /// `maxmemory`).
+    fn save_memory_state(&mut self) -> Result<()> {
         let Backend::Memory(memory) = &self.backend else {
             return Ok(());
         };
@@ -1132,57 +1175,50 @@ impl StateStore {
         if bytes.len() as u64 > MAX_MEMORY_STATE_BYTES {
             bail!("Session state exceeds the 128 MiB size limit");
         }
-        match &memory.persistence {
-            MemoryPersistence::File(path) => {
-                let parent = path
-                    .parent()
-                    .context("The memory state path has no parent directory")?;
-                ensure_private_memory_directory(parent)?;
-                match fs::symlink_metadata(path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                        bail!(
-                            "Refusing to replace a non-regular session-state path: {}",
-                            path.display()
-                        );
+        let mut redis_failure = None;
+        let mut fallback_path = None;
+        match &self.backend {
+            Backend::Memory(memory) => match &memory.persistence {
+                MemoryPersistence::File(path) => return persist_memory_file(path, &bytes),
+                MemoryPersistence::Redis {
+                    connection,
+                    key,
+                    fallback_path: path,
+                } => {
+                    let result = {
+                        let mut connection = connection.borrow_mut();
+                        redis::cmd("SET")
+                            .arg(key)
+                            .arg(&bytes)
+                            .query::<()>(&mut *connection)
+                            .context("Unable to persist the qin session to Redis")
+                    };
+                    if let Err(error) = result {
+                        // Preserve the latest in-memory state before letting the
+                        // failed Redis write affect the rest of the current turn.
+                        persist_memory_file(path, &bytes).with_context(|| {
+                            format!(
+                                "Redis rejected the qin session write ({error:#}), and the JSON fallback also failed"
+                            )
+                        })?;
+                        redis_failure = Some(error);
+                        fallback_path = Some(path.clone());
                     }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
                 }
-                let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
-                    format!(
-                        "Unable to create temporary session state in {}",
-                        parent.display()
-                    )
-                })?;
-                temporary.write_all(&bytes)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    temporary
-                        .as_file()
-                        .set_permissions(fs::Permissions::from_mode(0o600))?;
-                }
-                temporary.as_file().sync_all()?;
-                temporary
-                    .persist(path)
-                    .map_err(|error| error.error)
-                    .with_context(|| {
-                        format!("Unable to persist session state to {}", path.display())
-                    })?;
-                sync_state_directory(parent)?;
-                Ok(())
-            }
-            MemoryPersistence::Redis { connection, key } => {
-                let mut connection = connection.borrow_mut();
-                redis::cmd("SET")
-                    .arg(key)
-                    .arg(bytes)
-                    .query::<()>(&mut *connection)
-                    .context("Unable to persist the qin session to Redis")?;
-                Ok(())
-            }
+            },
+            Backend::Sqlite(_) => return Ok(()),
         }
+        if let (Some(path), Some(error)) = (fallback_path, redis_failure) {
+            let Backend::Memory(memory) = &mut self.backend else {
+                unreachable!()
+            };
+            memory.persistence = MemoryPersistence::File(path.clone());
+            self.notice = Some(format!(
+                "Redis session write failed; qin switched to the private JSON fallback at {} ({error:#})",
+                path.display()
+            ));
+        }
+        Ok(())
     }
 
     pub fn lock_session(&self, session_id: &str) -> Result<SessionLock> {
@@ -3430,7 +3466,7 @@ mod tests {
         config.storage.redis.url = "not-a-redis-url".into();
         let mut store = StateStore::open(&config, &resolver).unwrap();
         assert_eq!(store.backend_label(), "tmpfs-json");
-        assert!(store.notice().is_some());
+        assert!(store.take_notice().is_some());
         let id = store.ensure_current_session(Path::new("/tmp")).unwrap();
         store
             .append_messages(&id, &[user_message("fallback")], Path::new("/tmp"))

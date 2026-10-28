@@ -2,6 +2,11 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.6
+
+- Continued session work with the private JSON fallback when Redis rejects a session write, preserving the latest state and warning about the storage switch.
+- Packaged Windows x64 releases as portable ZIP archives.
+
 ## 0.6.5
 
 - Matched the TUI message input to the compact prompt style: `#313131` background, `#7D8185` placeholder, and `#C8D1D9` input text; added top/bottom padding and a leading `> ` prompt with text beginning in column three.
