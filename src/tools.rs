@@ -2665,6 +2665,7 @@ fn trusted_executable_directory(directory: Option<&Path>) -> bool {
                 | "/usr/bin"
                 | "/sbin"
                 | "/usr/sbin"
+                | "/usr/lib/cargo/bin/coreutils"
                 | "/usr/libexec/uutils-coreutils"
                 | "/System/Cryptexes/App/usr/bin"
                 | "/System/Cryptexes/App/usr/sbin"
@@ -4088,7 +4089,10 @@ mod tests {
     }
 
     #[test]
-    fn trusts_ubuntu_uutils_coreutils_directory() {
+    fn trusts_uutils_coreutils_directories() {
+        assert!(trusted_executable_directory(Some(Path::new(
+            "/usr/lib/cargo/bin/coreutils"
+        ))));
         assert!(trusted_executable_directory(Some(Path::new(
             "/usr/libexec/uutils-coreutils"
         ))));
