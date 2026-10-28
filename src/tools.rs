@@ -2665,6 +2665,7 @@ fn trusted_executable_directory(directory: Option<&Path>) -> bool {
                 | "/usr/bin"
                 | "/sbin"
                 | "/usr/sbin"
+                | "/usr/libexec/uutils-coreutils"
                 | "/System/Cryptexes/App/usr/bin"
                 | "/System/Cryptexes/App/usr/sbin"
         )
@@ -4084,6 +4085,13 @@ mod tests {
         let fake = dir.path().join("date");
         symlink("/usr/bin/date", &fake).unwrap();
         assert!(trusted_program_name(fake.to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn trusts_ubuntu_uutils_coreutils_directory() {
+        assert!(trusted_executable_directory(Some(Path::new(
+            "/usr/libexec/uutils-coreutils"
+        ))));
     }
 
     #[test]

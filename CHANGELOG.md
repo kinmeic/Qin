@@ -2,6 +2,11 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.7
+
+- Updated vulnerable and unsound transitive dependencies reported by the security audit.
+- Recognized Ubuntu's uutils Coreutils directory as a trusted system utility location, restoring read-only classification for `date` on current Ubuntu runners.
+
 ## 0.6.6
 
 - Continued session work with the private JSON fallback when Redis rejects a session write, preserving the latest state and warning about the storage switch.
