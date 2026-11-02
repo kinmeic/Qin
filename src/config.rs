@@ -16,6 +16,7 @@ use serde::Deserialize;
 use tempfile::NamedTempFile;
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/config.example.toml");
+const MAX_OUTPUT_TOKENS: u64 = 393_216;
 const MAX_REPORTED_UNKNOWN_FIELDS: usize = 16;
 
 #[derive(Debug)]
@@ -792,7 +793,7 @@ impl Config {
             )?;
             if !(1_024..=2_000_000).contains(&candidate.context_window)
                 || candidate.max_output_tokens == 0
-                || candidate.max_output_tokens > 262_144
+                || candidate.max_output_tokens > MAX_OUTPUT_TOKENS
                 || candidate.max_output_tokens >= candidate.context_window
             {
                 bail!("models.{name} has invalid context or output token limits");
@@ -1815,6 +1816,38 @@ mod tests {
         config.validate(false).unwrap();
 
         config.context.compact_trigger_ratio = 0.4;
+        assert!(config.validate(false).is_err());
+    }
+
+    #[test]
+    fn output_token_limit_supports_384k_and_preserves_context_constraints() {
+        assert_eq!(ModelConfig::default().max_output_tokens, 8_192);
+        let mut config = Config::default();
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                model: "deepseek-test".into(),
+                api_key: Some("key".into()),
+                context_window: 1_000_000,
+                max_output_tokens: MAX_OUTPUT_TOKENS,
+                ..ModelConfig::default()
+            },
+        );
+        config.context.reserve_output_tokens = MAX_OUTPUT_TOKENS;
+        config.validate(false).unwrap();
+
+        config.models.get_mut("primary").unwrap().max_output_tokens = MAX_OUTPUT_TOKENS + 1;
+        assert!(config.validate(false).is_err());
+
+        let model = config.models.get_mut("primary").unwrap();
+        model.max_output_tokens = MAX_OUTPUT_TOKENS;
+        config.context.reserve_output_tokens = MAX_OUTPUT_TOKENS - 1;
+        assert!(config.validate(false).is_err());
+
+        config.context.reserve_output_tokens = MAX_OUTPUT_TOKENS;
+        let model = config.models.get_mut("primary").unwrap();
+        model.context_window = MAX_OUTPUT_TOKENS;
+        model.max_output_tokens = MAX_OUTPUT_TOKENS;
         assert!(config.validate(false).is_err());
     }
 

@@ -28,6 +28,14 @@ For shell commands, use the narrowest practical command and do not retry a denie
 When the task is complete, give a concise result. If a tool fails, report the actual error."#;
 
 const REPEATED_TOOL_BATCH_WARNING_THRESHOLD: u32 = 3;
+const MAX_RESPONSE_CONTINUATIONS: u32 = 3;
+const RESPONSE_CONTINUATION_PROMPT: &str = "The previous assistant response reached the provider's output-token limit. Continue the response from the exact cutoff without repeating, paraphrasing, or adding commentary.";
+
+#[derive(Debug)]
+struct ModelOutcome {
+    message: Message,
+    truncated: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -204,7 +212,8 @@ impl ModelResponder<'_> {
         tools: &[Value],
         expected_hash: &str,
         events: Option<&EventSink>,
-    ) -> Result<Message> {
+        stream_state: StreamState<'_>,
+    ) -> Result<ModelOutcome> {
         if let Some(events) = events {
             let estimated_tokens =
                 estimate_messages(messages).saturating_add(estimate_schemas(tools));
@@ -212,7 +221,16 @@ impl ModelResponder<'_> {
         }
         match self {
             Self::Live(client) => {
-                request_model(client, model, messages, tools, Some(expected_hash), events).await
+                request_model(
+                    client,
+                    model,
+                    messages,
+                    tools,
+                    Some(expected_hash),
+                    events,
+                    stream_state,
+                )
+                .await
             }
             Self::Replay {
                 responses,
@@ -239,7 +257,10 @@ impl ModelResponder<'_> {
                         true,
                     )?;
                 }
-                Ok(message)
+                Ok(ModelOutcome {
+                    message,
+                    truncated: false,
+                })
             }
         }
     }
@@ -525,27 +546,94 @@ async fn run_loop(
             _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
             _ = crate::cancellation::wait(options.cancellation.clone()) => bail!("Agent canceled by the user"),
         }
-        ensure_within_hard_limit(config, messages, schemas)?;
-        let remaining = remaining_time(config, started)?;
         let model = config.primary_model()?;
-        let snapshot = build_request_snapshot(model, messages, schemas, iteration)?;
-        let request_hash = snapshot.input_sha256.clone();
-        store.append_request_snapshot(session_id, turn_id, &snapshot)?;
-        events.phase(&format!(
-            "Requesting the model (round {})...",
-            iteration + 1
-        ))?;
-        let outcome = tokio::select! {
-            result = tokio::time::timeout(
-                remaining,
-                responder.request(model, messages, schemas, &request_hash, Some(events)),
-            ) => result
-                .context("The agent reached its total runtime limit")??,
-            _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
-            _ = crate::cancellation::wait(options.cancellation.clone()) => bail!("Agent canceled by the user"),
+        let mut continuation_messages: Option<Vec<Message>> = None;
+        let mut continued_content = String::new();
+        let mut continuation_count = 0_u32;
+        let mut stream_text = StreamingText::default();
+        let assistant = loop {
+            let continuing = continuation_messages.is_some();
+            if continuing && replay_request_limit.is_some_and(|limit| iteration >= limit) {
+                bail!("Replay fixture reached its maximum model-request count");
+            }
+            let request_messages = continuation_messages
+                .as_ref()
+                .map_or(messages.as_slice(), Vec::as_slice);
+            ensure_within_hard_limit(config, request_messages, schemas)?;
+            let snapshot = build_request_snapshot(model, request_messages, schemas, iteration)?;
+            let request_hash = snapshot.input_sha256.clone();
+            store.append_request_snapshot(session_id, turn_id, &snapshot)?;
+            if continuing {
+                events.phase(&format!(
+                    "Continuing the truncated model response ({continuation_count}/{MAX_RESPONSE_CONTINUATIONS})..."
+                ))?;
+            } else {
+                events.phase(&format!(
+                    "Requesting the model (round {})...",
+                    iteration + 1
+                ))?;
+            }
+            let remaining = remaining_time(config, started)?;
+            let outcome = tokio::select! {
+                result = tokio::time::timeout(
+                    remaining,
+                    responder.request(
+                        model,
+                        request_messages,
+                        schemas,
+                        &request_hash,
+                        Some(events),
+                        StreamState {
+                            continuation: continuing,
+                            text: &mut stream_text,
+                        },
+                    ),
+                ) => result
+                    .context("The agent reached its total runtime limit")??,
+                _ = tokio::signal::ctrl_c() => bail!("Agent canceled by the user"),
+                _ = crate::cancellation::wait(options.cancellation.clone()) => bail!("Agent canceled by the user"),
+            };
+            iteration = iteration.saturating_add(1);
+            let mut assistant = outcome.message;
+            if !outcome.truncated {
+                if !continued_content.is_empty() {
+                    continued_content.push_str(assistant.content.as_deref().unwrap_or_default());
+                    assistant.content = Some(std::mem::take(&mut continued_content));
+                }
+                break assistant;
+            }
+            if assistant
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+            {
+                bail!(
+                    "The model response was truncated during a tool call (finish_reason=length); no tool calls were executed. Increase the active model's max_output_tokens (currently {}) and context.reserve_output_tokens, then retry",
+                    model.max_output_tokens
+                );
+            }
+            let Some(partial) = assistant
+                .content
+                .as_deref()
+                .filter(|content| !content.trim().is_empty())
+            else {
+                bail!(
+                    "The model reached finish_reason=length without resumable content. Increase the active model's max_output_tokens (currently {}) and context.reserve_output_tokens, then retry",
+                    model.max_output_tokens
+                );
+            };
+            if continuation_count >= MAX_RESPONSE_CONTINUATIONS {
+                bail!(
+                    "The model response still reached finish_reason=length after {MAX_RESPONSE_CONTINUATIONS} continuations. Increase the active model's max_output_tokens (currently {}) and context.reserve_output_tokens, then retry",
+                    model.max_output_tokens
+                );
+            }
+            continued_content.push_str(partial);
+            let next_messages = continuation_messages.get_or_insert_with(|| messages.clone());
+            next_messages.push(assistant);
+            next_messages.push(Message::user(RESPONSE_CONTINUATION_PROMPT));
+            continuation_count = continuation_count.saturating_add(1);
         };
-        let assistant = outcome;
-        iteration = iteration.saturating_add(1);
         let stored_assistant = to_stored(&assistant)?;
         store.append_assistant_message(session_id, turn_id, &stored_assistant)?;
         messages.push(assistant.clone());
@@ -1098,7 +1186,8 @@ async fn request_model(
     tools: &[Value],
     expected_hash: Option<&str>,
     events: Option<&EventSink>,
-) -> Result<Message> {
+    mut stream_state: StreamState<'_>,
+) -> Result<ModelOutcome> {
     let api_key = model.resolve_api_key()?;
     let endpoint = chat_endpoint(&model.base_url);
     let mut last_error = None;
@@ -1128,11 +1217,12 @@ async fn request_model(
             .await;
         match response {
             Ok(response) if response.status().is_success() => {
-                let (message, usage) = if model.stream {
+                let (outcome, usage) = if model.stream {
                     parse_stream(
                         response,
                         model.max_output_tokens.saturating_mul(8) as usize,
                         events,
+                        &mut stream_state,
                     )
                     .await
                 } else {
@@ -1145,7 +1235,7 @@ async fn request_model(
                 if let Some(events) = events {
                     let estimated_input =
                         estimate_messages(messages).saturating_add(estimate_schemas(tools));
-                    let estimated_output = estimate_message(&message).saturating_sub(8);
+                    let estimated_output = estimate_message(&outcome.message).saturating_sub(8);
                     let (input_tokens, output_tokens, estimated) = usage
                         .and_then(ProviderUsage::counts)
                         .map(|(input, output)| (input, output, false))
@@ -1157,7 +1247,7 @@ async fn request_model(
                         estimated,
                     )?;
                 }
-                return Ok(message);
+                return Ok(outcome);
             }
             Ok(response) => {
                 let status = response.status();
@@ -1204,7 +1294,7 @@ async fn request_model(
 async fn parse_response(
     response: reqwest::Response,
     max_bytes: usize,
-) -> Result<(Message, Option<ProviderUsage>)> {
+) -> Result<(ModelOutcome, Option<ProviderUsage>)> {
     let body_bytes = read_response_limited(response, max_bytes).await?;
     let body = serde_json::from_slice::<ChatResponse>(&body_bytes)
         .context("The model response was not valid JSON")?;
@@ -1214,30 +1304,40 @@ async fn parse_response(
         .into_iter()
         .next()
         .context("The model response did not contain choices")?;
+    let truncated = choice.finish_reason.as_deref() == Some("length");
     if let Some(reason) = choice.finish_reason.as_deref() {
         validate_finish_reason(reason)?;
     }
     let mut message = choice.message;
     message.role = "assistant".into();
-    validate_assistant_message(&message)?;
-    Ok((message, usage))
+    if !truncated {
+        validate_assistant_message(&message)?;
+    }
+    Ok((ModelOutcome { message, truncated }, usage))
+}
+
+struct StreamState<'a> {
+    continuation: bool,
+    text: &'a mut StreamingText,
 }
 
 async fn parse_stream(
     response: reqwest::Response,
     max_chars: usize,
     events: Option<&EventSink>,
-) -> Result<(Message, Option<ProviderUsage>)> {
+    stream_state: &mut StreamState<'_>,
+) -> Result<(ModelOutcome, Option<ProviderUsage>)> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut content = String::new();
     let mut streamed_chars = 0_usize;
     let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
     let mut usage = None;
-    let mut stream_text = StreamingText::default();
     let mut done = false;
-    let mut finished = false;
-    if let Some(events) = events {
+    let mut finish_reason = None;
+    if !stream_state.continuation
+        && let Some(events) = events
+    {
         events.assistant_stream_start()?;
     }
     while !done {
@@ -1265,9 +1365,9 @@ async fn parse_stream(
                 &mut calls,
                 &mut streamed_chars,
                 max_chars,
-                &mut stream_text,
+                &mut *stream_state.text,
                 &mut usage,
-                &mut finished,
+                &mut finish_reason,
                 events,
             )? {
                 done = true;
@@ -1289,16 +1389,17 @@ async fn parse_stream(
                 &mut calls,
                 &mut streamed_chars,
                 max_chars,
-                &mut stream_text,
+                &mut *stream_state.text,
                 &mut usage,
-                &mut finished,
+                &mut finish_reason,
                 events,
             )?;
         }
     }
-    if !done && !finished {
+    if !done && finish_reason.is_none() {
         bail!("The model stream ended before a completion marker; incomplete response discarded");
     }
+    let truncated = finish_reason.as_deref() == Some("length");
     let message = Message {
         role: "assistant".into(),
         content: if content.is_empty() {
@@ -1313,12 +1414,14 @@ async fn parse_stream(
         },
         tool_call_id: None,
     };
-    validate_assistant_message(&message)?;
-    if let Some(events) = events {
-        stream_text.finish(events)?;
+    if !truncated {
+        validate_assistant_message(&message)?;
+    }
+    if !truncated && let Some(events) = events {
+        stream_state.text.finish(events)?;
         events.assistant_stream_complete()?;
     }
-    Ok((message, usage))
+    Ok((ModelOutcome { message, truncated }, usage))
 }
 
 #[derive(Default)]
@@ -1354,7 +1457,7 @@ fn apply_stream_data(
     max_chars: usize,
     stream_text: &mut StreamingText,
     usage: &mut Option<ProviderUsage>,
-    finished: &mut bool,
+    finish_reason: &mut Option<String>,
     events: Option<&EventSink>,
 ) -> Result<bool> {
     if data == "[DONE]" {
@@ -1373,7 +1476,7 @@ fn apply_stream_data(
     }
     if let Some(reason) = value["choices"][0]["finish_reason"].as_str() {
         validate_finish_reason(reason)?;
-        *finished = true;
+        *finish_reason = Some(reason.to_owned());
     }
     if let Some(provider_usage) = value.get("usage").filter(|usage| usage.is_object())
         && let Ok(provider_usage) = serde_json::from_value::<ProviderUsage>(provider_usage.clone())
@@ -1451,7 +1554,7 @@ fn http_client() -> Result<reqwest::Client> {
 }
 
 fn validate_finish_reason(reason: &str) -> Result<()> {
-    if !matches!(reason, "stop" | "tool_calls" | "function_call") {
+    if !matches!(reason, "stop" | "tool_calls" | "function_call" | "length") {
         bail!("The model response was incomplete: finish_reason={reason}");
     }
     Ok(())
@@ -1597,11 +1700,29 @@ async fn generate_summary(
         ),
         Message::user(source),
     ];
-    request_model(client, model, &messages, &[], None, None)
-        .await
-        .ok()
-        .and_then(|message| message.content)
-        .filter(|content| !content.trim().is_empty())
+    let mut stream_text = StreamingText::default();
+    request_model(
+        client,
+        model,
+        &messages,
+        &[],
+        None,
+        None,
+        StreamState {
+            continuation: false,
+            text: &mut stream_text,
+        },
+    )
+    .await
+    .ok()
+    .and_then(|outcome| {
+        if outcome.truncated {
+            None
+        } else {
+            outcome.message.content
+        }
+    })
+    .filter(|content| !content.trim().is_empty())
 }
 
 fn summary_source(previous: &str, messages: &[Message], max_chars: usize) -> String {
@@ -2192,7 +2313,7 @@ mod tests {
         server.join().unwrap();
     }
 
-    async fn parse_test_sse(body: &str) -> Result<(Message, Option<ProviderUsage>)> {
+    async fn parse_test_sse(body: &str) -> Result<(ModelOutcome, Option<ProviderUsage>)> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let body = body.to_string();
@@ -2206,13 +2327,194 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let result = parse_stream(response, 4096, None).await;
+        let mut stream_text = StreamingText::default();
+        let mut stream_state = StreamState {
+            continuation: false,
+            text: &mut stream_text,
+        };
+        let result = parse_stream(response, 4096, None, &mut stream_state).await;
         server.join().unwrap();
         result
     }
 
+    fn live_test_config(address: std::net::SocketAddr, stream: bool) -> Config {
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.storage.database = "agent.db".into();
+        config.knowledge.enabled = false;
+        config.models.insert(
+            "primary".into(),
+            ModelConfig {
+                base_url: format!("http://{address}/v1"),
+                model: "test".into(),
+                api_key: Some("key".into()),
+                context_window: 16_384,
+                max_output_tokens: 1_024,
+                stream,
+                ..ModelConfig::default()
+            },
+        );
+        config
+    }
+
+    async fn execute_live_test(
+        config: &Config,
+        store: &mut StateStore,
+        session: &str,
+        events: &EventSink,
+    ) -> Result<String> {
+        execute(
+            config,
+            store,
+            session,
+            "Test output limits",
+            events,
+            RunOptions {
+                source: "cli",
+                source_path: None,
+                assume_yes: true,
+                dry_run: false,
+                agents_md: None,
+                cancellation: None,
+            },
+        )
+        .await
+    }
+
     #[tokio::test]
-    async fn nonstreaming_responses_reject_truncation_even_with_valid_tool_arguments() {
+    async fn continues_nonstreaming_length_responses_with_audited_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for turn in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let body = if turn == 0 {
+                    serde_json::json!({"choices":[{
+                        "finish_reason":"length",
+                        "message":{"role":"assistant","content":"Hel"}
+                    }]})
+                } else {
+                    let request_body = request.split_once("\r\n\r\n").unwrap().1;
+                    let request: Value = serde_json::from_str(request_body).unwrap();
+                    let messages = request["messages"].as_array().unwrap();
+                    assert_eq!(messages[messages.len() - 2]["role"], "assistant");
+                    assert_eq!(messages[messages.len() - 2]["content"], "Hel");
+                    assert_eq!(messages[messages.len() - 1]["role"], "user");
+                    assert!(
+                        messages[messages.len() - 1]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("exact cutoff")
+                    );
+                    serde_json::json!({"choices":[{
+                        "finish_reason":"stop",
+                        "message":{"role":"assistant","content":"lo"}
+                    }]})
+                }
+                .to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = live_test_config(address, false);
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("test")).unwrap();
+        let answer = execute_live_test(
+            &config,
+            &mut store,
+            &session,
+            &EventSink::new(true, false, false),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(answer, "Hello");
+
+        let messages = store.load_messages(&session).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content.as_deref(), Some("Hello"));
+        let snapshots = store
+            .load_events(&session)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == crate::state::EventKind::RequestHeader)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].data["iteration"].as_u64(), Some(0));
+        assert_eq!(snapshots[1].data["iteration"].as_u64(), Some(1));
+        let continued_messages = snapshots[1].data["messages"].as_array().unwrap();
+        assert_eq!(
+            continued_messages[continued_messages.len() - 1]["content"],
+            RESPONSE_CONTINUATION_PROMPT
+        );
+        store.validate_session(&session).unwrap();
+    }
+
+    #[tokio::test]
+    async fn continued_stream_preserves_redaction_and_assistant_event_sequence() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for turn in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                let (reason, content) = if turn == 0 {
+                    ("length", "api")
+                } else {
+                    ("stop", "_key=secret")
+                };
+                let body = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: [DONE]\n\n"
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = live_test_config(address, true);
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("test")).unwrap();
+        let (events, receiver) = EventSink::new_tui(true, false);
+        let answer = execute_live_test(&config, &mut store, &session, &events)
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(answer, "api_key=secret");
+
+        let stream_events = receiver
+            .try_iter()
+            .filter(|event| event.event.starts_with("assistant_"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stream_events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "assistant_stream_start",
+                "assistant_delta",
+                "assistant_stream_complete"
+            ]
+        );
+        let displayed = stream_events
+            .iter()
+            .filter(|event| event.event == "assistant_delta")
+            .map(|event| event.message.as_str())
+            .collect::<String>();
+        assert!(displayed.contains("[REDACTED]"));
+        assert!(!displayed.contains("secret"));
+        let messages = store.load_messages(&session).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content.as_deref(), Some("api_key=secret"));
+    }
+
+    #[tokio::test]
+    async fn nonstreaming_responses_classify_length_and_reject_other_incomplete_reasons() {
         for reason in [
             Some("length"),
             Some("content_filter"),
@@ -2244,12 +2546,120 @@ mod tests {
                 .unwrap();
             let result = parse_response(response, 4096).await;
             server.join().unwrap();
-            if matches!(reason, None | Some("tool_calls")) {
-                assert_eq!(result.unwrap().0.tool_calls.unwrap().len(), 1);
-            } else {
-                assert!(result.unwrap_err().to_string().contains("incomplete"));
+            match reason {
+                None | Some("tool_calls") => {
+                    let outcome = result.unwrap().0;
+                    assert!(!outcome.truncated);
+                    assert_eq!(outcome.message.tool_calls.unwrap().len(), 1);
+                }
+                Some("length") => {
+                    let outcome = result.unwrap().0;
+                    assert!(outcome.truncated);
+                    assert_eq!(outcome.message.tool_calls.unwrap().len(), 1);
+                }
+                _ => assert!(result.unwrap_err().to_string().contains("incomplete")),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn length_continuations_are_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for turn in 0..=MAX_RESPONSE_CONTINUATIONS {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                let body = serde_json::json!({"choices":[{
+                    "finish_reason":"length",
+                    "message":{"role":"assistant","content":format!("part{turn}")}
+                }]})
+                .to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = live_test_config(address, false);
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("test")).unwrap();
+        let error = execute_live_test(
+            &config,
+            &mut store,
+            &session,
+            &EventSink::new(true, false, false),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("after 3 continuations"));
+        assert!(error.to_string().contains("max_output_tokens"));
+        let snapshots = store
+            .load_events(&session)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == crate::state::EventKind::RequestHeader)
+            .count();
+        assert_eq!(snapshots, (MAX_RESPONSE_CONTINUATIONS + 1) as usize);
+        assert_eq!(store.load_messages(&session).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_calls_are_never_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist");
+        let request_path = target.to_string_lossy().into_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            let body = serde_json::json!({"choices":[{
+                "finish_reason":"length",
+                "message":{
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[{
+                        "id":"call",
+                        "type":"function",
+                        "function":{
+                            "name":"write_file",
+                            "arguments":serde_json::json!({
+                                "path":request_path,
+                                "content":"must not be written"
+                            }).to_string()
+                        }
+                    }]
+                }
+            }]});
+            let body = body.to_string();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        let config = live_test_config(address, false);
+        let resolver =
+            ConfigPathResolver::new(Some(dir.path().join("config.toml")), false).unwrap();
+        let mut store = StateStore::open(&config, &resolver).unwrap();
+        let session = store.new_session(dir.path(), Some("test")).unwrap();
+        let error = execute_live_test(
+            &config,
+            &mut store,
+            &session,
+            &EventSink::new(true, false, false),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("no tool calls were executed"));
+        assert!(error.to_string().contains("max_output_tokens"));
+        assert!(!target.exists());
+        let events = store.load_events(&session).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != crate::state::EventKind::ToolCall)
+        );
+        assert_eq!(store.load_messages(&session).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2267,10 +2677,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_finish_reason_without_done_but_rejects_errors_and_length() {
+    async fn accepts_finish_reason_without_done_and_classifies_length() {
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n";
         assert_eq!(
-            parse_test_sse(body).await.unwrap().0.content.as_deref(),
+            parse_test_sse(body)
+                .await
+                .unwrap()
+                .0
+                .message
+                .content
+                .as_deref(),
             Some("hello")
         );
         assert!(
@@ -2278,11 +2694,16 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            parse_test_sse(&body.replace("stop", "length"))
-                .await
-                .is_err()
-        );
+        let truncated = parse_test_sse(&body.replace("stop", "length"))
+            .await
+            .unwrap()
+            .0;
+        assert!(truncated.truncated);
+        assert_eq!(truncated.message.content.as_deref(), Some("hello"));
+        let tool = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"length\"}]}\n\n";
+        let truncated = parse_test_sse(tool).await.unwrap().0;
+        assert!(truncated.truncated);
+        assert_eq!(truncated.message.tool_calls.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2303,6 +2724,21 @@ mod tests {
             "https://x/v1/chat/completions"
         );
     }
+    #[test]
+    fn request_snapshot_preserves_384k_output_limit() {
+        let model = ModelConfig {
+            model: "deepseek-test".into(),
+            max_output_tokens: 393_216,
+            ..ModelConfig::default()
+        };
+        let snapshot = build_request_snapshot(&model, &[Message::user("hello")], &[], 7).unwrap();
+        assert_eq!(snapshot.max_tokens, 393_216);
+        assert_eq!(
+            snapshot.input_sha256,
+            request_snapshot_hash(&snapshot).unwrap()
+        );
+    }
+
     #[test]
     fn truncates_tool_output() {
         assert!(truncate_tool_result(&"x".repeat(100), 10).contains("truncated"));
@@ -2807,10 +3243,22 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             supports_native_search: false,
         };
         let client = http_client().unwrap();
-        let message = request_model(&client, &model, &[Message::user("hello")], &[], None, None)
-            .await
-            .unwrap();
-        assert_eq!(message.content.as_deref(), Some("Hello"));
+        let mut stream_text = StreamingText::default();
+        let outcome = request_model(
+            &client,
+            &model,
+            &[Message::user("hello")],
+            &[],
+            None,
+            None,
+            StreamState {
+                continuation: false,
+                text: &mut stream_text,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.message.content.as_deref(), Some("Hello"));
         server.join().unwrap();
     }
 

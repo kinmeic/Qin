@@ -133,7 +133,7 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-4.1-mini"
 api_key_env = "QIN_API_KEY"
 context_window = 128000
-max_output_tokens = 4096
+max_output_tokens = 8192
 supports_native_search = false
 # Set true only when the provider/model can emit independent tool calls.
 supports_parallel_tools = false
@@ -141,6 +141,10 @@ supports_parallel_tools = false
 [context]
 compact_trigger_ratio = 0.9
 ```
+
+When a model response ends with `finish_reason=length`, qin automatically continues a non-empty, text-only response up to three times and stores the combined answer as one assistant message. These continuation requests use the same request auditing, cancellation, context-budget, and runtime limits as the initial request. A response truncated during a tool call is rejected before persistence or execution; qin never tries to run partial tool arguments. If this happens, or if three continuations are not enough, increase the active model's `max_output_tokens` and set `context.reserve_output_tokens` to at least that value, within the provider's supported limits.
+
+Qin accepts `max_output_tokens` values up to 393216 (384K), although the provider's own limit may be lower. The default remains 8192 for broad provider compatibility. To match DeepSeek's documented 64K thinking-mode default, explicitly set both `max_output_tokens` and `context.reserve_output_tokens` to 65536. A larger output reservation reduces the available input budget, so `context_window` must still leave room for input, safety reserves, and tool-result headroom.
 
 Keep API keys in environment variables whenever possible instead of storing secrets directly in the configuration file.
 

@@ -1582,6 +1582,23 @@ mod tests {
     }
 
     #[test]
+    fn continued_streamed_answer_is_not_duplicated_at_completion() {
+        let mut app = app();
+        let mut screen = ScreenGuard { active: false };
+        for event in [
+            ui_event("assistant_stream_start", ""),
+            ui_event("assistant_delta", "Hel"),
+            ui_event("assistant_delta", "lo"),
+            ui_event("assistant_stream_complete", ""),
+            ui_event("final_answer", "Hello"),
+        ] {
+            app.handle_event(event, &mut screen).unwrap();
+        }
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].text, "Hello");
+    }
+
+    #[test]
     fn restored_answers_and_chunked_command_output_keep_alignment() {
         let table = "| 名称 | 数量 |\n| --- | --- |\n| 中文 | 2 |";
         let restored = App::new(

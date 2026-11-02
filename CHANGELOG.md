@@ -2,6 +2,12 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.8
+
+- Automatically continued non-empty text responses truncated by the provider output limit, preserving audited requests, TUI streaming, and cross-continuation secret redaction. Truncated tool calls remain rejected before execution.
+- Raised the configurable `max_output_tokens` ceiling to 393216 (384K) for supported DeepSeek models while retaining the 8192 default and documenting output-reserve requirements.
+- Added regression coverage for continuation limits, request snapshots, tool-call safety, TUI answer deduplication, and output-token configuration boundaries.
+
 ## 0.6.7
 
 - Updated vulnerable and unsound transitive dependencies reported by the security audit.
