@@ -18,6 +18,7 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tokio::sync::watch;
 use unicode_width::UnicodeWidthStr;
 
+use crate::approval::ApprovalMode;
 use crate::event::{self as qin_event, EventSink, TuiEvent};
 use crate::state::{StateStore, StoredMessage};
 use crate::system_stats::{Sampler, SystemStats};
@@ -33,66 +34,19 @@ const INPUT_PLACEHOLDER: Color = Color::Rgb(0x7D, 0x81, 0x85);
 enum WorkerRequest {
     Prompt {
         prompt: String,
-        approval_mode: ApprovalMode,
+        approval_mode: watch::Receiver<ApprovalMode>,
         cancellation: watch::Receiver<bool>,
     },
     NewSession,
     Shutdown,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ApprovalMode {
-    Always,
-    OnRisk,
-    Auto,
-    Yolo,
-}
-
-impl ApprovalMode {
-    fn from_config(policy: &str, assume_yes: bool) -> Self {
-        if assume_yes {
-            return Self::Auto;
-        }
-        match policy {
-            "always" => Self::Always,
-            "never" => Self::Auto,
-            _ => Self::OnRisk,
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Always => Self::OnRisk,
-            Self::OnRisk => Self::Auto,
-            Self::Auto => Self::Yolo,
-            Self::Yolo => Self::Always,
-        }
-    }
-
-    fn policy(self) -> &'static str {
-        match self {
-            Self::Always => "always",
-            Self::OnRisk => "on_risk",
-            Self::Auto | Self::Yolo => "never",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Always => "always",
-            Self::OnRisk => "on risk",
-            Self::Auto => "auto",
-            Self::Yolo => "YOLO",
-        }
-    }
-
-    fn color(self) -> Color {
-        match self {
-            Self::Always => Color::Yellow,
-            Self::OnRisk => Color::Green,
-            Self::Auto => Color::Yellow,
-            Self::Yolo => Color::LightRed,
-        }
+fn approval_color(mode: ApprovalMode) -> Color {
+    match mode {
+        ApprovalMode::Always => Color::Yellow,
+        ApprovalMode::OnRisk => Color::Green,
+        ApprovalMode::Auto => Color::Yellow,
+        ApprovalMode::Yolo => Color::LightRed,
     }
 }
 
@@ -130,13 +84,13 @@ struct App {
     active_command_output: Option<(String, usize)>,
     busy: bool,
     cancellation: Option<watch::Sender<bool>>,
+    approval_updates: Option<watch::Sender<ApprovalMode>>,
     pending_approval: Option<PendingApproval>,
     confirmation: Option<Confirmation>,
     status: String,
     session_id: String,
     backend: String,
     approval_mode: ApprovalMode,
-    active_approval_mode: Option<ApprovalMode>,
     model_name: String,
     context_window: u64,
     context_tokens: Option<u64>,
@@ -197,13 +151,13 @@ impl App {
             active_command_output: None,
             busy: false,
             cancellation: None,
+            approval_updates: None,
             pending_approval: None,
             confirmation: None,
             status: "Ready".into(),
             session_id,
             backend,
             approval_mode,
-            active_approval_mode: None,
             model_name,
             context_window,
             context_tokens: None,
@@ -231,15 +185,18 @@ impl App {
                 || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT)))
         {
             self.approval_mode = self.approval_mode.next();
-            self.status = format!(
-                "Approval: {}{}",
-                self.approval_mode.label(),
-                if self.busy {
-                    " · applies to next turn"
-                } else {
-                    ""
-                },
-            );
+            if self.busy
+                && let Some(updates) = &self.approval_updates
+            {
+                let _ = updates.send(self.approval_mode);
+            }
+            self.status = format!("Approval: {}", self.approval_mode.label());
+            if self.approval_mode == ApprovalMode::Yolo
+                && let Some(approval) = self.pending_approval.take()
+            {
+                let _ = approval.reply.send("y".into());
+                self.status = "Approval granted (YOLO)".into();
+            }
             return;
         }
 
@@ -375,10 +332,11 @@ impl App {
             return;
         }
         let (cancel_sender, cancel_receiver) = watch::channel(false);
+        let (approval_sender, approval_receiver) = watch::channel(self.approval_mode);
         if requests
             .send(WorkerRequest::Prompt {
                 prompt: prompt.clone(),
-                approval_mode: self.approval_mode,
+                approval_mode: approval_receiver,
                 cancellation: cancel_receiver,
             })
             .is_err()
@@ -397,10 +355,10 @@ impl App {
         self.input.clear();
         self.history_index = None;
         self.busy = true;
-        self.active_approval_mode = Some(self.approval_mode);
         self.streaming_index = None;
         self.last_streamed_answer = None;
         self.cancellation = Some(cancel_sender);
+        self.approval_updates = Some(approval_sender);
         self.input_token_usage = 0;
         self.output_token_usage = 0;
         self.token_usage_available = false;
@@ -414,7 +372,7 @@ impl App {
     fn run_slash_command(&mut self, prompt: &str, requests: &Sender<WorkerRequest>) {
         match prompt.trim() {
             "/help" => self.push_activity(
-                "Commands: /new starts a session, /help shows this help, /exit quits. Enter sends; Ctrl+J inserts a newline; Ctrl+C cancels the current turn. Shift+Tab cycles approval: always → on risk → auto → YOLO. Changes apply to the next turn. Auto still asks for high-risk actions; YOLO skips all tool approvals but keeps tool restrictions and forbidden-command rules. Mode changes last for this TUI session.",
+                "Commands: /new starts a session, /help shows this help, /exit quits. Enter sends; Ctrl+J inserts a newline; Ctrl+C cancels the current turn. Shift+Tab cycles approval: always → on risk → auto → YOLO. Changes apply immediately, including to the current turn. Auto still asks for high-risk actions; YOLO skips all tool approvals but keeps tool restrictions and forbidden-command rules. Mode changes last for this TUI session.",
             ),
             "/new" => self.begin_new_session(requests),
             "/exit" | "/quit" => {
@@ -661,12 +619,17 @@ impl App {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 if let Some(reply) = event.approval_reply {
-                    self.pending_approval = Some(PendingApproval {
-                        message: qin_event::sanitize_terminal(&qin_event::redact(&message)),
-                        allow_all,
-                        reply,
-                    });
-                    self.status = "Approval required".into();
+                    if self.approval_mode == ApprovalMode::Yolo {
+                        let _ = reply.send("y".into());
+                        self.status = "Approval granted (YOLO)".into();
+                    } else {
+                        self.pending_approval = Some(PendingApproval {
+                            message: qin_event::sanitize_terminal(&qin_event::redact(&message)),
+                            allow_all,
+                            reply,
+                        });
+                        self.status = "Approval required".into();
+                    }
                 } else {
                     self.push_activity(&message);
                 }
@@ -699,8 +662,8 @@ impl App {
                 self.streaming_index = None;
                 self.active_command_output = None;
                 self.busy = false;
-                self.active_approval_mode = None;
                 self.cancellation = None;
+                self.approval_updates = None;
                 if !message.is_empty() {
                     if message.contains("canceled by the user")
                         || message.contains("cancelled by the user")
@@ -724,8 +687,8 @@ impl App {
                 self.status = "New session".into();
                 self.scroll_from_bottom = 0;
                 self.busy = false;
-                self.active_approval_mode = None;
                 self.cancellation = None;
+                self.approval_updates = None;
                 self.input_token_usage = 0;
                 self.output_token_usage = 0;
                 self.token_usage_available = false;
@@ -741,8 +704,15 @@ impl App {
                 }
                 self.push_activity(&message);
             }
-            "tool_started" | "tool_finished" | "command_heartbeat" | "phase" | "warning"
-            | "tool_warning" | "success" | "approval_decided" => self.push_activity(&message),
+            "tool_finished" => {
+                if let Some(stats) = diff_stats(event.data.as_ref()) {
+                    self.push_activity(&format!("{message}  {stats}"));
+                } else {
+                    self.push_activity(&message);
+                }
+            }
+            "tool_started" | "command_heartbeat" | "phase" | "warning" | "tool_warning"
+            | "success" | "approval_decided" => self.push_activity(&message),
             _ => {
                 if !message.is_empty() {
                     self.push_activity(&message);
@@ -883,10 +853,11 @@ fn start_worker(
                         approval_mode,
                         cancellation,
                     } => {
-                        // Snapshot the selected policy for the entire turn, including its
-                        // system prompt. Later UI changes take effect on the next request.
-                        config.permissions.approval = approval_mode.policy().into();
-                        config.permissions.yolo = approval_mode == ApprovalMode::Yolo;
+                        // Seed the turn from the selected policy, then keep checking
+                        // the watch receiver so later UI changes apply immediately.
+                        let selected_mode = *approval_mode.borrow();
+                        config.permissions.approval = selected_mode.policy().into();
+                        config.permissions.yolo = selected_mode == ApprovalMode::Yolo;
                         let result = runtime.block_on(crate::execute_with(
                             &config,
                             &mut store,
@@ -899,6 +870,7 @@ fn start_worker(
                             false,
                             dry_run,
                             Some(cancellation),
+                            Some(approval_mode),
                         ));
                         let message = result
                             .err()
@@ -1367,6 +1339,21 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
+fn diff_stats(data: Option<&serde_json::Value>) -> Option<String> {
+    let stats = data?
+        .get("diffs")?
+        .as_array()?
+        .iter()
+        .filter_map(|diff| {
+            let path = diff.get("path")?.as_str()?;
+            let added = diff.get("added_lines")?.as_u64()?;
+            let removed = diff.get("removed_lines")?.as_u64()?;
+            Some(format!("{path}  +{added} -{removed}"))
+        })
+        .collect::<Vec<_>>();
+    (!stats.is_empty()).then(|| stats.join("  "))
+}
+
 fn format_token_count(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}M", value as f64 / 1_000_000.0)
@@ -1378,14 +1365,7 @@ fn format_token_count(value: u64) -> String {
 }
 
 fn info_line(app: &App, width: u16) -> Line<'static> {
-    let next_turn = app
-        .active_approval_mode
-        .is_some_and(|mode| mode != app.approval_mode);
-    let approval = format!(
-        "{}{}",
-        app.approval_mode.label(),
-        if next_turn { " (next)" } else { "" }
-    );
+    let approval = app.approval_mode.label();
     let context = app.context_tokens.map_or_else(
         || "CTX:-- / --%".into(),
         |tokens| {
@@ -1418,7 +1398,10 @@ fn info_line(app: &App, width: u16) -> Line<'static> {
     let status = ellipsize(&status_text, available.saturating_sub(model.width()));
     let divider = || Span::styled(" · ", Style::default().fg(Color::DarkGray));
     Line::from(vec![
-        Span::styled(approval, Style::default().fg(app.approval_mode.color())),
+        Span::styled(
+            approval,
+            Style::default().fg(approval_color(app.approval_mode)),
+        ),
         divider(),
         Span::styled(model, Style::default().fg(Color::Cyan)),
         divider(),
@@ -1562,6 +1545,69 @@ mod tests {
             .unwrap();
         assert!(app.pending_approval.is_none());
         assert!(!app.busy);
+    }
+
+    #[test]
+    fn switching_to_yolo_updates_the_live_turn_and_answers_pending_approval() {
+        let mut app = app();
+        let (requests, _receiver) = mpsc::channel();
+        let (updates, mode) = watch::channel(ApprovalMode::OnRisk);
+        let (reply, answer) = mpsc::sync_channel(1);
+        app.busy = true;
+        app.approval_updates = Some(updates);
+        app.pending_approval = Some(PendingApproval {
+            message: "Modify file?".into(),
+            allow_all: false,
+            reply,
+        });
+
+        for _ in 0..2 {
+            app.handle_key(
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                &requests,
+            );
+        }
+
+        assert_eq!(*mode.borrow(), ApprovalMode::Yolo);
+        assert!(app.pending_approval.is_none());
+        assert_eq!(answer.try_recv().unwrap(), "y");
+    }
+
+    #[test]
+    fn yolo_answers_an_approval_event_that_arrives_after_the_switch() {
+        let mut app = app();
+        let mut screen = ScreenGuard { active: false };
+        let (reply, answer) = mpsc::sync_channel(1);
+        app.approval_mode = ApprovalMode::Yolo;
+        let mut event = ui_event("approval_required", "Modify file?");
+        event.approval_reply = Some(reply);
+
+        app.handle_event(event, &mut screen).unwrap();
+
+        assert!(app.pending_approval.is_none());
+        assert_eq!(answer.try_recv().unwrap(), "y");
+    }
+
+    #[test]
+    fn patch_completion_includes_path_and_line_stats() {
+        let mut app = app();
+        let mut screen = ScreenGuard { active: false };
+        let mut event = ui_event("tool_finished", "✓ apply_patch  0.01s  Patch applied");
+        event.data = Some(serde_json::json!({
+            "diffs": [{
+                "path": "/root/NaivePanel/install.sh",
+                "added_lines": 1,
+                "removed_lines": 2,
+                "content_redacted": true
+            }]
+        }));
+
+        app.handle_event(event, &mut screen).unwrap();
+
+        assert_eq!(
+            app.entries[0].text,
+            "✓ apply_patch  0.01s  Patch applied  /root/NaivePanel/install.sh  +1 -2"
+        );
     }
 
     #[test]

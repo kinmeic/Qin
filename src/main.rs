@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::agent::RunOptions;
+use crate::approval::ApprovalMode;
 use crate::cli::{Cli, Command, ConfigCommand, KnowledgeCommand, MemoryCommand};
 use crate::config::{ConfigPathResolver, InitOptions};
 use crate::event::EventSink;
@@ -154,6 +155,7 @@ async fn run() -> Result<()> {
                     &events,
                     assume_yes,
                     dry_run,
+                    None,
                     None,
                 )
                 .await?;
@@ -409,6 +411,7 @@ async fn execute_from_file(
         yes,
         dry_run,
         None,
+        None,
     )
     .await
 }
@@ -463,6 +466,7 @@ async fn execute_prompt(
         yes,
         dry_run,
         None,
+        None,
     )
     .await
 }
@@ -498,6 +502,7 @@ pub(crate) async fn execute_with(
     yes: bool,
     dry_run: bool,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    approval_mode: Option<tokio::sync::watch::Receiver<ApprovalMode>>,
 ) -> Result<()> {
     let _session_lock = store.lock_session(id)?;
     let recovered = store.recover_session(id)?;
@@ -519,6 +524,7 @@ pub(crate) async fn execute_with(
             dry_run,
             agents_md,
             cancellation,
+            approval_mode,
         },
     )
     .await;

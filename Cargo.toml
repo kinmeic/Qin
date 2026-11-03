@@ -1,6 +1,6 @@
 [package]
 name = "qin"
-version = "0.6.8"
+version = "0.6.9"
 edition = "2024"
 rust-version = "1.88"
 description = "Use natural language to operate Linux, macOS, and OpenWrt without memorizing commands or flags"
@@ -31,6 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"
 sha2 = "0.10"
+similar = { version = "2", default-features = false, features = ["text"] }
 semver = "1"
 tempfile = "3"
 tar = "0.4"

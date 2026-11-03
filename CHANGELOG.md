@@ -2,6 +2,13 @@
 
 All notable changes to `qin` are documented here.
 
+## 0.6.9
+
+- Applied TUI approval-mode changes immediately to the active turn. Switching to YOLO now approves pending and subsequent tool requests without leaving stale confirmation dialogs, while tool restrictions and forbidden-command rules remain enforced.
+- Added real line-based `+added -removed` statistics to completed `apply_patch` activity without exposing patch contents in event metadata.
+- Retried transient model response-body read failures for non-streaming responses and for streams before any model output, without duplicating TUI stream starts; streams with partial output still fail rather than risking duplicate content or tool calls.
+- Added regression coverage for live approval changes, diff statistics, interrupted response bodies, and the TUI pseudo-terminal workflow.
+
 ## 0.6.8
 
 - Automatically continued non-empty text responses truncated by the provider output limit, preserving audited requests, TUI streaming, and cross-continuation secret redaction. Truncated tool calls remain rejected before execution.

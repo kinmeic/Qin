@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::approval::ApprovalMode;
 use crate::config::{COMPACT_TARGET_RATIO, Config, ModelConfig};
 use crate::event::EventSink;
 use crate::knowledge;
@@ -194,6 +195,7 @@ pub struct RunOptions<'a> {
     pub dry_run: bool,
     pub agents_md: Option<&'a str>,
     pub cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    pub approval_mode: Option<tokio::sync::watch::Receiver<ApprovalMode>>,
 }
 
 enum ModelResponder<'a> {
@@ -461,6 +463,7 @@ pub async fn execute_replay(
             dry_run,
             agents_md: None,
             cancellation: None,
+            approval_mode: None,
         };
         let answer = run_loop(
             &replay_config,
@@ -586,6 +589,7 @@ async fn run_loop(
                         StreamState {
                             continuation: continuing,
                             text: &mut stream_text,
+                            received_output: false,
                         },
                     ),
                 ) => result
@@ -715,6 +719,7 @@ async fn run_loop(
                     &call.function.arguments,
                     config,
                     cwd,
+                    options.approval_mode.as_ref(),
                 )
             });
         if parallel {
@@ -729,6 +734,7 @@ async fn run_loop(
                 messages,
                 started,
                 options.cancellation.clone(),
+                options.approval_mode.clone(),
             )
             .await?;
             continue;
@@ -783,6 +789,7 @@ async fn run_loop(
                     approve_all_commands: &mut approve_all_commands,
                     dry_run: options.dry_run,
                     cancellation: options.cancellation.clone(),
+                    approval_mode: options.approval_mode.clone(),
                     deadline: Some(started + Duration::from_secs(config.agent.wall_time_seconds)),
                 };
                 let execution = tokio::select! {
@@ -899,6 +906,7 @@ async fn execute_parallel_tools(
     messages: &mut Vec<Message>,
     started: tokio::time::Instant,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    approval_mode: Option<tokio::sync::watch::Receiver<ApprovalMode>>,
 ) -> Result<()> {
     let remaining = match remaining_time(config, started) {
         Ok(remaining) => remaining,
@@ -939,11 +947,19 @@ async fn execute_parallel_tools(
         let arguments = call.function.arguments.clone();
         let config = config.clone();
         let cwd = cwd.to_path_buf();
+        let approval_mode = approval_mode.clone();
         let call_started = tokio::time::Instant::now();
         futures.push(async move {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let worker = tokio::task::spawn_blocking(move || {
-                tools::execute_parallel_read_only(&call_id, &name, &arguments, &config, &cwd)
+                tools::execute_parallel_read_only(
+                    &call_id,
+                    &name,
+                    &arguments,
+                    &config,
+                    &cwd,
+                    approval_mode,
+                )
             });
             let (result, interrupted) = match tokio::time::timeout(remaining, worker).await {
                 Ok(Ok(result)) => (result.map_err(|error| format!("{error:#}")), false),
@@ -1217,7 +1233,8 @@ async fn request_model(
             .await;
         match response {
             Ok(response) if response.status().is_success() => {
-                let (outcome, usage) = if model.stream {
+                stream_state.received_output = false;
+                let parsed = if model.stream {
                     parse_stream(
                         response,
                         model.max_output_tokens.saturating_mul(8) as usize,
@@ -1231,7 +1248,22 @@ async fn request_model(
                         model.max_output_tokens.saturating_mul(16) as usize,
                     )
                     .await
-                }?;
+                };
+                let (outcome, usage) = match parsed {
+                    Ok(parsed) => parsed,
+                    Err(error)
+                        if is_response_body_error(&error)
+                            && (!model.stream || !stream_state.received_output) =>
+                    {
+                        last_error = Some(format!("{error:#}"));
+                        if attempt < 3 {
+                            tokio::time::sleep(Duration::from_millis(500 * 2_u64.pow(attempt)))
+                                .await;
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if let Some(events) = events {
                     let estimated_input =
                         estimate_messages(messages).saturating_add(estimate_schemas(tools));
@@ -1291,6 +1323,14 @@ async fn request_model(
     )
 }
 
+fn is_response_body_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_body)
+    })
+}
+
 async fn parse_response(
     response: reqwest::Response,
     max_bytes: usize,
@@ -1319,6 +1359,7 @@ async fn parse_response(
 struct StreamState<'a> {
     continuation: bool,
     text: &'a mut StreamingText,
+    received_output: bool,
 }
 
 async fn parse_stream(
@@ -1336,9 +1377,11 @@ async fn parse_stream(
     let mut done = false;
     let mut finish_reason = None;
     if !stream_state.continuation
+        && !stream_state.text.started
         && let Some(events) = events
     {
         events.assistant_stream_start()?;
+        stream_state.text.started = true;
     }
     while !done {
         let next = tokio::time::timeout(Duration::from_secs(120), stream.next())
@@ -1359,7 +1402,7 @@ async fn parse_stream(
             let Some(data) = line.strip_prefix("data:").map(str::trim_start) else {
                 continue;
             };
-            if apply_stream_data(
+            let data_done = apply_stream_data(
                 data,
                 &mut content,
                 &mut calls,
@@ -1369,7 +1412,9 @@ async fn parse_stream(
                 &mut usage,
                 &mut finish_reason,
                 events,
-            )? {
+            )?;
+            stream_state.received_output |= !content.is_empty() || !calls.is_empty();
+            if data_done {
                 done = true;
                 break;
             }
@@ -1427,6 +1472,7 @@ async fn parse_stream(
 #[derive(Default)]
 struct StreamingText {
     redactor: crate::event::StreamRedactor,
+    started: bool,
 }
 
 impl StreamingText {
@@ -1711,6 +1757,7 @@ async fn generate_summary(
         StreamState {
             continuation: false,
             text: &mut stream_text,
+            received_output: false,
         },
     )
     .await
@@ -2270,6 +2317,7 @@ mod tests {
             dry_run: false,
             agents_md: None,
             cancellation: Some(receiver),
+            approval_mode: None,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(3),
@@ -2331,6 +2379,7 @@ mod tests {
         let mut stream_state = StreamState {
             continuation: false,
             text: &mut stream_text,
+            received_output: false,
         };
         let result = parse_stream(response, 4096, None, &mut stream_state).await;
         server.join().unwrap();
@@ -2376,6 +2425,7 @@ mod tests {
                 dry_run: false,
                 agents_md: None,
                 cancellation: None,
+                approval_mode: None,
             },
         )
         .await
@@ -2860,6 +2910,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
                 dry_run: false,
                 agents_md: None,
                 cancellation: None,
+                approval_mode: None,
             },
         )
         .await
@@ -3040,6 +3091,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
                 dry_run: false,
                 agents_md: None,
                 cancellation: None,
+                approval_mode: None,
             },
         )
         .await
@@ -3102,6 +3154,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
                 dry_run: false,
                 agents_md: None,
                 cancellation: None,
+                approval_mode: None,
             },
         )
         .await;
@@ -3204,6 +3257,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             &mut messages,
             started,
             None,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -3216,6 +3270,157 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             .finish_turn(&session, turn_id, "failed", None)
             .unwrap();
         store.validate_session(&session).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_a_nonstreaming_response_body_read_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = serde_json::json!({"choices":[{
+            "finish_reason":"stop",
+            "message":{"role":"assistant","content":"recovered"}
+        }]})
+        .to_string();
+        let server = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                if attempt == 0 {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{{\"choices\":["
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let config = live_test_config(address, false);
+        let client = http_client().unwrap();
+        let mut stream_text = StreamingText::default();
+        let outcome = request_model(
+            &client,
+            config.primary_model().unwrap(),
+            &[Message::user("hello")],
+            &[],
+            None,
+            None,
+            StreamState {
+                continuation: false,
+                text: &mut stream_text,
+                received_output: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.message.content.as_deref(), Some("recovered"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_a_stream_body_failure_before_output_without_duplicate_start() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
+        let server = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                if attempt == 0 {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\ndata: {{\"choices\":["
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let config = live_test_config(address, true);
+        let client = http_client().unwrap();
+        let (events, receiver) = EventSink::new_tui(true, false);
+        let mut stream_text = StreamingText::default();
+        let outcome = request_model(
+            &client,
+            config.primary_model().unwrap(),
+            &[Message::user("hello")],
+            &[],
+            None,
+            Some(&events),
+            StreamState {
+                continuation: false,
+                text: &mut stream_text,
+                received_output: false,
+            },
+        )
+        .await
+        .unwrap();
+        drop(events);
+
+        assert_eq!(outcome.message.content.as_deref(), Some("Hello"));
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "assistant_stream_start")
+                .count(),
+            1
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_a_stream_body_failure_after_partial_output() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len() + 128,
+                body
+            )
+            .unwrap();
+        });
+        let config = live_test_config(address, true);
+        let client = http_client().unwrap();
+        let mut stream_text = StreamingText::default();
+        let error = request_model(
+            &client,
+            config.primary_model().unwrap(),
+            &[Message::user("hello")],
+            &[],
+            None,
+            None,
+            StreamState {
+                continuation: false,
+                text: &mut stream_text,
+                received_output: false,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!format!("{error:#}").contains("after retries"), "{error:#}");
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -3254,6 +3459,7 @@ PRETTY_NAME="Ubuntu 22.04.5 LTS"
             StreamState {
                 continuation: false,
                 text: &mut stream_text,
+                received_output: false,
             },
         )
         .await

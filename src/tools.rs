@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::approval::{ApprovalOutcome, ApprovalRequest};
+use crate::approval::{ApprovalMode, ApprovalOutcome, ApprovalRequest};
 use crate::checkpoint::Recorder;
 use crate::config::Config;
 use crate::event::{EventSink, redact};
@@ -31,6 +31,7 @@ pub struct ToolContext<'a> {
     pub approve_all_commands: &'a mut bool,
     pub dry_run: bool,
     pub cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    pub approval_mode: Option<tokio::sync::watch::Receiver<ApprovalMode>>,
     pub deadline: Option<tokio::time::Instant>,
 }
 
@@ -321,7 +322,9 @@ fn authorize_tool(
     if !definition.availability.enabled(ctx.config) {
         bail!("Tool {name} is disabled by the current configuration");
     }
-    if ctx.config.permissions.approval == "always" && risk(name) == "read_only" {
+    if current_approval_mode(ctx.config, ctx.approval_mode.as_ref()) == ApprovalMode::Always
+        && risk(name) == "read_only"
+    {
         approve(ctx, &format!("Allow read-only tool {name}? [y/N] "), false)?;
     }
     Ok(())
@@ -592,11 +595,19 @@ fn stat_path_at(path: &Path) -> Result<ToolResult> {
 /// Returns true only for local, read-only calls that do not need shared
 /// approval or state. The caller still rechecks this condition inside the
 /// worker before touching the filesystem.
-pub fn is_parallel_read_only(name: &str, arguments: &str, config: &Config, cwd: &Path) -> bool {
+pub fn is_parallel_read_only(
+    name: &str,
+    arguments: &str,
+    config: &Config,
+    cwd: &Path,
+    approval_mode: Option<&tokio::sync::watch::Receiver<ApprovalMode>>,
+) -> bool {
     let Some(definition) = find_tool_definition(name) else {
         return false;
     };
-    if config.permissions.approval == "always" || !definition.parallel_read_only {
+    if current_approval_mode(config, approval_mode) == ApprovalMode::Always
+        || !definition.parallel_read_only
+    {
         return false;
     }
     let Ok(args) = serde_json::from_str::<Value>(arguments) else {
@@ -621,8 +632,9 @@ pub fn execute_parallel_read_only(
     arguments: &str,
     config: &Config,
     cwd: &Path,
+    approval_mode: Option<tokio::sync::watch::Receiver<ApprovalMode>>,
 ) -> Result<ToolResult> {
-    if !is_parallel_read_only(name, arguments, config, cwd) {
+    if !is_parallel_read_only(name, arguments, config, cwd, approval_mode.as_ref()) {
         bail!("Tool {name} is not eligible for parallel read-only execution");
     }
     let args: Value = serde_json::from_str(arguments)?;
@@ -972,8 +984,9 @@ async fn shell(args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     }
     let invokes_elevation = invokes_elevation(command);
     let high_risk = elevated || dangerous(command) || invokes_elevation;
-    let needs_approval =
-        high_risk || ctx.config.permissions.approval == "always" || !is_read_only_command(command);
+    let needs_approval = high_risk
+        || current_approval_mode(ctx.config, ctx.approval_mode.as_ref()) == ApprovalMode::Always
+        || !is_read_only_command(command);
     if needs_approval && (high_risk || !*ctx.approve_all_commands) {
         let choices = if high_risk { "[y/N]" } else { "[y/N/All]" };
         let message = if ctx.events.shows_command_details() {
@@ -1890,6 +1903,22 @@ async fn read_json_limited(response: reqwest::Response, max_bytes: usize) -> Res
     Ok(serde_json::from_slice(&body)?)
 }
 
+fn current_approval_mode(
+    config: &Config,
+    updates: Option<&tokio::sync::watch::Receiver<ApprovalMode>>,
+) -> ApprovalMode {
+    updates.map_or_else(
+        || {
+            if config.permissions.yolo {
+                ApprovalMode::Yolo
+            } else {
+                ApprovalMode::from_config(&config.permissions.approval, false)
+            }
+        },
+        |mode| *mode.borrow(),
+    )
+}
+
 fn approve_path_mutation(
     ctx: &mut ToolContext<'_>,
     message: &str,
@@ -1903,7 +1932,12 @@ fn approve_path_mutation(
         return Ok(());
     }
     let external = paths.iter().any(|path| is_external_path(ctx.cwd, path));
-    if auto_approves_path_mutation(ctx.config, ctx.cwd, paths, reversible_without_overwrite) {
+    if auto_approves_path_mutation(
+        current_approval_mode(ctx.config, ctx.approval_mode.as_ref()),
+        ctx.cwd,
+        paths,
+        reversible_without_overwrite,
+    ) {
         return Ok(());
     }
     let prompt = path_mutation_prompt(message);
@@ -1915,12 +1949,12 @@ fn path_mutation_prompt(message: &str) -> String {
 }
 
 fn auto_approves_path_mutation(
-    config: &Config,
+    approval_mode: ApprovalMode,
     cwd: &Path,
     paths: &[&Path],
     reversible_without_overwrite: bool,
 ) -> bool {
-    config.permissions.approval == "on_risk"
+    approval_mode == ApprovalMode::OnRisk
         && reversible_without_overwrite
         && paths.iter().all(|path| !is_external_path(cwd, path))
 }
@@ -1949,13 +1983,14 @@ enum ApprovalAnswer {
 }
 
 fn approve(ctx: &mut ToolContext<'_>, message: &str, high_risk: bool) -> Result<()> {
-    if ctx.config.permissions.yolo {
+    let approval_mode = current_approval_mode(ctx.config, ctx.approval_mode.as_ref());
+    if approval_mode == ApprovalMode::Yolo {
         return Ok(());
     }
     if ctx.assume_yes && !high_risk {
         return Ok(());
     }
-    if ctx.config.permissions.approval == "never" && !high_risk {
+    if approval_mode == ApprovalMode::Auto && !high_risk {
         return Ok(());
     }
     match request_approval(ctx, message, high_risk, false)? {
@@ -1975,13 +2010,14 @@ fn approve_command(
     message: &str,
     high_risk: bool,
 ) -> Result<ApprovalDecision> {
-    if ctx.config.permissions.yolo {
+    let approval_mode = current_approval_mode(ctx.config, ctx.approval_mode.as_ref());
+    if approval_mode == ApprovalMode::Yolo {
         return Ok(ApprovalDecision::Once);
     }
     if ctx.assume_yes && !high_risk {
         return Ok(ApprovalDecision::Once);
     }
-    if ctx.config.permissions.approval == "never" && !high_risk {
+    if approval_mode == ApprovalMode::Auto && !high_risk {
         return Ok(ApprovalDecision::Once);
     }
     match request_approval(ctx, message, high_risk, !high_risk)? {
@@ -3385,6 +3421,19 @@ fn display_args(name: &str, args: &Value) -> String {
         .unwrap_or_else(|| one_line(&truncate(safe_args(name, args), 200)))
 }
 
+fn line_diff_stats(old_text: &str, new_text: &str) -> (u64, u64) {
+    let mut added = 0_u64;
+    let mut removed = 0_u64;
+    for change in similar::TextDiff::from_lines(old_text, new_text).iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => added += 1,
+            similar::ChangeTag::Delete => removed += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (added, removed)
+}
+
 /// Builds renderer-only metadata for JSON event consumers. It deliberately
 /// describes the card and affected locations without copying file contents or
 /// raw command arguments into the event stream.
@@ -3420,10 +3469,13 @@ fn tool_presentation(call_id: &str, name: &str, args: &Value, cwd: &Path) -> Val
             args.get("new_text").and_then(Value::as_str),
         )
     {
+        let (added_lines, removed_lines) = line_diff_stats(old_text, new_text);
         data["diffs"] = json!([{
             "path": presentation_path(path),
             "old_bytes": old_text.len(),
             "new_bytes": new_text.len(),
+            "added_lines": added_lines,
+            "removed_lines": removed_lines,
             "content_redacted": true,
         }]);
     } else if name == "write_file"
@@ -3645,6 +3697,7 @@ mod tests {
             approve_all_commands: all,
             dry_run: false,
             cancellation: None,
+            approval_mode: None,
             deadline: None,
         }
     }
@@ -3771,6 +3824,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_yolo_bypasses_file_and_high_risk_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, mut store, session) = audit_store(dir.path());
+        config.permissions.approval = "always".into();
+        let events = EventSink::new(true, false, false);
+        let mut all = false;
+        let mut ctx = audit_context(&config, &mut store, &session, dir.path(), &mut all, &events);
+        ctx.assume_yes = false;
+        let (mode, receiver) = tokio::sync::watch::channel(ApprovalMode::Always);
+        ctx.approval_mode = Some(receiver);
+        mode.send(ApprovalMode::Yolo).unwrap();
+        fs::write(dir.path().join("patch-me"), "before\n").unwrap();
+        execute(
+            "patch-call",
+            "apply_patch",
+            &json!({"path":"patch-me","old_text":"before\n","new_text":"after\n"}).to_string(),
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("patch-me")).unwrap(),
+            "after\n"
+        );
+
+        fs::write(dir.path().join("remove-me"), "temporary").unwrap();
+        execute(
+            "shell-call",
+            "shell",
+            r#"{"command":"rm remove-me"}"#,
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!dir.path().join("remove-me").exists());
+    }
+
+    #[tokio::test]
+    async fn live_mode_can_restore_strict_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, mut store, session) = audit_store(dir.path());
+        config.permissions.yolo = true;
+        let events = EventSink::new(true, false, false);
+        let mut all = false;
+        let mut ctx = audit_context(&config, &mut store, &session, dir.path(), &mut all, &events);
+        ctx.assume_yes = false;
+        let (mode, receiver) = tokio::sync::watch::channel(ApprovalMode::Yolo);
+        ctx.approval_mode = Some(receiver);
+        mode.send(ApprovalMode::Always).unwrap();
+        fs::write(dir.path().join("protected"), "before\n").unwrap();
+        let result = execute(
+            "patch-call",
+            "apply_patch",
+            &json!({"path":"protected","old_text":"before\n","new_text":"after\n"}).to_string(),
+            &mut ctx,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("protected")).unwrap(),
+            "before\n"
+        );
+    }
+
+    #[tokio::test]
     async fn copied_new_files_are_removed_by_undo_and_self_moves_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let (config, mut store, session) = audit_store(dir.path());
@@ -3882,7 +4000,8 @@ mod tests {
                 name,
                 &json!({"path": "."}).to_string(),
                 &config,
-                cwd
+                cwd,
+                None,
             ));
         }
         for name in ["write_file", "remove_path", "shell", "web_search"] {
@@ -3890,14 +4009,16 @@ mod tests {
                 name,
                 &json!({"path": "."}).to_string(),
                 &config,
-                cwd
+                cwd,
+                None,
             ));
         }
         assert!(!is_parallel_read_only(
             "list_directory",
             &json!({"path": outside.path()}).to_string(),
             &config,
-            cwd
+            cwd,
+            None,
         ));
 
         let mut strict_approval = config;
@@ -3906,7 +4027,25 @@ mod tests {
             "list_directory",
             &json!({"path": "."}).to_string(),
             &strict_approval,
-            cwd
+            cwd,
+            None,
+        ));
+
+        let (mode, receiver) = tokio::sync::watch::channel(ApprovalMode::OnRisk);
+        assert!(is_parallel_read_only(
+            "list_directory",
+            &json!({"path": "."}).to_string(),
+            &strict_approval,
+            cwd,
+            Some(&receiver),
+        ));
+        mode.send(ApprovalMode::Always).unwrap();
+        assert!(!is_parallel_read_only(
+            "list_directory",
+            &json!({"path": "."}).to_string(),
+            &strict_approval,
+            cwd,
+            Some(&receiver),
         ));
     }
 
@@ -4151,7 +4290,6 @@ mod tests {
     #[test]
     fn on_risk_only_auto_approves_non_overwriting_workspace_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::default();
         let internal = resolve_target(dir.path(), "new.txt").unwrap();
         let external = dir
             .path()
@@ -4161,19 +4299,19 @@ mod tests {
             .unwrap()
             .join("outside.txt");
         assert!(auto_approves_path_mutation(
-            &config,
+            ApprovalMode::OnRisk,
             dir.path(),
             &[internal.as_path()],
             true,
         ));
         assert!(!auto_approves_path_mutation(
-            &config,
+            ApprovalMode::OnRisk,
             dir.path(),
             &[internal.as_path()],
             false,
         ));
         assert!(!auto_approves_path_mutation(
-            &config,
+            ApprovalMode::OnRisk,
             dir.path(),
             &[external.as_path()],
             true,
@@ -4212,6 +4350,22 @@ mod tests {
     }
 
     #[test]
+    fn line_diff_stats_count_only_changed_lines() {
+        for (old, new, expected) in [
+            ("a\n", "a\nb\n", (1, 0)),
+            ("a\nb\n", "a\n", (0, 1)),
+            ("keep\nold\nkeep\n", "keep\nnew\nkeep\n", (1, 1)),
+            ("a\nb\na\n", "a\nb\n", (0, 1)),
+            ("a\nb\n", "b\na\n", (1, 1)),
+            ("old\n", "", (0, 1)),
+            ("", "new\n", (1, 0)),
+            ("a", "a\n", (1, 1)),
+        ] {
+            assert_eq!(line_diff_stats(old, new), expected, "{old:?} -> {new:?}");
+        }
+    }
+
+    #[test]
     fn tool_presentation_exposes_safe_diff_metadata() {
         let presentation = tool_presentation(
             "call-1",
@@ -4228,6 +4382,8 @@ mod tests {
         assert_eq!(presentation["tool_call_id"], "call-1");
         assert_eq!(presentation["diffs"][0]["old_bytes"], 10);
         assert_eq!(presentation["diffs"][0]["new_bytes"], 10);
+        assert_eq!(presentation["diffs"][0]["added_lines"], 1);
+        assert_eq!(presentation["diffs"][0]["removed_lines"], 1);
         assert_eq!(presentation["diffs"][0]["content_redacted"], true);
         let encoded = presentation.to_string();
         assert!(!encoded.contains("secret-old"));
@@ -4366,6 +4522,7 @@ mod tests {
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
             cancellation: None,
+            approval_mode: None,
             deadline: None,
         };
         let result = execute(
@@ -4410,6 +4567,7 @@ mod tests {
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
             cancellation: None,
+            approval_mode: None,
             deadline: None,
         };
         let result = execute(
@@ -4450,6 +4608,7 @@ mod tests {
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
             cancellation: None,
+            approval_mode: None,
             deadline: None,
         };
         execute(
@@ -4489,6 +4648,7 @@ mod tests {
             approve_all_commands: &mut approve_all_commands,
             dry_run: false,
             cancellation: None,
+            approval_mode: None,
             deadline: None,
         };
         let error = execute(

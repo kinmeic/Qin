@@ -27,6 +27,12 @@ def call(identifier, command, **kwargs):
         "name": "shell", "arguments": json.dumps({"command": command, **kwargs})}}
 
 
+def patch(identifier, path, old_text, new_text):
+    return {"id": identifier, "type": "function", "function": {
+        "name": "apply_patch", "arguments": json.dumps({
+            "path": path, "old_text": old_text, "new_text": new_text})}}
+
+
 class Model(http.server.BaseHTTPRequestHandler):
     requests = []
 
@@ -36,14 +42,23 @@ class Model(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.requests.append(request)
-        turn = sum(message["role"] == "user" for message in request["messages"])
-        if turn == 1 and not any(message["role"] == "tool" for message in request["messages"]):
+        messages = request["messages"]
+        turn = sum(message["role"] == "user" for message in messages)
+        last_user = max(index for index, message in enumerate(messages) if message["role"] == "user")
+        current_turn_has_tool = any(message["role"] == "tool" for message in messages[last_user + 1:])
+        if turn == 1 and not current_turn_has_tool:
             message = {"role": "assistant", "content": None, "tool_calls": [
                 call("captured", "test ! -t 0 && printf 'QIN_CAPTURED\\n'"),
                 call("terminal", "printf 'QIN_PROMPT\\n'; read answer; test \"$answer\" = terminal-answer && test -t 0 && test -t 1 && test -t 2 && printf '\\033[32mQIN_DIRECT\\033[0m\\n'", interactive=True),
             ]}
         elif turn == 1:
             message = {"role": "assistant", "content": "QIN_FINISHED"}
+        elif turn == 4 and not current_turn_has_tool:
+            message = {"role": "assistant", "content": None, "tool_calls": [
+                patch("live-yolo-patch", "patch-file", "keep\nold\nlegacy\n", "keep\nnew\n"),
+            ]}
+        elif turn == 4:
+            message = {"role": "assistant", "content": "QIN_PATCH_FINISHED"}
         else:
             message = {"role": "assistant", "content": None, "tool_calls": [
                 call(f"approval-{turn}", "rm protected-file"),
@@ -85,6 +100,7 @@ wall_time_seconds = 5
 ''')
             config.chmod(0o600)
             (directory / "protected-file").write_text("keep")
+            (directory / "patch-file").write_text("keep\nold\nlegacy\n")
             pid, descriptor = pty.fork()
             if pid == 0:
                 os.chdir(directory)
@@ -126,12 +142,14 @@ wall_time_seconds = 5
             until(b"QIN_PROMPT")
             os.write(descriptor, b"terminal-answer\n")
             until(b"QIN_FINISHED")
+            time.sleep(0.2)
             assert b"\x1b[32mQIN_DIRECT\x1b[0m" in observed, "Interactive stdout lost TTY/control sequences"
             assert b"QIN_CAPTURED" in observed, "Ordinary output missing from TUI"
             messages = Model.requests[-1]["messages"]
             results = {message["tool_call_id"]: message["content"] for message in messages if message["role"] == "tool"}
             assert results["captured"].startswith("exit_code=0\nstdout: QIN_CAPTURED")
             assert results["terminal"].startswith("exit_code=0\n[Interactive command output")
+
             os.write(descriptor, b"cancel approval\r")
             until(b"Allow once")
             os.write(descriptor, b"\x03")
@@ -139,6 +157,22 @@ wall_time_seconds = 5
             os.write(descriptor, b"expire approval\r")
             until(b"Allow once")
             until(b"Turn ended with an error")
+
+            # Start in auto, switch to always, then approve a live patch by
+            # cycling through on-risk/auto to YOLO instead of pressing y.
+            os.write(descriptor, b"\x1b[Z")
+            os.write(descriptor, b"\x1b[Z")
+            until(b"always")
+            os.write(descriptor, b"live yolo patch")
+            until(b"live yolo patch")
+            os.write(descriptor, b"\r")
+            until(b"Allow once")
+            os.write(descriptor, b"\x1b[Z")
+            os.write(descriptor, b"\x1b[Z")
+            os.write(descriptor, b"\x1b[Z")
+            until(b"QIN_PATCH_FINISHED")
+            time.sleep(0.2)
+            assert (directory / "patch-file").read_text() == "keep\nnew\n"
             os.write(descriptor, b"/exit\r")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
@@ -160,8 +194,8 @@ wall_time_seconds = 5
             state = json.loads((directory / "qin-session.json").read_text())
             messages = [entry["message"] for entry in state["session"]["messages"]]
             tool_results = {message["tool_call_id"]: message for message in messages if message["role"] == "tool"}
-            assert set(tool_results) == {"captured", "terminal", "approval-2", "later-2", "approval-3", "later-3"}
-            print("TUI smoke passed: captured output, terminal stdio/ANSI, cancel, approval deadline, paired results, shutdown")
+            assert set(tool_results) == {"captured", "terminal", "approval-2", "later-2", "approval-3", "later-3", "live-yolo-patch"}
+            print("TUI smoke passed: captured output, terminal stdio/ANSI, live YOLO patch, cancel, approval deadline, paired results, shutdown")
     finally:
         if pid is not None:
             os.kill(pid, signal.SIGKILL)

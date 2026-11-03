@@ -1,5 +1,52 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalMode {
+    Always,
+    OnRisk,
+    Auto,
+    Yolo,
+}
+
+impl ApprovalMode {
+    pub fn from_config(policy: &str, assume_yes: bool) -> Self {
+        if assume_yes {
+            return Self::Auto;
+        }
+        match policy {
+            "always" => Self::Always,
+            "never" => Self::Auto,
+            _ => Self::OnRisk,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Always => Self::OnRisk,
+            Self::OnRisk => Self::Auto,
+            Self::Auto => Self::Yolo,
+            Self::Yolo => Self::Always,
+        }
+    }
+
+    pub fn policy(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::OnRisk => "on_risk",
+            Self::Auto | Self::Yolo => "never",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::OnRisk => "on risk",
+            Self::Auto => "auto",
+            Self::Yolo => "YOLO",
+        }
+    }
+}
+
 /// Closed outcomes for one approval request. The two allowed variants encode
 /// the exact authorization scope; every other outcome is fail-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
